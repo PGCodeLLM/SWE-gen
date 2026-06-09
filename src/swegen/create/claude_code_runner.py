@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 from dataclasses import dataclass
@@ -10,11 +11,13 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     HookMatcher,
+    ResultMessage,
     TextBlock,
     query,
 )
 
 from swegen.create.claude_code_utils import Colors, print_sdk_message
+from swegen.model_settings import load_model_settings, session_header_env
 from swegen.tools.harbor_runner import parse_harbor_outcome
 
 
@@ -155,12 +158,14 @@ Replace the TODO placeholder with the actual test command running THIS PR's test
 
 For each validation attempt, increment the run number (-1, -2, -3, etc.):
 
+Before running ```harbor run```, make sure to either ```sg docker``` or ```newgrp docker``` to avoid Docker permission issues.
+
 ```bash
 # Test NOP - should get reward=0
-harbor run --agent nop -p {dataset_path} -t {task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
+harbor run --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
 
 # Test Oracle - should get reward=1
-harbor run --agent oracle -p {dataset_path} -t {task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
+harbor run --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
 ```
 
 If you need to re-run after fixing issues, increment the number:
@@ -617,12 +622,14 @@ In this case, run the discovery test file, not the individual fixtures.
 
 For each validation attempt, increment the run number (-1, -2, -3, etc.):
 
+Before running ```harbor run```, make sure to either ```sg docker``` or ```newgrp docker``` to avoid Docker permission issues.
+
 ```bash
 # Test NOP - should get reward=0 (tests FAIL on buggy code)
-harbor run --agent nop -p {dataset_path} -t {task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
+harbor run --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
 
 # Test Oracle - should get reward=1 (tests PASS after applying fix)
-harbor run --agent oracle -p {dataset_path} -t {task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
+harbor run --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
 ```
 
 If you need to re-run after fixing issues, increment the number:
@@ -742,24 +749,45 @@ def run_claude_code_session(
     Returns:
         MakeItWorkResult with success status
     """
-    # Run async session in sync context
-    return asyncio.run(
-        _run_claude_code_session_async(
-            repo=repo,
-            pr_number=pr_number,
-            repo_path=repo_path,
-            task_dir=task_dir,
-            task_id=task_id,
-            dataset_path=dataset_path,
-            test_files=test_files,
-            timeout=timeout,
-            verbose=verbose,
-            reference_task_id=reference_task_id,
-            reference_pr=reference_pr,
-            head_sha=head_sha,
-            environment=environment,
+    # Run async session in sync context.
+    #
+    # We drive the loop manually instead of using asyncio.run(): the SDK spawns
+    # the CLI as a subprocess, and its asyncio pipe transports are only
+    # finalized on a later GC pass. asyncio.run() closes the loop the instant
+    # the coroutine returns, so those finalizers run against a dead loop and
+    # spew "RuntimeError: Event loop is closed" from BaseSubprocessTransport
+    # .__del__. Forcing a GC sweep while the loop is still alive lets the
+    # finalizers schedule their cleanup callbacks on a live loop.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(
+            _run_claude_code_session_async(
+                repo=repo,
+                pr_number=pr_number,
+                repo_path=repo_path,
+                task_dir=task_dir,
+                task_id=task_id,
+                dataset_path=dataset_path,
+                test_files=test_files,
+                timeout=timeout,
+                verbose=verbose,
+                reference_task_id=reference_task_id,
+                reference_pr=reference_pr,
+                head_sha=head_sha,
+                environment=environment,
+            )
         )
-    )
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            # Collect lingering subprocess transports, then pump the loop once
+            # so their __del__-scheduled callbacks run before we close it.
+            gc.collect()
+            loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
 async def _run_claude_code_session_async(
@@ -855,12 +883,63 @@ async def _run_claude_code_session_async(
             print(f"[SDK] Task dir: {task_dir}", flush=True)
             print("-" * 60, flush=True)
 
+        # Resolve model + endpoint: env var > swegen.toml > default.
+        model_settings = load_model_settings()
+        # The SDK CLI subprocess inherits this process's env, so set the base URL
+        # there when it's configured but not already pinned in the environment
+        # (env stays authoritative).
+        if model_settings.base_url and "ANTHROPIC_BASE_URL" not in os.environ:
+            os.environ["ANTHROPIC_BASE_URL"] = model_settings.base_url
+        logger.info(
+            "Using model %s (endpoint: %s)",
+            model_settings.model,
+            os.environ.get("ANTHROPIC_BASE_URL") or "default",
+        )
+        if verbose:
+            print(
+                f"[SDK] Model: {model_settings.model} | "
+                f"Endpoint: {os.environ.get('ANTHROPIC_BASE_URL') or 'default'}",
+                flush=True,
+            )
+
+        # Optional CLI debug capture: the Claude Code CLI is a compiled binary
+        # whose fetch() only prints a one-line hint (e.g. "socket connection was
+        # closed unexpectedly"). Its --debug-file writes the underlying cause
+        # (ECONNRESET, timeouts, the undici cause chain). Opt-in via
+        # SWEGEN_CC_DEBUG=1 so big runs don't accumulate large debug files.
+        extra_args: dict[str, str | None] = {}
+        stderr_cb = None
+        if os.environ.get("SWEGEN_CC_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            debug_file = jobs_dir / f"{task_id}-cc-debug.log"
+            extra_args["debug-file"] = str(debug_file)  # implicitly enables --debug
+
+            def stderr_cb(line: str) -> None:
+                # Surface only error-ish stderr inline; full detail is in debug_file.
+                low = line.lower()
+                if any(
+                    k in low
+                    for k in ("error", "socket", "econn", "etimedout", "fetch", "timeout")
+                ):
+                    print(f"[cc-stderr] {line.rstrip()}", flush=True)
+
+            logger.info("Claude Code debug log: %s", debug_file)
+            if verbose:
+                print(f"[SDK] CC debug log: {debug_file}", flush=True)
+
+        # Pin all SDK rounds for this instance to one model via a stable
+        # X-Session-ID header, so a router fronting multiple models keeps this
+        # task on one model and reuses its KV cache across turns.
+        session_env = session_header_env(task_id)
+
         # Configure SDK options
         options = ClaudeAgentOptions(
             allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "LS", "Bash"],
             permission_mode="bypassPermissions",  # Auto-approve actions
             cwd=os.getcwd(),  # Run from project root
-            model="sonnet",  # Use Sonnet model
+            model=model_settings.model,
+            env=session_env,
+            extra_args=extra_args,
+            stderr=stderr_cb,
             hooks={
                 "PreToolUse": [HookMatcher(matcher="Bash", hooks=[log_harbor_runs])]
             } if verbose else {},
@@ -870,24 +949,30 @@ async def _run_claude_code_session_async(
         try:
             async with asyncio.timeout(timeout):
                 response_parts = []
-                
-                if verbose:
-                    # Stream messages with real-time display
-                    async for message in query(prompt=prompt_text, options=options):
-                        print_sdk_message(message)
-                        
+
+                # NOTE: The SDK's message generator does not finish when the
+                # ResultMessage is emitted — it keeps reading until the CLI
+                # subprocess closes stdout (EOF). Custom model backends may
+                # emit the result but never exit, so we break on ResultMessage
+                # ourselves and aclose() the generator to tear down the
+                # subprocess deterministically (otherwise the loop hangs until
+                # the asyncio timeout fires).
+                agen = query(prompt=prompt_text, options=options)
+                try:
+                    async for message in agen:
+                        if verbose:
+                            print_sdk_message(message)
+
                         # Collect text for final result
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
                                 if isinstance(block, TextBlock):
                                     response_parts.append(block.text)
-                else:
-                    # Collect messages without printing
-                    async for message in query(prompt=prompt_text, options=options):
-                        if isinstance(message, AssistantMessage):
-                            for block in message.content:
-                                if isinstance(block, TextBlock):
-                                    response_parts.append(block.text)
+
+                        if isinstance(message, ResultMessage):
+                            break
+                finally:
+                    await agen.aclose()
 
         except TimeoutError:
             logger.warning("Claude Code session timed out after %ds", timeout)

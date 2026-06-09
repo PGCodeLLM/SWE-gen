@@ -15,6 +15,7 @@ from openai import OpenAI
 from rich.console import Console
 
 from swegen.create.claude_code_utils import Colors, print_sdk_message
+from swegen.model_settings import session_header_env
 
 from .models import (
     BaselineResult,
@@ -238,6 +239,9 @@ class TrialClassifier:
             cwd=str(trial_dir),
             add_dirs=[str(task_dir)],
             model=self._model,
+            # Pin all rounds for this task instance to one model (X-Session-ID)
+            # so a multi-model router maximizes KV cache reuse across trials.
+            env=session_header_env(task_dir.name),
             # Prefer structured output when supported by the SDK/runtime.
             # This avoids brittle "parse JSON from text" logic entirely.
             output_format={

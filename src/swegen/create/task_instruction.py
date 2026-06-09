@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -132,6 +133,8 @@ If the user prompt says "Task name requested: yes", generate a short task_name.
 - Do not include the repo name or PR number
 - Keep it descriptive of the behavior change
 If task name is NOT requested, set task_name to null.
+
+Avoid using methods of setup that require starting a Docker container. Such methods will not work, and will only result in wasted time and resources.
 """
 
 
@@ -304,6 +307,53 @@ def _format_user_prompt(
     )
 
 
+def _tolerant_parse_content(content: str) -> CombinedPRTaskEvaluation:
+    """Validate model content into the schema, tolerating non-JSON wrapping.
+
+    Some reasoning backends (e.g. a gpt-5.2 deployment behind a gateway that does
+    not enforce the json_schema grammar) wrap the JSON answer: a leading
+    ``<think>...</think>`` reasoning block, and/or trailing commentary after the
+    object, and the reasoning itself can contain ``{``/``}`` characters. So the
+    content may look like ``<think>... { ... } ...</think>\\n\\n{json}\\nnote``.
+
+    Strategy: first try to validate the whole content (clean-JSON path, identical
+    to before). Otherwise scan the text for balanced JSON objects with
+    ``raw_decode`` (which ignores anything before/after a value) and return the
+    LAST one that validates against the schema — the real answer is emitted after
+    any reasoning, and reasoning may include earlier example objects.
+    """
+    text = (content or "").strip()
+
+    # Fast path: the content is already pure JSON (unchanged behaviour).
+    try:
+        return CombinedPRTaskEvaluation.model_validate_json(text)
+    except Exception:
+        pass
+
+    # Robust path: find every top-level JSON object and keep the last valid one.
+    decoder = json.JSONDecoder()
+    best: CombinedPRTaskEvaluation | None = None
+    i = 0
+    while True:
+        brace = text.find("{", i)
+        if brace == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, brace)
+        except json.JSONDecodeError:
+            i = brace + 1  # not the start of a valid object; try the next "{"
+            continue
+        i = end  # skip past this object, then look for the next one
+        if isinstance(obj, dict):
+            try:
+                best = CombinedPRTaskEvaluation.model_validate(obj)
+            except Exception:
+                pass  # a brace-bearing fragment that isn't our schema; keep scanning
+    if best is None:
+        raise ValueError("no schema-valid JSON object found in model content")
+    return best
+
+
 def evaluate_and_generate_task(
     metadata: dict,
     files: list[dict],
@@ -389,21 +439,57 @@ def evaluate_and_generate_task(
         sanitized_system_prompt = _sanitize_for_openai(COMBINED_SYSTEM_PROMPT)
         sanitized_user_prompt = _sanitize_for_openai(user_prompt)
         
-        # Use structured outputs with parse() method - type-safe!
-        completion = client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": sanitized_system_prompt},
-                {"role": "user", "content": sanitized_user_prompt},
-            ],
-            response_format=CombinedPRTaskEvaluation,
-            max_completion_tokens=MAX_COMPLETION_TOKENS,
-            # reasoning_effort="low", # TODO: reasoning level?
-        )
+        messages = [
+            {"role": "system", "content": sanitized_system_prompt},
+            {"role": "user", "content": sanitized_user_prompt},
+        ]
 
-        result = completion.choices[0].message.parsed
-        if result is None:
-            raise RuntimeError("LLM returned no parsed result")
+        # Primary path: structured outputs with parse() - type-safe. Unchanged,
+        # so backends that return clean JSON behave exactly as before.
+        try:
+            completion = client.beta.chat.completions.parse(
+                model=model,
+                messages=messages,
+                response_format=CombinedPRTaskEvaluation,
+                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                # reasoning_effort="low", # TODO: reasoning level?
+            )
+            result = completion.choices[0].message.parsed
+            if result is None:
+                raise RuntimeError("LLM returned no parsed result")
+        except Exception as parse_exc:
+            # Fallback only for reasoning backends that wrap the JSON answer in a
+            # <think>...</think> block (strict parse() then fails on non-JSON at
+            # column 1). Re-request without strict parsing and tolerate the block.
+            logger.warning(
+                "Structured parse failed (%s); retrying with <think>-tolerant parsing",
+                type(parse_exc).__name__,
+            )
+            try:
+                # Send the same json_schema the parse() path uses, so the request
+                # to the model is identical; we just parse the content leniently.
+                try:
+                    from openai.lib._parsing import type_to_response_format_param
+
+                    response_format = type_to_response_format_param(
+                        CombinedPRTaskEvaluation
+                    )
+                except Exception:
+                    response_format = {"type": "json_object"}
+
+                raw = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    response_format=response_format,
+                    max_completion_tokens=MAX_COMPLETION_TOKENS,
+                )
+                content = raw.choices[0].message.content
+                if not content:
+                    raise RuntimeError("LLM returned empty content")
+                result = _tolerant_parse_content(content)
+            except Exception:
+                # Recovery failed; surface the original strict-parse failure.
+                raise parse_exc
 
         logger.debug(
             f"Combined evaluation: is_substantial={result.is_substantial}, reason={result.reason[:DEBUG_REASON_TRUNCATE_LENGTH]}..."

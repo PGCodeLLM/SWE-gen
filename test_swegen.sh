@@ -1,0 +1,1 @@
+swegen create --repo caronc/apprise --pr 1089 --no-require-minimum-difficulty --verbose --force

@@ -55,10 +55,3 @@ jobs/
 tasks*/
 old_*/
 *.jsonl
-.claude/
-.cache/
-.swegen*/
-.docker/
-*.zip
-orchestrator-logs*/
-successful_tasks_temp_eval/
