@@ -55,15 +55,27 @@ try:
 except Exception as exc:  # pragma: no cover
     sys.exit(f"error: could not import swegen.tools.harbor_runner ({exc}).")
 
-# Age buckets (in completed months). Last bucket is open-ended.
-AGE_BUCKETS: list[tuple[str, int, int | None]] = [
-    ("0-3", 0, 3),
-    ("4-6", 4, 6),
-    ("7-12", 7, 12),
-    ("13-24", 13, 24),
-    ("25-36", 25, 36),
-    ("37+", 37, None),
-]
+# Age buckets are generated at runtime from the data: even-width bins in months,
+# spanning 0 up to the oldest PR (no open-ended "N+" catch-all). Width is chosen
+# to give a readable number of bins unless overridden with --bucket-months.
+_NICE_WIDTHS = [1, 2, 3, 4, 6, 9, 12, 18, 24, 36, 48, 60]
+
+
+def pick_bucket_width(max_age: int, target_bins: int = 14) -> int:
+    """Pick an even bin width (months) so the range splits into ~target_bins."""
+    if max_age <= target_bins:
+        return 1
+    raw = max_age / target_bins
+    for w in _NICE_WIDTHS:
+        if w >= raw:
+            return w
+    return ((int(raw) // 12) + 1) * 12
+
+
+def build_buckets(max_age: int, width: int) -> list[str]:
+    """Even-width inclusive month-range labels covering [0, max_age]."""
+    n_bins = max_age // width + 1
+    return [f"{k * width}-{k * width + width - 1}" for k in range(n_bins)]
 
 
 # --- Success detection (mirrors extract_successful.py) -----------------------
@@ -191,13 +203,6 @@ def months_old(pr_date_iso: str, now: datetime) -> int | None:
     return max(0, months)
 
 
-def bucket_for(months: int) -> str | None:
-    for label, lo, hi in AGE_BUCKETS:
-        if months >= lo and (hi is None or months <= hi):
-            return label
-    return None
-
-
 # --- Main --------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -220,6 +225,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Only process the first N task folders (testing).")
     parser.add_argument("--no-fetch", action="store_true",
                         help="Skip GitHub fetching; use only cached dates.")
+    parser.add_argument("--bucket-months", type=int, default=None,
+                        help="Even bin width in months for the x-axis. Default: "
+                             "auto-chosen to cover the full age range in a "
+                             "readable number of bins.")
     args = parser.parse_args(argv)
 
     tasks_dir: Path = args.dir
@@ -303,34 +312,35 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {len(records)} record(s) to {args.out_jsonl} "
           f"({n_dates} with PR dates).", flush=True)
 
-    # 4. Bucket by age and plot.
+    # 4. Bucket by age (even-width bins covering the full range) and plot.
     now = datetime.now(timezone.utc)
-    labels = [b[0] for b in AGE_BUCKETS]
-    totals = {lbl: 0 for lbl in labels}
-    succ = {lbl: 0 for lbl in labels}
+    aged: list[tuple[int, bool]] = []
     undated = 0
     for r in records:
-        if not r["pr_date"]:
-            undated += 1
-            continue
-        m = months_old(r["pr_date"], now)
+        m = months_old(r["pr_date"], now) if r.get("pr_date") else None
         if m is None:
             undated += 1
-            continue
-        lbl = bucket_for(m)
-        if lbl is None:
-            continue
-        totals[lbl] += 1
-        if r["successful"]:
-            succ[lbl] += 1
+        else:
+            aged.append((m, bool(r["successful"])))
+
+    max_age = max((m for m, _ in aged), default=0)
+    width = args.bucket_months if args.bucket_months else pick_bucket_width(max_age)
+    labels = build_buckets(max_age, width)
+    total_y = [0] * len(labels)
+    succ_y = [0] * len(labels)
+    for m, ok in aged:
+        idx = m // width
+        total_y[idx] += 1
+        if ok:
+            succ_y[idx] += 1
+    print(f"Age range: 0..{max_age} months -> {len(labels)} even bin(s) of "
+          f"{width} month(s).", flush=True)
 
     total_all = len(records)
     succ_all = n_success
     yield_pct = 100 * succ_all / total_all if total_all else 0.0
 
     x = list(range(len(labels)))
-    total_y = [totals[lbl] for lbl in labels]
-    succ_y = [succ[lbl] for lbl in labels]
 
     fig = plt.figure(figsize=(13, 6))
     gs = fig.add_gridspec(1, 2, width_ratios=[3.2, 1])
@@ -341,7 +351,8 @@ def main(argv: list[str] | None = None) -> int:
     ax.plot(x, succ_y, color="#54A24B", marker="o", linewidth=2,
             label="Successful PRs", zorder=4)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels)
+    rotation = 45 if len(labels) > 8 else 0
+    ax.set_xticklabels(labels, rotation=rotation, ha="right" if rotation else "center")
     ax.set_xlabel("PR age (months)")
     ax.set_ylabel("PR count")
     ax.set_title("Task yield over time")
@@ -360,9 +371,21 @@ def main(argv: list[str] | None = None) -> int:
         f"Total PRs:\n{total_all}"
     )
     ax2.text(
-        0.5, 0.5, stats, ha="center", va="center", fontsize=14,
+        0.5, 0.72, stats, ha="center", va="center", fontsize=14,
         transform=ax2.transAxes,
         bbox=dict(boxstyle="round,pad=0.8", facecolor="#F5F5F5", edgecolor="#888"),
+    )
+    notes = (
+        'Successful PR: reward=0 for NOP (no patch applied),\n'
+        'reward=1 for Oracle (patch applied).\n\n'
+        'Models (swe-gen create):\n'
+        '  GPT-5.2 — PR evaluation & task authoring\n'
+        '  Qwen3.5-397B-A17B-FP8 — agentic env construction'
+    )
+    ax2.text(
+        0.5, 0.18, notes, ha="center", va="center", fontsize=8,
+        transform=ax2.transAxes,
+        bbox=dict(boxstyle="round,pad=0.6", facecolor="#FFF8E7", edgecolor="#C9A227"),
     )
     if undated:
         ax.annotate(f"(+{undated} PRs without a usable date, excluded from buckets)",
