@@ -62,3 +62,11 @@ old_*/
 *.zip
 orchestrator-logs*/
 successful_tasks_temp_eval/
+_singleton
+analyse_dir/
+analyze_out/
+a/
+demo/
+e2e-app/
+src/offcanvas/
+temp_test/
