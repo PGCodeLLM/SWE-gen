@@ -70,3 +70,11 @@ demo/
 e2e-app/
 src/offcanvas/
 temp_test/
+node_modules
+successful_*/
+200_sampled_from_successful_*/
+setup_tokens.sh
+get_merge_commit_ids.py
+reward_hacking_detector/hacking_checker.toml
+reward_hacking_detector/hacking_checker_CODEX_ONLY.toml
+swegen.toml
