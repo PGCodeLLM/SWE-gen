@@ -286,6 +286,13 @@ the verdict first using the criteria above, then write the suggestion.
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = (1, 3, 5)  # seconds between retries
 
+# Files larger than this are replaced with a placeholder in the test bundle
+# instead of having their contents inlined. Large files are almost always
+# generated data fixtures (e.g. SCALE-encoded metadata blobs) that carry no
+# signal for reward-hacking detection but can blow past the model's context
+# window.
+_MAX_BUNDLE_FILE_BYTES = 75 * 1024
+
 
 def _coerce_is_hacking(value: object) -> bool:
     """Normalize model output to a strict boolean.
@@ -550,7 +557,10 @@ def build_test_bundle(instance_dir: Path) -> str:
 
     `tests/test.sh` is placed first so it matches the prompt's framing
     ("the first file below is the test script"). Files that cannot be
-    decoded as UTF-8 (binaries) are skipped.
+    decoded as UTF-8 (binaries) are skipped. Files larger than
+    ``_MAX_BUNDLE_FILE_BYTES`` have their contents replaced with a placeholder
+    (they are almost always generated data fixtures that would only blow past
+    the model's context window).
     """
     tests_dir = instance_dir / "tests"
     if not tests_dir.is_dir():
@@ -567,6 +577,18 @@ def build_test_bundle(instance_dir: Path) -> str:
     blocks: list[str] = []
     for p in files:
         rel = p.relative_to(instance_dir)
+        try:
+            size = p.stat().st_size
+        except OSError as e:
+            logger.warning(f"[{instance_dir.name}] skipping unreadable file {rel}: {e}")
+            continue
+        if size > _MAX_BUNDLE_FILE_BYTES:
+            logger.info(
+                f"[{instance_dir.name}] {rel} is {size} bytes "
+                f"(> {_MAX_BUNDLE_FILE_BYTES}); replacing contents with placeholder."
+            )
+            blocks.append(f"```{rel}\n<File skipped due to being above 75KB>\n```")
+            continue
         try:
             contents = p.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError) as e:

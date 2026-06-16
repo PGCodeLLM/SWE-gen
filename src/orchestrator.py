@@ -5,9 +5,19 @@ Reads a JSONL file where each line describes one PR to process:
 
     {"repo": "owner/repo", "pull_number": "1234"}
 
-Splits the entries into ``--workers`` roughly-equal segments and runs the
-segments concurrently. Within a segment, each PR is processed sequentially by
-shelling out to:
+Work is organized as a producer-consumer pipeline. The entries are grouped into
+one "package" per repo (all of that repo's PRs that still need processing); a
+producer thread feeds those packages onto a queue, and ``--workers`` consumer
+threads each pull a package, process its PRs sequentially, and then pull the
+next available package. Keeping a whole repo inside a single consumer ensures
+the shared per-repo git cache (.swegen/repos/<repo>) is never touched by two
+consumers at once, while idle consumers immediately grab more work instead of
+waiting on a fixed segment.
+
+By default a PR whose task directory already exists under ``--output`` is
+skipped (so reruns only fill gaps); pass ``--force`` to rebuild every PR.
+
+Within a package, each PR is processed sequentially by shelling out to:
 
     swegen create --repo <repo> --pr <pr> \
         --no-require-minimum-difficulty --no-require-issue
@@ -26,11 +36,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import random
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -208,6 +220,46 @@ def split_into_segments(items: list[Entry], n: int) -> list[list[Entry]]:
     return bins
 
 
+def build_packages(
+    items: list[Entry], output_dir: Path, force: bool
+) -> tuple[list[list[Entry]], int]:
+    """Group entries into one "package" per repo for the producer-consumer queue.
+
+    A package holds every PR of a single repo that still needs processing. Unless
+    ``force`` is set, PRs whose task directory already exists under ``output_dir``
+    are dropped (a rerun only fills the gaps); when every PR of a repo is dropped,
+    that repo produces no package at all. Within a package the PRs are ordered
+    highest PR number to lowest, matching the old per-segment ordering.
+
+    Returns ``(packages, skipped)`` where ``skipped`` is the number of existing
+    PRs filtered out. Largest packages are returned first so consumers start the
+    longest-running repos earliest (better tail-latency under producer-consumer).
+    """
+    groups: dict[str, list[Entry]] = {}
+    for entry in items:
+        groups.setdefault(entry.repo, []).append(entry)
+
+    packages: list[list[Entry]] = []
+    skipped = 0
+    for repo in sorted(groups):
+        entries = sorted(groups[repo], key=_pr_desc_key)
+        if force:
+            kept = entries
+        else:
+            kept = [
+                e
+                for e in entries
+                if not (output_dir / task_dir_name(e.repo, e.pull_number)).exists()
+            ]
+            skipped += len(entries) - len(kept)
+        if kept:
+            packages.append(kept)
+
+    # Longest package first: keeps the slowest repos from starting last.
+    packages.sort(key=len, reverse=True)
+    return packages, skipped
+
+
 def build_child_env(args: argparse.Namespace) -> dict[str, str]:
     """Build the environment for child processes: inherit, then override with
     any resolved secrets."""
@@ -264,6 +316,8 @@ def build_child_command(
     if args.cc_timeout is not None:
         cmd += ["--cc-timeout", str(args.cc_timeout)]
     cmd += ["--max-retries", str(args.max_retries)]
+    if args.force:
+        cmd.append("--force")
     return cmd
 
 
@@ -557,9 +611,151 @@ def pick_github_token(pool: list[str], exclude: set[str]) -> str | None:
     return random.choice(candidates)
 
 
-def run_worker(
+def process_entry(
     worker_id: int,
-    segment: list[Entry],
+    entry: Entry,
+    tag: str,
+    env: dict[str, str],
+    swegen_bin: str,
+    log,
+    log_path: Path,
+    cc_timeout: int | None,
+    output_dir: Path | None,
+    max_retries: int,
+    token_pool: list[str],
+    force: bool,
+) -> int:
+    """Run `swegen create` for a single PR, writing to the open ``log`` handle.
+
+    A failed run whose output matches a transient network/API error (e.g.
+    "socket connection was closed unexpectedly") is retried up to ``max_retries``
+    times with a short backoff; non-transient failures are not.
+
+    When ``token_pool`` holds more than one token, each run injects a random one
+    as GITHUB_TOKEN for cloning/API access; a run that fails with a GitHub
+    rate-limit/forbidden error (HTTP 403/429) is retried with a *different* token
+    from the pool. Returns the final return code.
+    """
+    base_cmd = [
+        swegen_bin,
+        "create",
+        "--repo",
+        entry.repo,
+        "--pr",
+        entry.pull_number,
+        "--no-require-minimum-difficulty",
+        "--no-require-issue",
+        "--verbose",
+    ]
+    # Forward the output directory so tasks land where the orchestrator later
+    # copies obs_download.py.
+    if output_dir is not None:
+        base_cmd += ["--output", str(output_dir)]
+    # Forward the Claude Code session timeout when set; otherwise let
+    # `swegen create` use its own default.
+    if cc_timeout is not None:
+        base_cmd += ["--cc-timeout", str(cc_timeout)]
+
+    returncode = 1
+
+    # Pick a random GitHub token for this entry; rotate to a different one if we
+    # hit a rate limit. Tracks which tokens we've already tried.
+    current_token = pick_github_token(token_pool, set())
+    tried_tokens: set[str] = {current_token} if current_token else set()
+
+    for attempt in range(1, max_retries + 1):
+        # Force-overwrite when explicitly requested, or when regenerating over
+        # partial output left by a failed earlier attempt.
+        cmd = base_cmd + (["--force"] if (force or attempt > 1) else [])
+        attempt_note = "" if attempt == 1 else f" (retry {attempt}/{max_retries})"
+        token_note = f" [token {_mask_token(current_token)}]" if token_pool else ""
+        print(f"{tag} starting{attempt_note}{token_note}", flush=True)
+
+        # Inject the chosen token for this attempt without mutating the shared
+        # base env (consumers run concurrently).
+        attempt_env = env
+        if current_token:
+            attempt_env = {**env, "GITHUB_TOKEN": current_token}
+
+        log.write(
+            f"\n{'=' * 80}\n{tag}{attempt_note}{token_note}\n$ {' '.join(cmd)}\n{'=' * 80}\n"
+        )
+        log.flush()
+        start_size = os.fstat(log.fileno()).st_size
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                env=attempt_env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            returncode = proc.returncode
+        except FileNotFoundError:
+            # Not transient — abort retries for this entry.
+            msg = (
+                f"could not find executable {swegen_bin!r}; "
+                "is swegen installed / on PATH?"
+            )
+            log.write(msg + "\n")
+            print(f"{tag} ERROR: {msg}", flush=True)
+            return 127
+        log.flush()
+
+        if returncode == 0:
+            break
+
+        # Inspect the tail of this attempt's output to decide on a retry.
+        end_size = os.fstat(log.fileno()).st_size
+        output_tail = ""
+        try:
+            with open(log_path, "r", errors="replace") as reader:
+                reader.seek(max(start_size, end_size - 65536))
+                output_tail = reader.read()
+        except OSError:
+            pass
+
+        rate_limited = _is_github_rate_limited(output_tail)
+        if attempt < max_retries and (
+            rate_limited or _is_retryable_failure(output_tail)
+        ):
+            backoff = RETRY_BACKOFF_SEC * attempt
+            if rate_limited and len(token_pool) > 1:
+                # Swap to a different token before retrying the clone/API.
+                next_token = pick_github_token(token_pool, tried_tokens)
+                tried_tokens.add(next_token)
+                cause = (
+                    f"github rate limit on token "
+                    f"{_mask_token(current_token)}; rotating to "
+                    f"{_mask_token(next_token)}"
+                )
+                current_token = next_token
+            elif rate_limited:
+                cause = "github rate limit (no alternate token available)"
+            else:
+                cause = "transient error"
+            retry_msg = (
+                f"{cause} (rc={returncode}); retrying in {backoff}s "
+                f"[attempt {attempt + 1}/{max_retries}]"
+            )
+            log.write(f"{tag} {retry_msg}\n")
+            log.flush()
+            print(f"{tag} {retry_msg}", flush=True)
+            time.sleep(backoff)
+            continue
+
+        # Either out of retries or a non-transient failure: stop.
+        break
+
+    status = "OK" if returncode == 0 else f"FAILED rc={returncode}"
+    print(f"{tag} {status} (log: {log_path})", flush=True)
+    return returncode
+
+
+def run_consumer(
+    worker_id: int,
+    work_queue: "queue.Queue[list[Entry] | None]",
     env: dict[str, str],
     swegen_bin: str,
     log_dir: Path,
@@ -567,145 +763,76 @@ def run_worker(
     output_dir: Path | None = None,
     max_retries: int = 3,
     github_tokens: list[str] | None = None,
+    force: bool = False,
 ) -> list[Outcome]:
-    """Process one worker's segment sequentially, logging to a per-worker file.
+    """Consumer thread: pull repo packages off ``work_queue`` until drained.
 
-    A failed `swegen create` whose output matches a transient network/API error
-    (e.g. "socket connection was closed unexpectedly") is retried up to
-    ``max_retries`` times with a short backoff; non-transient failures are not.
-
-    When ``github_tokens`` holds more than one token, each run injects a random
-    one as GITHUB_TOKEN for cloning/API access; a run that fails with a GitHub
-    rate-limit/forbidden error (HTTP 403/429) is retried with a *different*
-    token from the pool.
+    Each ``get`` returns a package (all PRs of one repo) or ``None`` — the
+    sentinel the producer enqueues once per consumer to signal shutdown. PRs
+    within a package are processed sequentially; a whole repo stays inside one
+    consumer so its shared git cache is never touched concurrently. When the
+    package is done the consumer immediately pulls the next one. All of this
+    consumer's runs are appended to a single per-consumer log file.
     """
     token_pool = github_tokens or []
     outcomes: list[Outcome] = []
     log_path = log_dir / f"worker-{worker_id}.log"
-    total = len(segment)
 
     with log_path.open("w") as log:
-        for idx, entry in enumerate(segment, 1):
-            base_cmd = [
-                swegen_bin,
-                "create",
-                "--repo",
-                entry.repo,
-                "--pr",
-                entry.pull_number,
-                "--no-require-minimum-difficulty",
-                "--no-require-issue",
-                "--verbose",
-            ]
-            # Forward the output directory so tasks land where the orchestrator
-            # later copies obs_download.py.
-            if output_dir is not None:
-                base_cmd += ["--output", str(output_dir)]
-            # Forward the Claude Code session timeout when set; otherwise let
-            # `swegen create` use its own default.
-            if cc_timeout is not None:
-                base_cmd += ["--cc-timeout", str(cc_timeout)]
-
-            tag = f"[worker {worker_id}] ({idx}/{total}) {entry.repo}#{entry.pull_number}"
-            returncode = 1
-
-            # Pick a random GitHub token for this entry; rotate to a different
-            # one if we hit a rate limit. Tracks which tokens we've already tried.
-            current_token = pick_github_token(token_pool, set())
-            tried_tokens: set[str] = {current_token} if current_token else set()
-
-            for attempt in range(1, max_retries + 1):
-                # Regenerate over any partial output left by a failed attempt.
-                cmd = base_cmd + (["--force"] if attempt > 1 else [])
-                attempt_note = "" if attempt == 1 else f" (retry {attempt}/{max_retries})"
-                token_note = (
-                    f" [token {_mask_token(current_token)}]" if token_pool else ""
-                )
-                print(f"{tag} starting{attempt_note}{token_note}", flush=True)
-
-                # Inject the chosen token for this attempt without mutating the
-                # shared base env (workers run concurrently).
-                attempt_env = env
-                if current_token:
-                    attempt_env = {**env, "GITHUB_TOKEN": current_token}
-
+        while True:
+            package = work_queue.get()
+            try:
+                if package is None:  # producer's shutdown sentinel
+                    break
+                repo = package[0].repo
+                total = len(package)
                 log.write(
-                    f"\n{'=' * 80}\n{tag}{attempt_note}{token_note}\n$ {' '.join(cmd)}\n{'=' * 80}\n"
+                    f"\n{'#' * 80}\n[worker {worker_id}] package {repo} "
+                    f"({total} PR{'s' if total != 1 else ''})\n{'#' * 80}\n"
                 )
                 log.flush()
-                start_size = os.fstat(log.fileno()).st_size
-
-                try:
-                    proc = subprocess.run(
-                        cmd,
-                        env=attempt_env,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        text=True,
+                for idx, entry in enumerate(package, 1):
+                    tag = (
+                        f"[worker {worker_id}] ({idx}/{total}) "
+                        f"{entry.repo}#{entry.pull_number}"
                     )
-                    returncode = proc.returncode
-                except FileNotFoundError:
-                    # Not transient — abort retries for this entry.
-                    msg = (
-                        f"could not find executable {swegen_bin!r}; "
-                        "is swegen installed / on PATH?"
+                    returncode = process_entry(
+                        worker_id,
+                        entry,
+                        tag,
+                        env,
+                        swegen_bin,
+                        log,
+                        log_path,
+                        cc_timeout,
+                        output_dir,
+                        max_retries,
+                        token_pool,
+                        force,
                     )
-                    log.write(msg + "\n")
-                    print(f"{tag} ERROR: {msg}", flush=True)
-                    returncode = 127
-                    break
-                log.flush()
-
-                if returncode == 0:
-                    break
-
-                # Inspect the tail of this attempt's output to decide on a retry.
-                end_size = os.fstat(log.fileno()).st_size
-                output_tail = ""
-                try:
-                    with open(log_path, "r", errors="replace") as reader:
-                        reader.seek(max(start_size, end_size - 65536))
-                        output_tail = reader.read()
-                except OSError:
-                    pass
-
-                rate_limited = _is_github_rate_limited(output_tail)
-                if attempt < max_retries and (
-                    rate_limited or _is_retryable_failure(output_tail)
-                ):
-                    backoff = RETRY_BACKOFF_SEC * attempt
-                    if rate_limited and len(token_pool) > 1:
-                        # Swap to a different token before retrying the clone/API.
-                        next_token = pick_github_token(token_pool, tried_tokens)
-                        tried_tokens.add(next_token)
-                        cause = (
-                            f"github rate limit on token "
-                            f"{_mask_token(current_token)}; rotating to "
-                            f"{_mask_token(next_token)}"
-                        )
-                        current_token = next_token
-                    elif rate_limited:
-                        cause = "github rate limit (no alternate token available)"
-                    else:
-                        cause = "transient error"
-                    retry_msg = (
-                        f"{cause} (rc={returncode}); retrying in {backoff}s "
-                        f"[attempt {attempt + 1}/{max_retries}]"
+                    outcomes.append(
+                        Outcome(worker_id=worker_id, entry=entry, returncode=returncode)
                     )
-                    log.write(f"{tag} {retry_msg}\n")
-                    log.flush()
-                    print(f"{tag} {retry_msg}", flush=True)
-                    time.sleep(backoff)
-                    continue
-
-                # Either out of retries or a non-transient failure: stop.
-                break
-
-            status = "OK" if returncode == 0 else f"FAILED rc={returncode}"
-            print(f"{tag} {status} (log: {log_path})", flush=True)
-            outcomes.append(Outcome(worker_id=worker_id, entry=entry, returncode=returncode))
+            finally:
+                work_queue.task_done()
 
     return outcomes
+
+
+def producer(
+    work_queue: "queue.Queue[list[Entry] | None]",
+    packages: list[list[Entry]],
+    num_consumers: int,
+) -> None:
+    """Producer thread: enqueue every package, then one sentinel per consumer.
+
+    The trailing ``None`` sentinels let each consumer exit cleanly once the
+    queue is drained.
+    """
+    for package in packages:
+        work_queue.put(package)
+    for _ in range(num_consumers):
+        work_queue.put(None)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -742,6 +869,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3,
         help="Max attempts per PR when a run fails with a transient network/API "
         "error (e.g. socket closed). Set to 1 to disable retries.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild every PR (passing `swegen create --force`). Without this, "
+        "PRs whose task directory already exists under --output are skipped so a "
+        "rerun only fills the gaps.",
     )
     parser.add_argument(
         "--slurm",
@@ -837,23 +971,49 @@ def main(argv: list[str] | None = None) -> int:
         )
         return submit_slurm_jobs(entries, args, env)
 
-    segments = split_into_segments(entries, args.workers)
+    # Group the entries into one package per repo, dropping PRs whose task dir
+    # already exists (unless --force). Empty repos yield no package.
+    packages, skipped = build_packages(entries, args.tasks_dir, args.force)
+    if skipped:
+        print(
+            f"Skipping {skipped} PR(s) whose task dir already exists under "
+            f"{args.tasks_dir}/ (use --force to rebuild).",
+            flush=True,
+        )
+    if not packages:
+        print("Nothing to do: all PRs already exist (use --force to rebuild).")
+        return 0
 
+    remaining = sum(len(p) for p in packages)
+    num_consumers = max(1, min(args.workers, len(packages)))
     print(
-        f"Loaded {len(entries)} entries -> {len(segments)} worker(s) "
-        f"(logs in {args.log_dir}/)",
+        f"Loaded {len(entries)} entries -> {remaining} PR(s) in {len(packages)} "
+        f"repo package(s), {num_consumers} consumer(s) (logs in {args.log_dir}/)",
         flush=True,
     )
-    for i, segment in enumerate(segments):
-        print(f"  worker {i}: {len(segment)} entr{'y' if len(segment) == 1 else 'ies'}")
+    for package in packages:
+        print(
+            f"  {package[0].repo}: {len(package)} "
+            f"PR{'s' if len(package) != 1 else ''}"
+        )
+
+    # Producer-consumer: a producer thread feeds repo packages onto the queue;
+    # each consumer pulls a package, processes its PRs, then pulls the next.
+    work_queue: "queue.Queue[list[Entry] | None]" = queue.Queue()
+    producer_thread = threading.Thread(
+        target=producer,
+        args=(work_queue, packages, num_consumers),
+        name="package-producer",
+    )
+    producer_thread.start()
 
     all_outcomes: list[Outcome] = []
-    with ThreadPoolExecutor(max_workers=len(segments)) as executor:
+    with ThreadPoolExecutor(max_workers=num_consumers) as executor:
         futures = {
             executor.submit(
-                run_worker,
+                run_consumer,
                 i,
-                segment,
+                work_queue,
                 env,
                 args.swegen_bin,
                 args.log_dir,
@@ -861,11 +1021,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.tasks_dir,
                 args.max_retries,
                 github_tokens,
+                args.force,
             ): i
-            for i, segment in enumerate(segments)
+            for i in range(num_consumers)
         }
         for future in as_completed(futures):
             all_outcomes.extend(future.result())
+
+    producer_thread.join()
 
     # Copy obs_download.py into every generated task's environment/ folder.
     if not OBS_DOWNLOAD_SRC.is_file():
