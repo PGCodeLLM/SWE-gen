@@ -84,11 +84,6 @@ RUN git clone {params.repo_url} src && \\
     git checkout --detach FETCH_HEAD && \\
     git submodule update --init --recursive
 
-# RUN REPO_FULL_NAME="$(echo '{params.repo_url}' | sed -E 's#^[a-z]+://[^/]+/##; s/\.git$//')" && \
-#     python3 /path/to/obs_download.py "$REPO_FULL_NAME" src && \
-#     cd src && \
-#     git submodule update --init --recursive
-
 WORKDIR /app/src
 
 # TODO: Set environment variables if needed
