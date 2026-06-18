@@ -22,10 +22,14 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-SUCCESSFUL = Path("/shared_workspace_mfs/alex/swe-gen-oss-successful.jsonl")
-TOTAL = Path("/shared_workspace_mfs/alex/swe-gen-oss-total.jsonl")
-YIELD_PNG = Path("/shared_workspace_mfs/alex/swe-gen-mod/SWE-gen/yield_over_time.png")
-AGE_PNG = Path("/shared_workspace_mfs/alex/swe-gen-mod/SWE-gen/pr_age_distribution.png")
+SUCCESSFUL = Path("data_cache/swe-gen-oss-successful.jsonl")
+TOTAL = Path("data_cache/swe-gen-oss-total.jsonl")
+HACKING_RESULTS = Path(
+    "data_cache/successful_20260612_200042_bz_codex_hacking_out/"
+    "hacking_results.dedup.jsonl"
+)
+YIELD_PNG = Path("data_cache/yield_over_time.png")
+AGE_PNG = Path("data_cache/pr_age_distribution.png")
 
 # extract_successful.py is re-run on a background thread roughly hourly; the
 # download button always serves the newest zip it has produced. It needs the
@@ -109,13 +113,42 @@ def count_lines(path: Path) -> int:
         return 0
 
 
+def count_non_hacking(path: Path) -> int:
+    """Number of instances in the hacking-results JSONL with no hacking flagged.
+
+    An instance counts as non-hacking when none of its per-LLM results have
+    ``is_hacking`` set. Malformed lines are skipped; a missing file yields 0.
+    """
+    n = 0
+    try:
+        with path.open("r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not any(
+                    r.get("is_hacking") for r in rec.get("llm_results", [])
+                ):
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
 def counts() -> dict:
     s = count_lines(SUCCESSFUL)
     t = count_lines(TOTAL)
+    nh = count_non_hacking(HACKING_RESULTS)
     out = {
         "successful": s,
         "total": t,
         "pct": round(100 * s / t, 1) if t else 0.0,
+        "non_hacking": nh,
+        "clean_pct": round(100 * nh / t, 1) if t else 0.0,
         "zip_available": False,
         "zip_name": None,
         "zip_time": None,
@@ -144,6 +177,11 @@ PAGE = """<!doctype html>
   .frac { font-size:1.6rem; color:#9aa4b2; margin-top:.3rem; }
   .bar { height:14px; background:#2a2f3a; border-radius:8px; overflow:hidden; margin:1.4rem 0 .4rem; }
   .fill { height:100%; background:linear-gradient(90deg,#54A24B,#7bd06f); width:0; transition:width .4s; }
+  .sub { margin-top:1.2rem; }
+  .sub-label { font-size:.78rem; color:#9aa4b2; letter-spacing:.03em; }
+  .sub-label b { color:#cbd5e1; font-weight:600; }
+  .bar.sub-bar { height:8px; margin:.5rem 0 .3rem; }
+  .fill.sub-fill { background:linear-gradient(90deg,#4c78a8,#7aa6d6); }
   .ts { font-size:.75rem; color:#6b7280; margin-top:1rem; }
   button.extract { margin-top:1.4rem; font:inherit; font-weight:600; cursor:pointer;
                    color:#fff; background:#54A24B; border:none; border-radius:10px;
@@ -160,10 +198,16 @@ PAGE = """<!doctype html>
 </style></head>
 <body><div class="wrap">
   <div class="card">
-    <h1>SWE-GEN-OSS &mdash; SUCCESSFUL / TOTAL</h1>
-    <div class="big"><span id="pct">&mdash;</span>%</div>
-    <div class="frac"><span id="succ">&mdash;</span> / <span id="tot">&mdash;</span></div>
-    <div class="bar"><div class="fill" id="fill"></div></div>
+    <h1>SWE-GEN-OSS &mdash; NON-HACKING / TOTAL</h1>
+    <div class="big"><span id="cleanPct">&mdash;</span>%</div>
+    <div class="frac"><span id="nonHack">&mdash;</span> / <span id="tot">&mdash;</span></div>
+    <div class="bar"><div class="fill" id="cleanFill"></div></div>
+    <div class="sub">
+      <div class="sub-label">Successful / total:
+        <b><span id="succ">&mdash;</span> / <span id="totSub">&mdash;</span></b>
+        (<span id="pct">&mdash;</span>%)</div>
+      <div class="bar sub-bar"><div class="fill sub-fill" id="fill"></div></div>
+    </div>
     <div class="ts">updated <span id="ts">&mdash;</span> &middot; refreshes every 5s</div>
     <button class="extract" id="extractBtn" onclick="downloadZip()" disabled>Download latest successful zip</button>
     <div class="extract-status" id="extractStatus">Checking for latest archive&hellip;</div>
@@ -182,9 +226,13 @@ PAGE = """<!doctype html>
 async function tick() {
   try {
     const r = await fetch('/api/counts'); const d = await r.json();
+    document.getElementById('cleanPct').textContent = d.clean_pct;
+    document.getElementById('nonHack').textContent = d.non_hacking.toLocaleString();
+    document.getElementById('tot').textContent = d.total.toLocaleString();
+    document.getElementById('cleanFill').style.width = d.clean_pct + '%';
     document.getElementById('pct').textContent = d.pct;
     document.getElementById('succ').textContent = d.successful.toLocaleString();
-    document.getElementById('tot').textContent = d.total.toLocaleString();
+    document.getElementById('totSub').textContent = d.total.toLocaleString();
     document.getElementById('fill').style.width = d.pct + '%';
     document.getElementById('ts').textContent = new Date().toLocaleTimeString();
     const btn = document.getElementById('extractBtn');

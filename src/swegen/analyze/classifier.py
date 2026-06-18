@@ -29,7 +29,7 @@ from .models import (
 
 
 # OpenAI verdict synthesis constants
-VERDICT_MODEL = "gpt-5.2"
+VERDICT_MODEL = "gpt-5.5"
 VERDICT_TIMEOUT = 120.0
 VERDICT_MAX_TOKENS = 4096
 

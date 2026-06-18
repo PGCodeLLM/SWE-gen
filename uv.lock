@@ -2921,8 +2921,8 @@ wheels = [
 ]
 
 [[package]]
-name = "swe-gen"
-version = "0.1.0"
+name = "swegen"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
