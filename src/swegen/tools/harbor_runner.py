@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
@@ -10,6 +11,8 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.result import JobResult
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
+
+SUFFIXED_DOCKER_ENV_IMPORT_PATH = "swegen.tools.suffixed_docker:SwegenDockerEnvironment"
 
 
 def harbor_cmd_base() -> list[str]:
@@ -22,6 +25,32 @@ def harbor_cmd_base() -> list[str]:
     if shutil.which("uv"):
         return ["uv", "run", "harbor"]
     return ["python", "-m", "harbor"]
+
+
+def _is_docker_environment(environment: EnvironmentType | str) -> bool:
+    value = environment.value if isinstance(environment, EnvironmentType) else environment
+    return value == EnvironmentType.DOCKER.value
+
+
+def write_suffixed_docker_config(config_dir: Path) -> Path:
+    """Write a Harbor config fragment selecting swegen's suffixed Docker environment."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "swegen-harbor-docker-suffix.json"
+    config = {
+        "environment": {
+            "type": EnvironmentType.DOCKER.value,
+            "import_path": SUFFIXED_DOCKER_ENV_IMPORT_PATH,
+        }
+    }
+    config_path.write_text(json.dumps(config, indent=2))
+    return config_path
+
+
+def suffixed_docker_config_args(config_dir: Path, environment: EnvironmentType | str) -> list[str]:
+    """Return Harbor CLI args that apply the swegen Docker suffix for Docker runs."""
+    if not _is_docker_environment(environment):
+        return []
+    return ["--config", str(write_suffixed_docker_config(config_dir))]
 
 
 def run_harbor_agent(
@@ -57,6 +86,7 @@ def run_harbor_agent(
 
     cmd = harbor_cmd_base() + [
         "run",
+        *suffixed_docker_config_args(unique_parent, environment),
         "--agent",
         agent,
         "-p",
@@ -134,7 +164,9 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
         for trial_result in job_result.trial_results:
             if getattr(trial_result, "exception_info", None):
                 exc = trial_result.exception_info
-                msg = getattr(exc, "exception_message", None) or getattr(exc, "exception_type", None)
+                msg = getattr(exc, "exception_message", None) or getattr(
+                    exc, "exception_type", None
+                )
                 if msg:
                     error = str(msg)
                     break
@@ -173,7 +205,9 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
 
                 if error is None and getattr(trial_result, "exception_info", None):
                     exc = trial_result.exception_info
-                    msg = getattr(exc, "exception_message", None) or getattr(exc, "exception_type", None)
+                    msg = getattr(exc, "exception_message", None) or getattr(
+                        exc, "exception_type", None
+                    )
                     if msg:
                         error = str(msg)
 

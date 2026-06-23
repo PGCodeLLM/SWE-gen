@@ -7,44 +7,46 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from harbor.models.trial.result import TrialResult
 from harbor.models.environment_type import EnvironmentType
+from harbor.models.trial.result import TrialResult
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
+from swegen.tools.harbor_runner import (
+    harbor_cmd_base,
+    parse_harbor_outcome,
+    run_harbor_agent,
+    suffixed_docker_config_args,
+)
+
+from .classifier import (
+    VERDICT_MODEL,
+    TrialClassifier,
+    classify_baseline_result,
+    compute_task_verdict,
+)
 from .models import (
     BaselineValidation,
     Classification,
     TaskVerdict,
     TrialClassification,
 )
-from .classifier import (
-    TrialClassifier,
-    classify_baseline_result,
-    compute_task_verdict,
-    VERDICT_MODEL,
-)
-from swegen.tools.harbor_runner import (
-    harbor_cmd_base,
-    parse_harbor_outcome,
-    run_harbor_agent,
-)
 
 
 def _setup_claude_auth_preference(console: Console) -> None:
     """Setup Claude Code to prefer OAuth token over API key.
-    
+
     For Claude Code trials and classification, we prefer OAuth token:
     1. CLAUDE_CODE_OAUTH_TOKEN (preferred - run 'claude setup-token')
     2. ANTHROPIC_API_KEY (fallback)
-    
+
     Displays which authentication method is being used.
     """
     has_oauth = bool(os.getenv("CLAUDE_CODE_OAUTH_TOKEN"))
     has_api_key = bool(os.getenv("ANTHROPIC_API_KEY"))
-    
+
     if has_oauth:
         # Prefer OAuth - unset API key to ensure OAuth is used
         if "ANTHROPIC_API_KEY" in os.environ:
@@ -55,10 +57,14 @@ def _setup_claude_auth_preference(console: Console) -> None:
         if "CLAUDE_CODE_OAUTH_TOKEN" in os.environ:
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN")
         console.print("[dim]🔐 Claude Code authentication: API key (fallback)[/dim]")
-        console.print("[dim]   Tip: For better security, use OAuth token ('claude setup-token')[/dim]")
+        console.print(
+            "[dim]   Tip: For better security, use OAuth token ('claude setup-token')[/dim]"
+        )
     else:
         console.print("[yellow]⚠️  No Claude Code authentication configured[/yellow]")
-        console.print("[yellow]   Set CLAUDE_CODE_OAUTH_TOKEN (preferred) or ANTHROPIC_API_KEY[/yellow]")
+        console.print(
+            "[yellow]   Set CLAUDE_CODE_OAUTH_TOKEN (preferred) or ANTHROPIC_API_KEY[/yellow]"
+        )
 
 
 @dataclass
@@ -87,24 +93,24 @@ class AnalysisResult:
 
     task_id: str
     task_path: Path
-    
+
     # Quality check
     quality_check: QualityCheckResult | None
-    
+
     # Baseline validation
     baseline: BaselineValidation | None
-    
+
     # Trial results
     trials_run: int
     success_rate: float
     trial_outcomes: list[TrialOutcome]
-    
+
     # Classifications (NEW)
     classifications: list[TrialClassification]
-    
+
     # Task verdict (NEW)
     verdict: TaskVerdict
-    
+
     # Job directory
     job_dir: Path | None
 
@@ -220,10 +226,10 @@ def _run_analysis(
     classifications: list[TrialClassification] = []
     if not args.skip_classify and trial_outcomes:
         console.print("\n[bold blue]Step 4/4: Classifying Trial Outcomes[/bold blue]")
-        
+
         # Get trial directories for classification
         trial_dirs = [t.trial_dir for t in trial_outcomes if t.trial_dir.exists()]
-        
+
         if trial_dirs:
             classifier = TrialClassifier(
                 model=args.analysis_model,
@@ -231,15 +237,21 @@ def _run_analysis(
                 timeout=args.classification_timeout,
             )
             classifications = classifier.classify_trials_sync(trial_dirs, task_path, console)
-            
+
             # Show classification summary
             task_problems = sum(1 for c in classifications if c.is_task_problem)
-            agent_problems = sum(1 for c in classifications if c.classification == Classification.GOOD_FAILURE)
-            
+            agent_problems = sum(
+                1 for c in classifications if c.classification == Classification.GOOD_FAILURE
+            )
+
             if task_problems > 0:
-                console.print(f"  [yellow]⚠ {task_problems} trial(s) indicate task problems[/yellow]")
+                console.print(
+                    f"  [yellow]⚠ {task_problems} trial(s) indicate task problems[/yellow]"
+                )
             if agent_problems > 0:
-                console.print(f"  [green]✓ {agent_problems} trial(s) are normal agent failures[/green]")
+                console.print(
+                    f"  [green]✓ {agent_problems} trial(s) are normal agent failures[/green]"
+                )
         else:
             console.print("  [dim]No trial directories found to classify[/dim]")
     else:
@@ -324,13 +336,13 @@ def _run_baseline_validation(
     console: Console,
 ) -> BaselineValidation:
     """Run nop and oracle baseline agents to validate task correctness."""
-    
+
     jobs_parent = args.jobs_dir.resolve()
     jobs_parent.mkdir(parents=True, exist_ok=True)
-    
+
     baseline = BaselineValidation()
     env = EnvironmentType(args.environment)
-    
+
     # Run nop agent (should fail - reward=0)
     console.print("  Running nop agent (should fail)...")
     nop_code, nop_job = run_harbor_agent(
@@ -355,12 +367,12 @@ def _run_baseline_validation(
         else:
             nop_error = "Could not parse reward from Harbor job result"
     baseline.nop = classify_baseline_result("nop", nop_reward, nop_error)
-    
+
     if baseline.nop.is_expected:
         console.print("    [green]✓ nop failed as expected[/green]")
     else:
         console.print("    [red]✗ CRITICAL: nop passed - task may be pre-solved![/red]")
-    
+
     # Run oracle agent (should pass - reward=1)
     console.print("  Running oracle agent (should pass)...")
     oracle_code, oracle_job = run_harbor_agent(
@@ -384,12 +396,12 @@ def _run_baseline_validation(
         else:
             oracle_error = "Could not parse reward from Harbor job result"
     baseline.oracle = classify_baseline_result("oracle", oracle_reward, oracle_error)
-    
+
     if baseline.oracle.is_expected:
         console.print("    [green]✓ oracle passed as expected[/green]")
     else:
         console.print("    [red]✗ CRITICAL: oracle failed - reference solution broken![/red]")
-    
+
     return baseline
 
 
@@ -410,15 +422,25 @@ def _run_agent_trials(
 
     cmd = harbor_cmd_base() + [
         "run",
-        "-p", str(dataset_path),
-        "-t", task_id,
-        "-a", args.agent,
-        "-m", args.model,
-        "-k", str(args.n_trials),
-        "-n", str(args.n_concurrent),  # Matches Harbor's -n flag
-        "-e", args.environment,
-        "--jobs-dir", str(unique_parent),
-        "--timeout-multiplier", str(args.timeout_multiplier),
+        *suffixed_docker_config_args(unique_parent, args.environment),
+        "-p",
+        str(dataset_path),
+        "-t",
+        task_id,
+        "-a",
+        args.agent,
+        "-m",
+        args.model,
+        "-k",
+        str(args.n_trials),
+        "-n",
+        str(args.n_concurrent),  # Matches Harbor's -n flag
+        "-e",
+        args.environment,
+        "--jobs-dir",
+        str(unique_parent),
+        "--timeout-multiplier",
+        str(args.timeout_multiplier),
     ]
 
     with Progress(
@@ -530,9 +552,11 @@ def _print_report(result: AnalysisResult, console: Console) -> None:
         table.add_row(
             "Quality Check",
             f"[{qc_style}]{qc_status}[/{qc_style}]",
-            ", ".join(result.quality_check.issues[:3])
-            if result.quality_check.issues
-            else "All checks passed",
+            (
+                ", ".join(result.quality_check.issues[:3])
+                if result.quality_check.issues
+                else "All checks passed"
+            ),
         )
 
     # Baseline validation row
@@ -578,14 +602,14 @@ def _print_report(result: AnalysisResult, console: Console) -> None:
     if result.classifications:
         task_problems = verdict.task_problem_count
         agent_problems = verdict.agent_problem_count
-        
+
         if task_problems > 0:
             class_status = f"⚠️ {task_problems} task problem(s)"
             class_style = "yellow"
         else:
             class_status = f"✅ {agent_problems} agent failure(s)"
             class_style = "green"
-        
+
         table.add_row(
             "Classification",
             f"[{class_style}]{class_status}[/{class_style}]",
@@ -597,7 +621,7 @@ def _print_report(result: AnalysisResult, console: Console) -> None:
     # Show classification details
     if result.classifications:
         console.print("\n[bold]Trial Classifications:[/bold]")
-        
+
         for c in result.classifications:
             # Color based on classification
             if c.classification == Classification.GOOD_SUCCESS:
@@ -615,8 +639,10 @@ def _print_report(result: AnalysisResult, console: Console) -> None:
             else:
                 icon = "⚫"
                 style = "dim"
-            
-            console.print(f"\n  [{style}]{icon} {c.trial_name}: {c.classification.value} - {c.subtype}[/{style}]")
+
+            console.print(
+                f"\n  [{style}]{icon} {c.trial_name}: {c.classification.value} - {c.subtype}[/{style}]"
+            )
             console.print(f"     [dim]Evidence:[/dim] {c.evidence}")
             console.print(f"     [dim]Root cause:[/dim] {c.root_cause}")
             if c.is_task_problem and c.recommendation != "N/A - task is fine":

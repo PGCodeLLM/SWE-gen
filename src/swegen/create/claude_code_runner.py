@@ -18,7 +18,7 @@ from claude_agent_sdk import (
 
 from swegen.create.claude_code_utils import Colors, print_sdk_message
 from swegen.model_settings import load_model_settings, session_header_env
-from swegen.tools.harbor_runner import parse_harbor_outcome
+from swegen.tools.harbor_runner import parse_harbor_outcome, suffixed_docker_config_args
 
 
 @dataclass
@@ -162,10 +162,10 @@ Before running ```harbor run```, make sure to either ```sg docker``` or ```newgr
 
 ```bash
 # Test NOP - should get reward=0
-harbor run --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
+harbor run {harbor_config_args} --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
 
 # Test Oracle - should get reward=1
-harbor run --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
+harbor run {harbor_config_args} --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
 ```
 
 If you need to re-run after fixing issues, increment the number:
@@ -626,10 +626,10 @@ Before running ```harbor run```, make sure to either ```sg docker``` or ```newgr
 
 ```bash
 # Test NOP - should get reward=0 (tests FAIL on buggy code)
-harbor run --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
+harbor run {harbor_config_args} --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
 
 # Test Oracle - should get reward=1 (tests PASS after applying fix)
-harbor run --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
+harbor run {harbor_config_args} --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
 ```
 
 If you need to re-run after fixing issues, increment the number:
@@ -819,6 +819,8 @@ async def _run_claude_code_session_async(
     jobs_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = jobs_dir.resolve()
 
+    harbor_config_args = " ".join(suffixed_docker_config_args(jobs_dir, environment))
+
     # Format test files list
     if test_files:
         test_files_list = "\n".join(f"  - {tf}" for tf in test_files)
@@ -842,6 +844,7 @@ async def _run_claude_code_session_async(
             test_files_list=test_files_list,
             head_sha=head_sha or "(check metadata)",
             environment=environment,
+            harbor_config_args=harbor_config_args,
         )
         logger.info(
             f"Using reference prompt (copying from {reference_task_id}, PR #{reference_pr})"
@@ -857,6 +860,7 @@ async def _run_claude_code_session_async(
             jobs_dir=jobs_dir,
             test_files_list=test_files_list,
             environment=environment,
+            harbor_config_args=harbor_config_args,
         )
         logger.info("Using full prompt (generating from skeleton)")
 
@@ -917,8 +921,7 @@ async def _run_claude_code_session_async(
                 # Surface only error-ish stderr inline; full detail is in debug_file.
                 low = line.lower()
                 if any(
-                    k in low
-                    for k in ("error", "socket", "econn", "etimedout", "fetch", "timeout")
+                    k in low for k in ("error", "socket", "econn", "etimedout", "fetch", "timeout")
                 ):
                     print(f"[cc-stderr] {line.rstrip()}", flush=True)
 
@@ -940,9 +943,11 @@ async def _run_claude_code_session_async(
             env=session_env,
             extra_args=extra_args,
             stderr=stderr_cb,
-            hooks={
-                "PreToolUse": [HookMatcher(matcher="Bash", hooks=[log_harbor_runs])]
-            } if verbose else {},
+            hooks=(
+                {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[log_harbor_runs])]}
+                if verbose
+                else {}
+            ),
         )
 
         # Run with timeout

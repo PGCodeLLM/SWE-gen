@@ -125,8 +125,6 @@ Examples:
 
 IMPORTANT: Generate exactly 3 tags.
 
-If NOT substantial, set instruction to null and provide a brief reason.
-
 TASK NAME (optional):
 If the user prompt says "Task name requested: yes", generate a short task_name.
 - 1-3 words, lowercase ASCII, dash-separated (e.g., "fix-http-header")
