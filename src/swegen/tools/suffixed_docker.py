@@ -6,37 +6,24 @@ from harbor.environments.docker.docker import DockerEnvironment
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 
-DOCKER_NAME_SUFFIX = "-swegencontainer"
-_COMPOSE_TEMPLATE = """services:
+DOCKER_IMAGE_SUFFIX = "-swegenimage"
+_IMAGE_COMPOSE_TEMPLATE = """services:
   main:
-    {image_config}
-    container_name: {container_name}
-    command: [ "sh", "-c", "sleep infinity" ]
-    network_mode: ${{NETWORK_MODE:-bridge}}
-    environment:
-      - TEST_DIR=${{TEST_DIR}}
-    volumes:
-      - ${{HOST_VERIFIER_LOGS_PATH}}:${{ENV_VERIFIER_LOGS_PATH}}
-      - ${{HOST_AGENT_LOGS_PATH}}:${{ENV_AGENT_LOGS_PATH}}
-    deploy:
-      resources:
-        limits:
-          cpus: ${{CPUS}}
-          memory: ${{MEMORY}}
+    image: ${MAIN_IMAGE_NAME}
 """
 
 
-def with_swegen_container_suffix(name: str) -> str:
-    """Append the swegen Docker suffix once."""
-    return name if name.endswith(DOCKER_NAME_SUFFIX) else f"{name}{DOCKER_NAME_SUFFIX}"
+def _append_suffix_once(name: str, suffix: str) -> str:
+    return name if name.endswith(suffix) else f"{name}{suffix}"
 
 
-def _compose_safe_name(name: str) -> str:
-    return name.lower().replace(".", "-")
+def with_swegen_image_suffix(name: str) -> str:
+    """Append the swegen Docker image suffix once."""
+    return _append_suffix_once(name, DOCKER_IMAGE_SUFFIX)
 
 
 class SwegenDockerEnvironment(DockerEnvironment):
-    """Docker environment that makes Harbor Docker resources easy to identify."""
+    """Docker environment that tags SWE-gen-built images predictably."""
 
     def __init__(
         self,
@@ -48,33 +35,27 @@ class SwegenDockerEnvironment(DockerEnvironment):
         *args,
         **kwargs,
     ):
-        suffixed_session_id = with_swegen_container_suffix(session_id)
         super().__init__(
             environment_dir,
             environment_name,
-            suffixed_session_id,
+            session_id,
             trial_paths,
             task_env_config,
             *args,
             **kwargs,
         )
-        self._env_vars.main_image_name = with_swegen_container_suffix(
+        self._env_vars.main_image_name = with_swegen_image_suffix(
             self._env_vars.main_image_name
         )
-        self._swegen_container_name = _compose_safe_name(suffixed_session_id)
-        self._swegen_compose_path = self.trial_paths.trial_dir / "docker-compose.swegen.yaml"
+        self._swegen_compose_path = (
+            self.trial_paths.trial_dir / "docker-compose.swegen-image.yaml"
+        )
 
     @property
-    def _docker_compose_path(self) -> Path:
-        image_config = (
-            "image: ${PREBUILT_IMAGE_NAME}"
-            if self._use_prebuilt
-            else "build:\n      context: ${CONTEXT_DIR}\n    image: ${MAIN_IMAGE_NAME}"
-        )
-        self._swegen_compose_path.write_text(
-            _COMPOSE_TEMPLATE.format(
-                image_config=image_config,
-                container_name=self._swegen_container_name,
-            )
-        )
-        return self._swegen_compose_path
+    def _docker_compose_paths(self) -> list[Path]:
+        paths = list(super()._docker_compose_paths)
+        if self._use_prebuilt:
+            return paths
+
+        self._swegen_compose_path.write_text(_IMAGE_COMPOSE_TEMPLATE)
+        return [*paths, self._swegen_compose_path]

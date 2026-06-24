@@ -70,6 +70,7 @@ PROGRESS_JSONL_NAME = "orchestrator-progress.jsonl"
 DEFAULT_RUNS_DIR = Path("runs")
 DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
 RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+SWEGEN_IMAGE_SUFFIX = "-swegenimage"
 
 # Slurm nodes to distribute across when --slurm is set (lux-3-bm-cpu-[01-10]).
 SLURM_NODES = [f"lux-3-bm-cpu-{i:02d}" for i in range(1, 11) if i != 8]  # CPU 8 is borked
@@ -167,10 +168,29 @@ class Outcome:
     entry: Entry
     returncode: int
     postprocess_status: str = ""
+    image_names: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
         return self.returncode == 0
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    """Local result from a consumer's `swegen create` subprocess."""
+
+    returncode: int
+    image_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImagePruneResult:
+    """Result of targeted Docker image removal for one completed instance."""
+
+    requested: int
+    removed: int
+    missing: int
+    failed: int
 
 
 def load_entries(jsonl_path: Path) -> list[Entry]:
@@ -511,6 +531,123 @@ def task_dir_name(repo: str, pull_number: str) -> str:
     return f"{repo_slug}-{pull_number}"
 
 
+def _docker_image_name(name: str) -> str:
+    """Mirror Harbor's Docker image-name sanitization."""
+    name = name.lower()
+    if not re.match(r"^[a-z0-9]", name):
+        name = "0" + name
+    return re.sub(r"[^a-z0-9._-]", "-", name)
+
+
+def _image_tag_for_instance(instance: str) -> str:
+    """Return the SWE-gen image tag Harbor builds for an instance."""
+    image_name = _docker_image_name(f"hb__{instance}")
+    if not image_name.endswith(SWEGEN_IMAGE_SUFFIX):
+        image_name = f"{image_name}{SWEGEN_IMAGE_SUFFIX}"
+    return f"{image_name}:latest"
+
+
+def _instance_harbor_job_dirs(harbor_jobs_dir: Path, instance: str) -> list[Path]:
+    """Return Harbor job parent dirs that belong to one task instance."""
+    if not harbor_jobs_dir.exists():
+        return []
+
+    prefixes = (
+        f"{instance}-nop-",
+        f"{instance}-oracle-",
+        f"{instance}.nop.",
+        f"{instance}.oracle.",
+    )
+    return sorted(
+        path
+        for path in harbor_jobs_dir.iterdir()
+        if path.is_dir() and path.name.startswith(prefixes)
+    )
+
+
+def _instance_harbor_config_paths(
+    state_dir: Path | None, instance: str
+) -> set[Path]:
+    """Find Harbor trial config files currently recorded for one instance."""
+    harbor_jobs_dir = (
+        (state_dir / "harbor-jobs") if state_dir else Path(".swegen/harbor-jobs")
+    )
+    configs: set[Path] = set()
+    for job_dir in _instance_harbor_job_dirs(harbor_jobs_dir, instance):
+        configs.update(path.resolve() for path in job_dir.rglob("config.json"))
+    return configs
+
+
+def _image_tag_from_trial_config(config_path: Path, instance: str) -> str | None:
+    """Best-effort image tag extraction from a Harbor trial config."""
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    trial_name = config.get("trial_name")
+    if not isinstance(trial_name, str) or not trial_name.strip():
+        return None
+
+    environment = config.get("environment")
+    if isinstance(environment, dict) and environment.get("type") != "docker":
+        return None
+
+    return _image_tag_for_instance(instance)
+
+
+def collect_new_instance_image_names(
+    state_dir: Path | None,
+    instance: str,
+    before_configs: set[Path],
+) -> tuple[str, ...]:
+    """Collect image tags from Harbor trials created after a task started."""
+    after_configs = _instance_harbor_config_paths(state_dir, instance)
+    image_names: list[str] = []
+    seen: set[str] = set()
+    for config_path in sorted(after_configs - before_configs):
+        image_name = _image_tag_from_trial_config(config_path, instance)
+        if image_name and image_name not in seen:
+            seen.add(image_name)
+            image_names.append(image_name)
+    return tuple(image_names)
+
+
+def prune_docker_images(image_names: tuple[str, ...]) -> ImagePruneResult:
+    """Remove exact Docker image tags for a completed instance."""
+    unique_names = tuple(dict.fromkeys(image_names))
+    removed = 0
+    missing = 0
+    failed = 0
+
+    for image_name in unique_names:
+        try:
+            proc = subprocess.run(
+                ["docker", "image", "rm", "--force", image_name],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            failed += len(unique_names) - removed - missing - failed
+            break
+
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        if proc.returncode == 0:
+            removed += 1
+        elif "No such image" in output:
+            missing += 1
+        else:
+            failed += 1
+
+    return ImagePruneResult(
+        requested=len(unique_names),
+        removed=removed,
+        missing=missing,
+        failed=failed,
+    )
+
+
 def _load_progress_lists(progress_path: Path) -> tuple[list[str], list[str]]:
     """Load the last success/failure lists from an existing progress JSONL."""
     if not progress_path.exists():
@@ -548,7 +685,7 @@ def _move_instance(
 def write_progress_jsonl(
     progress_queue: "queue.Queue[Outcome | None]", progress_path: Path
 ) -> None:
-    """Write one cumulative JSONL snapshot for each completed task."""
+    """Write progress JSONL snapshots and prune completed-instance images."""
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     successful_instances, failed_instances = _load_progress_lists(progress_path)
 
@@ -568,6 +705,21 @@ def write_progress_jsonl(
                 else:
                     status = "failure"
                     _move_instance(instance, failed_instances, successful_instances)
+
+                if outcome.image_names:
+                    prune_result = prune_docker_images(outcome.image_names)
+                    print(
+                        f"[orchestrator] {status}: {instance} pruned "
+                        f"{prune_result.removed} image tag(s); "
+                        f"{prune_result.missing} already absent; "
+                        f"{prune_result.failed} failed",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[orchestrator] {status}: {instance} no image tags found to prune",
+                        flush=True,
+                    )
 
                 record = {
                     "timestamp": datetime.now(UTC).isoformat(),
@@ -949,7 +1101,7 @@ def process_entry(
     max_retries: int,
     token_pool: list[str],
     force: bool,
-) -> int:
+) -> ProcessResult:
     """Run `swegen create` for a single PR, writing to the open ``log`` handle.
 
     A failed run whose output matches a transient network/API error (e.g.
@@ -959,8 +1111,12 @@ def process_entry(
     When ``token_pool`` holds more than one token, each run injects a random one
     as GITHUB_TOKEN for cloning/API access; a run that fails with a GitHub
     rate-limit/forbidden error (HTTP 403/429) is retried with a *different* token
-    from the pool. Returns the final return code.
+    from the pool. Returns the final return code and any Harbor image tags created
+    during this task's run.
     """
+    instance = task_dir_name(entry.repo, entry.pull_number)
+    before_configs = _instance_harbor_config_paths(state_dir, instance)
+
     base_cmd = [
         swegen_bin,
         "create",
@@ -1029,7 +1185,10 @@ def process_entry(
             )
             log.write(msg + "\n")
             print(f"{tag} ERROR: {msg}", flush=True)
-            return 127
+            image_names = collect_new_instance_image_names(
+                state_dir, instance, before_configs
+            )
+            return ProcessResult(127, image_names)
         log.flush()
 
         if returncode == 0:
@@ -1077,9 +1236,10 @@ def process_entry(
         # Either out of retries or a non-transient failure: stop.
         break
 
+    image_names = collect_new_instance_image_names(state_dir, instance, before_configs)
     status = "OK" if returncode == 0 else f"FAILED rc={returncode}"
     print(f"{tag} {status} (log: {log_path})", flush=True)
-    return returncode
+    return ProcessResult(returncode, image_names)
 
 
 def run_consumer(
@@ -1133,7 +1293,7 @@ def run_consumer(
                         f"[worker {worker_id}] ({idx}/{total}) "
                         f"{entry.repo}#{entry.pull_number}"
                     )
-                    returncode = process_entry(
+                    process_result = process_entry(
                         worker_id,
                         entry,
                         tag,
@@ -1149,6 +1309,7 @@ def run_consumer(
                         token_pool,
                         force,
                     )
+                    returncode = process_result.returncode
                     postprocess_status = ""
                     # Post-process immediately on success: copy the task into
                     # the postprocessed-output tree and apply the rewrites there.
@@ -1171,6 +1332,7 @@ def run_consumer(
                         entry=entry,
                         returncode=returncode,
                         postprocess_status=postprocess_status,
+                        image_names=process_result.image_names,
                     )
                     outcomes.append(outcome)
                     if progress_queue is not None:
