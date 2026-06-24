@@ -727,6 +727,7 @@ def run_claude_code_session(
     reference_pr: int | None = None,
     head_sha: str | None = None,
     environment: str = "docker",
+    jobs_dir: Path | None = None,
 ) -> ClaudeCodeResult:
     """
     Run Claude Code session to complete skeleton and make harbor pass.
@@ -745,6 +746,8 @@ def run_claude_code_session(
         reference_pr: If provided, PR number of the reference task
         head_sha: If provided, new HEAD SHA to use in Dockerfile
         environment: Environment type for Harbor runs (docker, daytona, etc.)
+        jobs_dir: Directory for Harbor job output. Defaults to
+            dataset_path.parent/.swegen/harbor-jobs.
 
     Returns:
         MakeItWorkResult with success status
@@ -776,6 +779,7 @@ def run_claude_code_session(
                 reference_pr=reference_pr,
                 head_sha=head_sha,
                 environment=environment,
+                jobs_dir=jobs_dir,
             )
         )
     finally:
@@ -804,6 +808,7 @@ async def _run_claude_code_session_async(
     reference_pr: int | None = None,
     head_sha: str | None = None,
     environment: str = "docker",
+    jobs_dir: Path | None = None,
 ) -> ClaudeCodeResult:
     """Async implementation of Claude Code session."""
     logger = logging.getLogger("swegen")
@@ -815,7 +820,10 @@ async def _run_claude_code_session_async(
     repo_path = Path(repo_path).resolve()
 
     # Jobs directory for harbor output
-    jobs_dir = dataset_path.parent / ".swegen" / "harbor-jobs"
+    if jobs_dir is None:
+        jobs_dir = dataset_path.parent / ".swegen" / "harbor-jobs"
+    else:
+        jobs_dir = Path(jobs_dir)
     jobs_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = jobs_dir.resolve()
 

@@ -62,7 +62,10 @@ def create_cmd(
     ),
     force: bool = typer.Option(False, help="Bypass local dedupe and regenerate"),
     state_dir: Path = typer.Option(
-        Path(".swegen"), help="Local dedupe state dir", show_default=True
+        Path(".swegen"), help="Local run state/logs/jobs dir", show_default=True
+    ),
+    repo_cache_dir: Path = typer.Option(
+        Path("data_cache/repos"), help="Shared git repo cache dir", show_default=True
     ),
     no_cache: bool = typer.Option(
         False, "--no-cache", help="Disable reusing cached Dockerfiles/test.sh from previous tasks"
@@ -110,6 +113,7 @@ def create_cmd(
         validate=validate,
         force=force,
         state_dir=state_dir,
+        repo_cache_dir=repo_cache_dir,
         use_cache=not no_cache,
         require_minimum_difficulty=require_minimum_difficulty,
         min_source_files=min_source_files,
@@ -327,7 +331,10 @@ def farm(
         Path("tasks"), help="Output directory for generated tasks", show_default=True
     ),
     state_dir: Path = typer.Option(
-        Path(".swegen"), help="State directory for cache/logs", show_default=True
+        Path(".swegen"), help="State directory for logs/jobs", show_default=True
+    ),
+    repo_cache_dir: Path = typer.Option(
+        Path("data_cache/repos"), help="Shared git repo cache dir", show_default=True
     ),
     force: bool = typer.Option(True, help="Regenerate even if task already exists"),
     timeout: int = typer.Option(300, help="Timeout per PR in seconds", show_default=True),
@@ -391,6 +398,7 @@ def farm(
         repo=repo,
         output=output,
         state_dir=state_dir,
+        repo_cache_dir=repo_cache_dir,
         force=force,
         timeout=timeout,
         cc_timeout=cc_timeout,

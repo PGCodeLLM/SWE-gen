@@ -380,6 +380,7 @@ class PRToHarborPipeline:
                     reference_pr=task_reference.pr_number if task_reference else None,
                     head_sha=metadata.get("head_sha"),
                     environment=environment,
+                    jobs_dir=(state_dir / "harbor-jobs") if state_dir else None,
                 )
 
                 if cc_result.success:

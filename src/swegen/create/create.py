@@ -457,7 +457,7 @@ def run_reversal(config: CreateConfig) -> None:
             console.print(
                 "[dim]  → Cloning/updating repo cache (may take a minute for first clone)...[/dim]"
             )
-            repo_cache_dir = config.state_dir / "repos" if config.state_dir else None
+            repo_cache_dir = config.repo_cache_dir
             repo_cache = RepoCache(repo_cache_dir)
             repo_path = repo_cache.get_or_clone(
                 repo=pipeline.repo,
@@ -534,6 +534,7 @@ def run_reversal(config: CreateConfig) -> None:
                 reference_pr=task_reference.pr_number if task_reference else None,
                 head_sha=metadata.get("head_sha"),
                 environment=config.environment.value,
+                jobs_dir=config.state_dir / "harbor-jobs",
             )
 
             gen_secs = time.perf_counter() - t0

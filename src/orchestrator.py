@@ -10,20 +10,26 @@ one "package" per repo (all of that repo's PRs that still need processing); a
 producer thread feeds those packages onto a queue, and ``--workers`` consumer
 threads each pull a package, process its PRs sequentially, and then pull the
 next available package. Keeping a whole repo inside a single consumer ensures
-the shared per-repo git cache (.swegen/repos/<repo>) is never touched by two
+the shared per-repo git cache (data_cache/repos/<repo>) is never touched by two
 consumers at once, while idle consumers immediately grab more work instead of
 waiting on a fixed segment.
 
-By default a PR whose task directory already exists under ``--output`` is
-skipped (so reruns only fill gaps); pass ``--force`` to rebuild every PR.
+Each invocation writes to a run directory. If ``--run-name`` is omitted, the
+run name defaults to the current UTC timestamp under ``runs/``. If a run name is
+specified, that existing run directory is reused; PRs whose task directories
+already exist under ``<run>/tasks`` are skipped unless ``--force`` is set. The
+shared git clone cache lives under ``data_cache/repos`` by default.
 
-As soon as a PR's ``swegen create`` run succeeds, that task is copied into the
-postprocessed-output tree (``--postprocessed-output``, default
-``tasks_voyager_postprocessed``) and all post-processing is applied to the *copy*,
-leaving the original task untouched. Post-processing rewrites the Dockerfile
-base image to the internal mirror, removes the bug.patch application block, and
-appends a ``[cwm_task_metadata]`` table (with the linked issue number) to
-task.toml.
+Each run contains ``tasks/``, ``tasks_voyager_postprocessed/``,
+``orchestrator-logs/``, ``logs/``, ``harbor-jobs/``, and an
+``orchestrator-progress.jsonl`` completion log. As soon as a PR's
+``swegen create`` run succeeds, that task is copied into
+``tasks_voyager_postprocessed/`` and all post-processing is applied to the
+*copy*, leaving the original task untouched. Post-processing rewrites the
+Dockerfile base image to the internal mirror, moves the preloaded Voyager
+repository into the path expected by the task, replaces the generated git clone
+block with a checkout of that preloaded repository, and appends a
+``[cwm_task_metadata]`` table (with the linked issue number) to task.toml.
 
 Within a package, each PR is processed sequentially by shelling out to:
 
@@ -53,17 +59,20 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-# Default directory for the post-processed copies of successful tasks. The
-# originals under --output are left untouched; postprocessed copies land here
-# (resolved relative to --output's parent unless --postprocessed-output is given).
+# Run-local directory name for post-processed copies of successful tasks.
 POSTPROCESSED_OUTPUT_NAME = "tasks_voyager_postprocessed"
+PROGRESS_JSONL_NAME = "orchestrator-progress.jsonl"
+DEFAULT_RUNS_DIR = Path("runs")
+DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
+RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 # Slurm nodes to distribute across when --slurm is set (lux-3-bm-cpu-[01-10]).
-SLURM_NODES = [f"lux-3-bm-cpu-{i:02d}" for i in range(1, 11) if i != 8] #CPU 8 is borked
+SLURM_NODES = [f"lux-3-bm-cpu-{i:02d}" for i in range(1, 11) if i != 8]  # CPU 8 is borked
 
 # Substrings in a failed `swegen create` run that indicate a transient
 # network/API error worth retrying (vs. a genuine task failure like a trivial
@@ -113,13 +122,19 @@ DOCKERFILE_BASE_REPLACEMENT = (
     "swesandbox/ubuntu:24.04"
 )
 
-# Post-processing removes the baseline-reversal patch from copied tasks. The
-# source task still keeps bug.patch and applies it normally.
-DOCKERFILE_BUG_PATCH_RE = re.compile(
-    r"(?m)^[ \t]*(?:#[^\n]*bug\.patch[^\n]*\n)?"
-    r"[ \t]*COPY[ \t]+bug\.patch[ \t]+/tmp/bug\.patch[ \t]*\n"
-    r"[ \t]*RUN[ \t]+patch[ \t]+-p1[ \t]+<[ \t]+/tmp/bug\.patch"
-    r"[ \t]+&&[ \t]+rm[ \t]+/tmp/bug\.patch[ \t]*\n?"
+# Post-processing: Voyager repo images already contain the repository under
+# /app/<owner>/<repo>, so generated Dockerfiles should move that checkout to the
+# task's working path and then check out the fixed PR commit there.
+VOYAGER_PATH_MARKER = (
+    "# Move the preloaded Voyager repository to the path expected by the task."
+)
+FROM_RE = re.compile(r"^FROM\s+\S+(?P<suffix>.*)$")
+HEAD_SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+GIT_FETCH_HEAD_RE = re.compile(
+    r"\bgit fetch(?: --depth \d+)? origin (?P<sha>[0-9a-f]{40})\b"
+)
+GIT_CHECKOUT_RE = re.compile(
+    r"^RUN cd (?P<path>\S+) && git checkout --detach (?P<sha>[0-9a-f]{40})$"
 )
 
 # Env vars forwarded to each `swegen create` subprocess. Maps the CLI flag name
@@ -141,6 +156,7 @@ class Entry:
     repo: str
     pull_number: str
     base_commit: str = ""
+    image_ref: str = ""
 
 
 @dataclass
@@ -150,6 +166,7 @@ class Outcome:
     worker_id: int
     entry: Entry
     returncode: int
+    postprocess_status: str = ""
 
     @property
     def ok(self) -> bool:
@@ -181,8 +198,16 @@ def load_entries(jsonl_path: Path) -> list[Entry]:
                 )
             # Optional: used by post-processing to populate task metadata.
             base_commit = str(obj.get("base_commit", "")).strip()
+            image_ref = str(
+                obj.get("image_ref") or obj.get("voyager_image_ref") or ""
+            ).strip()
             entries.append(
-                Entry(repo=repo, pull_number=pull_number, base_commit=base_commit)
+                Entry(
+                    repo=repo,
+                    pull_number=pull_number,
+                    base_commit=base_commit,
+                    image_ref=image_ref,
+                )
             )
     return entries
 
@@ -203,7 +228,7 @@ def split_into_segments(items: list[Entry], n: int) -> list[list[Entry]]:
     """Partition entries into up to ``n`` balanced segments, one repo per segment.
 
     Every PR of a given repo is kept together in a single segment, so the shared
-    per-repo git cache (.swegen/repos/<repo>) is never touched by two workers at
+    per-repo git cache (data_cache/repos/<repo>) is never touched by two workers at
     once. Repos are distributed greedily (largest group first → least-loaded
     segment) to balance the number of PRs per segment as evenly as the
     one-repo-per-segment constraint allows. Within a segment, each repo's PRs are
@@ -288,11 +313,62 @@ def build_child_env(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
+def _timestamp_run_name() -> str:
+    return datetime.now(UTC).strftime(RUN_TIMESTAMP_FORMAT)
+
+
+def resolve_run_dir(runs_dir: Path, run_name: str | None) -> tuple[str, Path]:
+    """Return the run name and directory, creating a fresh timestamp name by default."""
+    if run_name:
+        return run_name, runs_dir / run_name
+
+    base_name = _timestamp_run_name()
+    candidate = runs_dir / base_name
+    suffix = 1
+    while candidate.exists():
+        name = f"{base_name}-{suffix:02d}"
+        candidate = runs_dir / name
+        suffix += 1
+    return candidate.name, candidate
+
+
+def resolve_run_layout(args: argparse.Namespace) -> None:
+    """Populate derived run-local paths on parsed args."""
+    args.run_name, args.run_dir = resolve_run_dir(args.runs_dir, args.run_name)
+    args.state_dir = args.run_dir
+
+    if args.tasks_dir is None:
+        args.tasks_dir = args.run_dir / "tasks"
+    if args.postprocessed_dir is None:
+        args.postprocessed_dir = args.run_dir / POSTPROCESSED_OUTPUT_NAME
+    if args.log_dir is None:
+        args.log_dir = args.run_dir / "orchestrator-logs"
+    if args.progress_jsonl is None:
+        args.progress_jsonl = args.run_dir / PROGRESS_JSONL_NAME
+
+    args.repo_cache_dir = args.repo_cache_dir or DEFAULT_REPO_CACHE_DIR
+
+
+def create_run_dirs(args: argparse.Namespace) -> None:
+    """Ensure the standard run directory layout exists."""
+    for path in (
+        args.run_dir,
+        args.run_dir / "harbor-jobs",
+        args.run_dir / "logs",
+        args.log_dir,
+        args.tasks_dir,
+        args.postprocessed_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    args.repo_cache_dir.mkdir(parents=True, exist_ok=True)
+    args.progress_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+
 def write_chunk(path: Path, segment: list[Entry]) -> None:
     """Write a segment of entries to a JSONL chunk file for a slurm child run.
 
-    Preserves the fields the child needs (base_commit is required downstream for
-    cwm_task_metadata).
+    Preserves the fields the child needs for downstream post-processing and
+    cwm_task_metadata.
     """
     with path.open("w") as fh:
         for entry in segment:
@@ -302,6 +378,7 @@ def write_chunk(path: Path, segment: list[Entry]) -> None:
                         "repo": entry.repo,
                         "pull_number": entry.pull_number,
                         "base_commit": entry.base_commit,
+                        "image_ref": entry.image_ref,
                     }
                 )
                 + "\n"
@@ -322,8 +399,16 @@ def build_child_command(
         str(chunk_path),
         "--workers",
         str(args.workers),
+        "--runs-dir",
+        str(args.runs_dir),
+        "--run-name",
+        args.run_name,
+        "--repo-cache-dir",
+        str(args.repo_cache_dir),
         "--log-dir",
         str(node_log_dir),
+        "--progress-jsonl",
+        str(node_log_dir / PROGRESS_JSONL_NAME),
         # Shared, flat output dir — outputs are NOT subfoldered per node.
         "--output",
         str(args.tasks_dir),
@@ -426,6 +511,86 @@ def task_dir_name(repo: str, pull_number: str) -> str:
     return f"{repo_slug}-{pull_number}"
 
 
+def _load_progress_lists(progress_path: Path) -> tuple[list[str], list[str]]:
+    """Load the last success/failure lists from an existing progress JSONL."""
+    if not progress_path.exists():
+        return [], []
+
+    successful_instances: list[str] = []
+    failed_instances: list[str] = []
+    try:
+        with progress_path.open(errors="replace") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                successes = record.get("successful_instances")
+                failures = record.get("failed_instances")
+                if isinstance(successes, list) and isinstance(failures, list):
+                    successful_instances = [str(item) for item in successes]
+                    failed_instances = [str(item) for item in failures]
+    except OSError:
+        return [], []
+
+    return successful_instances, failed_instances
+
+
+def _move_instance(
+    instance: str, target: list[str], opposite: list[str]
+) -> None:
+    """Record the latest status for an instance without duplicate list entries."""
+    opposite[:] = [item for item in opposite if item != instance]
+    if instance not in target:
+        target.append(instance)
+
+
+def write_progress_jsonl(
+    progress_queue: "queue.Queue[Outcome | None]", progress_path: Path
+) -> None:
+    """Write one cumulative JSONL snapshot for each completed task."""
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    successful_instances, failed_instances = _load_progress_lists(progress_path)
+
+    with progress_path.open("a") as fh:
+        while True:
+            outcome = progress_queue.get()
+            try:
+                if outcome is None:
+                    break
+
+                instance = task_dir_name(
+                    outcome.entry.repo, outcome.entry.pull_number
+                )
+                if outcome.ok:
+                    status = "success"
+                    _move_instance(instance, successful_instances, failed_instances)
+                else:
+                    status = "failure"
+                    _move_instance(instance, failed_instances, successful_instances)
+
+                record = {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "event": "task_finished",
+                    "status": status,
+                    "instance": instance,
+                    "repo": outcome.entry.repo,
+                    "pull_number": outcome.entry.pull_number,
+                    "worker_id": outcome.worker_id,
+                    "returncode": outcome.returncode,
+                    "postprocess_status": outcome.postprocess_status,
+                    "total_successes": len(successful_instances),
+                    "total_failures": len(failed_instances),
+                    "total_processed": len(successful_instances) + len(failed_instances),
+                    "successful_instances": successful_instances.copy(),
+                    "failed_instances": failed_instances.copy(),
+                }
+                fh.write(json.dumps(record) + "\n")
+                fh.flush()
+            finally:
+                progress_queue.task_done()
+
+
 def fetch_issue_number(repo: str, pull_number: str, tokens: list[str] | None) -> str:
     """Look up the issue number linked to a PR via the GitHub API.
 
@@ -481,32 +646,198 @@ def _toml_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def rewrite_dockerfile_base(task_dir: Path) -> bool:
-    """Replace the base image in <task_dir>/environment/Dockerfile.
+def _dockerfile_path(task_dir: Path) -> Path:
+    return task_dir / "environment" / "Dockerfile"
 
-    Returns True if the file was found and rewritten, False otherwise.
-    """
-    dockerfile = task_dir / "environment" / "Dockerfile"
+
+def _replace_dockerfile_base(
+    lines: list[str], image_ref: str | None
+) -> tuple[list[str], bool]:
+    if not lines or not lines[0].startswith("FROM "):
+        return lines, False
+
+    if image_ref:
+        match = FROM_RE.match(lines[0])
+        suffix = match.group("suffix") if match else ""
+        replacement = f"FROM {image_ref}{suffix}"
+        if lines[0] != replacement:
+            return [replacement, *lines[1:]], True
+        return lines, False
+
+    if lines[0] == DOCKERFILE_BASE_FROM:
+        return [DOCKERFILE_BASE_REPLACEMENT, *lines[1:]], True
+    return lines, False
+
+
+def _clone_block_end(lines: list[str], start: int) -> int:
+    end = start + 1
+    while end < len(lines) and lines[end - 1].rstrip().endswith("\\"):
+        end += 1
+    return end
+
+
+def _extract_head_sha(lines: list[str]) -> str | None:
+    for line in lines:
+        match = GIT_FETCH_HEAD_RE.search(line)
+        if match:
+            return match.group("sha")
+    for line in lines:
+        match = HEAD_SHA_RE.search(line)
+        if match:
+            return match.group(0)
+    return None
+
+
+def _next_workdir(lines: list[str], start: int) -> str | None:
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped.startswith("WORKDIR "):
+            return stripped.split(None, 1)[1]
+    return None
+
+
+def _existing_checkout(lines: list[str]) -> tuple[str, str] | None:
+    for line in lines:
+        match = GIT_CHECKOUT_RE.match(line.strip())
+        if match:
+            return match.group("path"), match.group("sha")
+    return None
+
+
+def _first_repo_workdir(lines: list[str]) -> str:
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("WORKDIR "):
+            path = stripped.split(None, 1)[1]
+            if path != "/app":
+                return path
+    return "/app/src"
+
+
+def _remove_clone_comment(output: list[str]) -> None:
+    if output and "Clone repo" in output[-1]:
+        output.pop()
+        while len(output) >= 2 and output[-1] == "" and output[-2] == "":
+            output.pop()
+
+
+def _replace_git_clone_with_checkout(
+    lines: list[str], fallback_sha: str | None
+) -> tuple[list[str], bool, str]:
+    existing = _existing_checkout(lines)
+    if existing is not None and not any(
+        line.lstrip().startswith("RUN git clone ") for line in lines
+    ):
+        return lines, False, existing[0]
+
+    output: list[str] = []
+    changed = False
+    checkout_path = existing[0] if existing is not None else "/app/src"
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("RUN git clone "):
+            end = _clone_block_end(lines, i)
+            block = lines[i:end]
+            head_sha = _extract_head_sha(block) or fallback_sha
+            checkout_path = _next_workdir(lines, end) or checkout_path
+            if head_sha is None:
+                output.extend(block)
+                i = end
+                continue
+
+            _remove_clone_comment(output)
+            output.append(
+                "# Checkout the preloaded repository at the PR HEAD commit (with fix applied)"
+            )
+            output.append(f"RUN cd {checkout_path} && git checkout --detach {head_sha}")
+            output.append(f"RUN cd {checkout_path} && git submodule update --init || true")
+            changed = True
+            i = end
+            continue
+
+        output.append(line)
+        i += 1
+
+    return output, changed, checkout_path
+
+
+def _has_voyager_path_adjustment(lines: list[str], repo: str) -> bool:
+    source = f"/app/{repo}"
+    return any(
+        VOYAGER_PATH_MARKER in line or ("ln -s " in line and source in line)
+        for line in lines
+    )
+
+
+def _insert_voyager_path_adjustment(
+    lines: list[str], repo: str, checkout_path: str
+) -> tuple[list[str], bool]:
+    if not lines or not lines[0].startswith("FROM "):
+        return lines, False
+    if _has_voyager_path_adjustment(lines, repo):
+        return lines, False
+
+    source = f"/app/{repo}"
+    target = checkout_path or "/app/src"
+    target_parent = str(PurePosixPath(target).parent)
+    block = [
+        "",
+        VOYAGER_PATH_MARKER,
+        f"RUN mkdir -p {target_parent} && \\",
+        f"    mv {source} {target} && \\",
+        f"    ln -s {target} {source}",
+        "",
+    ]
+    return [lines[0], *block, *lines[1:]], True
+
+
+def rewrite_dockerfile_for_voyager(task_dir: Path, entry: Entry) -> list[str]:
+    """Rewrite Dockerfile repo setup for Voyager's preloaded repo images."""
+    dockerfile = _dockerfile_path(task_dir)
     if not dockerfile.is_file():
-        return False
-    text = dockerfile.read_text()
-    if DOCKERFILE_BASE_FROM not in text:
-        return False
-    dockerfile.write_text(text.replace(DOCKERFILE_BASE_FROM, DOCKERFILE_BASE_REPLACEMENT))
-    return True
+        return []
 
-
-def remove_dockerfile_bug_patch(task_dir: Path) -> bool:
-    """Remove the standard bug.patch application block from the Dockerfile."""
-    dockerfile = task_dir / "environment" / "Dockerfile"
-    if not dockerfile.is_file():
-        return False
     text = dockerfile.read_text()
-    new_text, count = DOCKERFILE_BUG_PATCH_RE.subn("", text, count=1)
-    if count == 0:
-        return False
-    dockerfile.write_text(new_text)
-    return True
+    trailing_newline = text.endswith("\n")
+    lines = text.splitlines()
+    changes: list[str] = []
+
+    image_ref = entry.image_ref or None
+    lines, base_changed = _replace_dockerfile_base(lines, image_ref)
+    if base_changed:
+        changes.append("voyager base rewritten" if image_ref else "base rewritten")
+
+    fallback_sha = (
+        entry.base_commit if HEAD_SHA_RE.fullmatch(entry.base_commit) else None
+    )
+    lines, clone_changed, checkout_path = _replace_git_clone_with_checkout(
+        lines, fallback_sha
+    )
+    if clone_changed:
+        changes.append("git clone replaced with checkout")
+    elif any(line.lstrip().startswith("RUN git clone ") for line in lines):
+        changes.append("git clone unchanged")
+    elif _existing_checkout(lines) is not None:
+        changes.append("checkout present")
+
+    if not checkout_path:
+        checkout_path = _first_repo_workdir(lines)
+    lines, path_changed = _insert_voyager_path_adjustment(
+        lines, entry.repo, checkout_path
+    )
+    if path_changed:
+        changes.append("voyager symlink added")
+    elif _has_voyager_path_adjustment(lines, entry.repo):
+        changes.append("voyager symlink present")
+
+    rendered = "\n".join(lines)
+    if trailing_newline:
+        rendered += "\n"
+    if rendered != text:
+        dockerfile.write_text(rendered)
+
+    return changes
 
 
 def write_cwm_metadata(task_dir: Path, entry: Entry, issue_number: str) -> bool:
@@ -545,8 +876,9 @@ def postprocess_task(
 
     The original task under ``tasks_dir`` is left untouched. The copy under
     ``postprocessed_dir`` gets, in order:
-      - the Dockerfile base image rewritten to the internal mirror
-      - the bug.patch application block removed from the Dockerfile
+      - the Dockerfile base image rewritten to the internal mirror when needed
+      - a Voyager path adjustment for the preloaded repository
+      - the generated git clone block replaced with a deterministic checkout
       - a ``[cwm_task_metadata]`` table (with linked issue number) on task.toml
 
     Returns a short status string for logging.
@@ -560,16 +892,16 @@ def postprocess_task(
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
     issue_number = fetch_issue_number(entry.repo, entry.pull_number, tokens)
-    base_ok = rewrite_dockerfile_base(dst_dir)
-    bug_patch_ok = remove_dockerfile_bug_patch(dst_dir)
+    dockerfile_changes = rewrite_dockerfile_for_voyager(dst_dir, entry)
     toml_ok = write_cwm_metadata(dst_dir, entry, issue_number)
 
-    parts = [
-        "base rewritten" if base_ok else "base unchanged",
-        "bug.patch removed" if bug_patch_ok else "bug.patch unchanged",
-        "task.toml updated" if toml_ok else "task.toml unchanged",
-        f"issue={issue_number or 'none'}",
-    ]
+    parts = dockerfile_changes or ["Dockerfile unchanged"]
+    parts.extend(
+        [
+            "task.toml updated" if toml_ok else "task.toml unchanged",
+            f"issue={issue_number or 'none'}",
+        ]
+    )
     return "; ".join(parts)
 
 
@@ -612,6 +944,8 @@ def process_entry(
     log_path: Path,
     cc_timeout: int | None,
     output_dir: Path | None,
+    state_dir: Path | None,
+    repo_cache_dir: Path | None,
     max_retries: int,
     token_pool: list[str],
     force: bool,
@@ -642,6 +976,10 @@ def process_entry(
     # post-processes them.
     if output_dir is not None:
         base_cmd += ["--output", str(output_dir)]
+    if state_dir is not None:
+        base_cmd += ["--state-dir", str(state_dir)]
+    if repo_cache_dir is not None:
+        base_cmd += ["--repo-cache-dir", str(repo_cache_dir)]
     # Forward the Claude Code session timeout when set; otherwise let
     # `swegen create` use its own default.
     if cc_timeout is not None:
@@ -655,9 +993,9 @@ def process_entry(
     tried_tokens: set[str] = {current_token} if current_token else set()
 
     for attempt in range(1, max_retries + 1):
-        # Force-overwrite when explicitly requested, or when regenerating over
-        # partial output left by a failed earlier attempt.
-        cmd = base_cmd + (["--force"] if (force or attempt > 1) else [])
+        # The orchestrator owns skip/rebuild decisions by run-local task dirs,
+        # so bypass create.jsonl dedupe for every processed entry.
+        cmd = base_cmd + ["--force"]
         attempt_note = "" if attempt == 1 else f" (retry {attempt}/{max_retries})"
         token_note = f" [token {_mask_token(current_token)}]" if token_pool else ""
         print(f"{tag} starting{attempt_note}{token_note}", flush=True)
@@ -752,10 +1090,13 @@ def run_consumer(
     log_dir: Path,
     cc_timeout: int | None = None,
     output_dir: Path | None = None,
+    state_dir: Path | None = None,
+    repo_cache_dir: Path | None = None,
     max_retries: int = 3,
     github_tokens: list[str] | None = None,
     force: bool = False,
     postprocessed_dir: Path | None = None,
+    progress_queue: "queue.Queue[Outcome | None] | None" = None,
 ) -> list[Outcome]:
     """Consumer thread: pull repo packages off ``work_queue`` until drained.
 
@@ -802,29 +1143,38 @@ def run_consumer(
                         log_path,
                         cc_timeout,
                         output_dir,
+                        state_dir,
+                        repo_cache_dir,
                         max_retries,
                         token_pool,
                         force,
                     )
-                    outcomes.append(
-                        Outcome(worker_id=worker_id, entry=entry, returncode=returncode)
-                    )
-
+                    postprocess_status = ""
                     # Post-process immediately on success: copy the task into
                     # the postprocessed-output tree and apply the rewrites there.
                     if returncode == 0 and postprocessed_dir is not None:
                         try:
-                            status = postprocess_task(
+                            postprocess_status = postprocess_task(
                                 entry,
                                 output_dir,
                                 postprocessed_dir,
                                 token_pool,
                             )
                         except Exception as e:  # never let postprocess abort work
-                            status = f"ERROR: {e}"
-                        log.write(f"{tag} postprocess: {status}\n")
+                            postprocess_status = f"ERROR: {e}"
+                        log.write(f"{tag} postprocess: {postprocess_status}\n")
                         log.flush()
-                        print(f"{tag} postprocess: {status}", flush=True)
+                        print(f"{tag} postprocess: {postprocess_status}", flush=True)
+
+                    outcome = Outcome(
+                        worker_id=worker_id,
+                        entry=entry,
+                        returncode=returncode,
+                        postprocess_status=postprocess_status,
+                    )
+                    outcomes.append(outcome)
+                    if progress_queue is not None:
+                        progress_queue.put(outcome)
             finally:
                 work_queue.task_done()
 
@@ -897,10 +1247,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers workers), then exit. Without this flag everything runs locally.",
     )
     parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=DEFAULT_RUNS_DIR,
+        help="Root directory containing named run folders.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Run folder name. Defaults to the current UTC timestamp.",
+    )
+    parser.add_argument(
+        "--repo-cache-dir",
+        type=Path,
+        default=DEFAULT_REPO_CACHE_DIR,
+        help="Shared git repo cache directory.",
+    )
+    parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("orchestrator-logs"),
-        help="Directory for per-worker log files.",
+        default=None,
+        help="Directory for per-worker log files. Defaults to <run>/orchestrator-logs.",
+    )
+    parser.add_argument(
+        "--progress-jsonl",
+        type=Path,
+        default=None,
+        help="Per-task completion JSONL. Defaults to <run>/orchestrator-progress.jsonl.",
     )
     parser.add_argument(
         "--output",
@@ -908,20 +1281,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tasks-dir",
         dest="tasks_dir",
         type=Path,
-        default=Path("tasks"),
-        help="Root output dir, forwarded to `swegen create --output`, where tasks "
-        "are written. The originals here are left untouched; post-processed copies "
-        "go under --postprocessed-output. (--tasks-dir is a deprecated alias.)",
+        default=None,
+        help="Root task output dir. Defaults to <run>/tasks. "
+        "(--tasks-dir is a deprecated alias.)",
     )
     parser.add_argument(
         "--postprocessed-output",
         dest="postprocessed_dir",
         type=Path,
         default=None,
-        help="Directory for the post-processed copies of successful tasks. As each "
-        "PR succeeds, its task is copied here and the Dockerfile/task.toml "
-        "rewrites are applied to the copy. Defaults to "
-        f"'{POSTPROCESSED_OUTPUT_NAME}' alongside --output.",
+        help="Directory for post-processed copies of successful tasks. Defaults "
+        f"to <run>/{POSTPROCESSED_OUTPUT_NAME}.",
     )
     # Secrets: default to None here (do NOT pull from os.environ, or --help
     # would print the resolved secret values). When a flag is omitted, the
@@ -978,13 +1348,12 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    resolve_run_layout(args)
+    create_run_dirs(args)
     env = build_child_env(args)
-    args.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve the postprocessed-output tree (where post-processed copies of
-    # successful tasks land). Defaults to a sibling of --output.
-    if args.postprocessed_dir is None:
-        args.postprocessed_dir = args.tasks_dir.parent / POSTPROCESSED_OUTPUT_NAME
+    print(f"Run: {args.run_name} -> {args.run_dir}", flush=True)
+    print(f"Repo cache: {args.repo_cache_dir}", flush=True)
 
     # Slurm mode: fan the input out across nodes via sbatch (one job per node,
     # each running --workers workers locally), then exit. Each node logs to its
@@ -1029,6 +1398,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Post-processed copies of successful tasks -> {args.postprocessed_dir}/",
         flush=True,
     )
+    print(f"Per-task progress JSONL -> {args.progress_jsonl}", flush=True)
 
     # Producer-consumer: a producer thread feeds repo packages onto the queue;
     # each consumer pulls a package, processes its PRs, then pulls the next.
@@ -1040,29 +1410,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     producer_thread.start()
 
-    all_outcomes: list[Outcome] = []
-    with ThreadPoolExecutor(max_workers=num_consumers) as executor:
-        futures = {
-            executor.submit(
-                run_consumer,
-                i,
-                work_queue,
-                env,
-                args.swegen_bin,
-                args.log_dir,
-                args.cc_timeout,
-                args.tasks_dir,
-                args.max_retries,
-                github_tokens,
-                args.force,
-                args.postprocessed_dir,
-            ): i
-            for i in range(num_consumers)
-        }
-        for future in as_completed(futures):
-            all_outcomes.extend(future.result())
+    progress_queue: "queue.Queue[Outcome | None]" = queue.Queue()
+    progress_thread = threading.Thread(
+        target=write_progress_jsonl,
+        args=(progress_queue, args.progress_jsonl),
+        name="progress-writer",
+    )
+    progress_thread.start()
 
-    producer_thread.join()
+    all_outcomes: list[Outcome] = []
+    try:
+        with ThreadPoolExecutor(max_workers=num_consumers) as executor:
+            futures = {
+                executor.submit(
+                    run_consumer,
+                    i,
+                    work_queue,
+                    env,
+                    args.swegen_bin,
+                    args.log_dir,
+                    args.cc_timeout,
+                    args.tasks_dir,
+                    args.state_dir,
+                    args.repo_cache_dir,
+                    args.max_retries,
+                    github_tokens,
+                    args.force,
+                    args.postprocessed_dir,
+                    progress_queue,
+                ): i
+                for i in range(num_consumers)
+            }
+            for future in as_completed(futures):
+                all_outcomes.extend(future.result())
+    finally:
+        progress_queue.put(None)
+        progress_thread.join()
+        producer_thread.join()
 
     # Post-processing already ran incrementally per task (copied into
     # args.postprocessed_dir and rewritten as each PR succeeded).

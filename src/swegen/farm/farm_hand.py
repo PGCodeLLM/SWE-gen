@@ -210,6 +210,7 @@ def _run_reversal_for_pr_impl(
         validate=config.validate,  # Run Harbor validation if --validate flag is set
         force=config.force,
         state_dir=config.state_dir,
+        repo_cache_dir=config.repo_cache_dir,
         verbose=config.verbose,
         quiet=False,
         use_cache=not config.no_cache,

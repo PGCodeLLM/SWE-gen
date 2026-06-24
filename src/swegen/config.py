@@ -22,7 +22,8 @@ class CreateConfig:
         cc_timeout: Timeout for Claude Code session in seconds
         validate: Run Harbor validations (NOP + Oracle)
         force: Bypass local dedupe and regenerate existing tasks
-        state_dir: Directory for local state/cache
+        state_dir: Directory for run-local state/logs/jobs
+        repo_cache_dir: Directory for shared git repository cache
         use_cache: Reuse cached Dockerfiles/test.sh from previous tasks
         require_minimum_difficulty: Require 3+ source files for task
         min_source_files: Minimum number of source files required (default: 3)
@@ -42,6 +43,7 @@ class CreateConfig:
     validate: bool = True
     force: bool = False
     state_dir: Path = field(default_factory=lambda: Path(".swegen"))
+    repo_cache_dir: Path = field(default_factory=lambda: Path("data_cache/repos"))
     use_cache: bool = True
     require_minimum_difficulty: bool = True
     min_source_files: int = 3
@@ -71,7 +73,8 @@ class FarmConfig:
     Attributes:
         repo: GitHub repository in "owner/repo" format
         output: Output directory for generated tasks (default: tasks/)
-        state_dir: Directory for local state/cache
+        state_dir: Directory for local state/logs/jobs
+        repo_cache_dir: Directory for shared git repository cache
         force: Regenerate even if task already exists
         timeout: Timeout per PR in seconds
         cc_timeout: Timeout for Claude Code session in seconds
@@ -95,6 +98,7 @@ class FarmConfig:
     repo: str
     output: Path = field(default_factory=lambda: Path("tasks"))
     state_dir: Path = field(default_factory=lambda: Path(".swegen"))
+    repo_cache_dir: Path = field(default_factory=lambda: Path("data_cache/repos"))
     force: bool = True
     timeout: int = 300
     cc_timeout: int = 900
