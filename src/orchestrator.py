@@ -169,6 +169,7 @@ class Outcome:
     returncode: int
     postprocess_status: str = ""
     image_names: tuple[str, ...] = ()
+    compose_projects: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -181,6 +182,7 @@ class ProcessResult:
 
     returncode: int
     image_names: tuple[str, ...] = ()
+    compose_projects: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -539,6 +541,14 @@ def _docker_image_name(name: str) -> str:
     return re.sub(r"[^a-z0-9._-]", "-", name)
 
 
+def _docker_compose_project_name(name: str) -> str:
+    """Mirror Harbor's Docker Compose project-name sanitization."""
+    name = name.lower()
+    if not re.match(r"^[a-z0-9]", name):
+        name = "0" + name
+    return re.sub(r"[^a-z0-9_-]", "-", name)
+
+
 def _image_tag_for_instance(instance: str) -> str:
     """Return the SWE-gen image tag Harbor builds for an instance."""
     image_name = _docker_image_name(f"hb__{instance}")
@@ -578,8 +588,10 @@ def _instance_harbor_config_paths(
     return configs
 
 
-def _image_tag_from_trial_config(config_path: Path, instance: str) -> str | None:
-    """Best-effort image tag extraction from a Harbor trial config."""
+def _docker_refs_from_trial_config(
+    config_path: Path, instance: str
+) -> tuple[str, str] | None:
+    """Best-effort Docker tag and Compose project extraction from a trial config."""
     try:
         config = json.loads(config_path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -593,55 +605,173 @@ def _image_tag_from_trial_config(config_path: Path, instance: str) -> str | None
     if isinstance(environment, dict) and environment.get("type") != "docker":
         return None
 
-    return _image_tag_for_instance(instance)
+    return (
+        _image_tag_for_instance(instance),
+        _docker_compose_project_name(trial_name.strip()),
+    )
 
 
-def collect_new_instance_image_names(
+def collect_new_instance_docker_refs(
     state_dir: Path | None,
     instance: str,
     before_configs: set[Path],
-) -> tuple[str, ...]:
-    """Collect image tags from Harbor trials created after a task started."""
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Collect Docker tags and Compose projects created after a task started."""
     after_configs = _instance_harbor_config_paths(state_dir, instance)
     image_names: list[str] = []
-    seen: set[str] = set()
+    compose_projects: list[str] = []
+    seen_images: set[str] = set()
+    seen_projects: set[str] = set()
+
     for config_path in sorted(after_configs - before_configs):
-        image_name = _image_tag_from_trial_config(config_path, instance)
-        if image_name and image_name not in seen:
-            seen.add(image_name)
+        refs = _docker_refs_from_trial_config(config_path, instance)
+        if refs is None:
+            continue
+        image_name, compose_project = refs
+        if image_name not in seen_images:
+            seen_images.add(image_name)
             image_names.append(image_name)
-    return tuple(image_names)
+        if compose_project not in seen_projects:
+            seen_projects.add(compose_project)
+            compose_projects.append(compose_project)
+
+    return tuple(image_names), tuple(compose_projects)
 
 
-def prune_docker_images(image_names: tuple[str, ...]) -> ImagePruneResult:
-    """Remove exact Docker image tags for a completed instance."""
+def _docker_no_such_image(output: str) -> bool:
+    return "No such image" in output or "No such object" in output
+
+
+def _docker_image_id(image_ref: str) -> tuple[str | None, bool]:
+    """Return (image_id, missing) for an image ref."""
+    proc = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image_ref],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    if proc.returncode == 0:
+        return proc.stdout.strip(), False
+    if _docker_no_such_image(output):
+        return None, True
+    return None, False
+
+
+def _docker_image_is_dangling(image_id: str) -> tuple[bool, bool]:
+    """Return (is_dangling, missing) for an image id."""
+    proc = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{json .RepoTags}}", image_id],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    if proc.returncode != 0:
+        return False, _docker_no_such_image(output)
+
+    try:
+        repo_tags = json.loads(proc.stdout.strip() or "null")
+    except json.JSONDecodeError:
+        return False, False
+    return not repo_tags, False
+
+
+def _dangling_image_ids_for_compose_project(compose_project: str) -> tuple[str, ...]:
+    proc = subprocess.run(
+        [
+            "docker",
+            "image",
+            "ls",
+            "-a",
+            "-q",
+            "--filter",
+            "dangling=true",
+            "--filter",
+            f"label=com.docker.compose.project={compose_project}",
+            "--filter",
+            "label=com.docker.compose.service=main",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return ()
+    return tuple(line.strip() for line in proc.stdout.splitlines() if line.strip())
+
+
+def prune_docker_images(
+    image_names: tuple[str, ...], compose_projects: tuple[str, ...]
+) -> ImagePruneResult:
+    """Remove exact Docker image tags and dangling images for completed trials."""
     unique_names = tuple(dict.fromkeys(image_names))
+    unique_projects = tuple(dict.fromkeys(compose_projects))
+    image_ids: set[str] = set()
+    dangling_ids: set[str] = set()
+    requested = len(unique_names)
     removed = 0
     missing = 0
     failed = 0
 
     for image_name in unique_names:
         try:
-            proc = subprocess.run(
-                ["docker", "image", "rm", "--force", image_name],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            image_id, image_missing = _docker_image_id(image_name)
         except FileNotFoundError:
             failed += len(unique_names) - removed - missing - failed
-            break
+            return ImagePruneResult(requested, removed, missing, failed)
 
+        if image_missing:
+            missing += 1
+            continue
+        if not image_id:
+            failed += 1
+            continue
+        image_ids.add(image_id)
+
+        proc = subprocess.run(
+            ["docker", "image", "rm", "--force", image_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        if proc.returncode != 0 and not _docker_no_such_image(output):
+            failed += 1
+
+    for compose_project in unique_projects:
+        dangling_ids.update(_dangling_image_ids_for_compose_project(compose_project))
+    requested += len(dangling_ids)
+
+    for image_id in sorted(image_ids | dangling_ids):
+        try:
+            is_dangling, image_missing = _docker_image_is_dangling(image_id)
+        except FileNotFoundError:
+            failed += 1
+            continue
+
+        if image_missing:
+            removed += 1
+            continue
+        if not is_dangling:
+            continue
+
+        proc = subprocess.run(
+            ["docker", "image", "rm", "--force", image_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
         output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
         if proc.returncode == 0:
             removed += 1
-        elif "No such image" in output:
+        elif _docker_no_such_image(output):
             missing += 1
         else:
             failed += 1
 
     return ImagePruneResult(
-        requested=len(unique_names),
+        requested=requested,
         removed=removed,
         missing=missing,
         failed=failed,
@@ -706,11 +836,13 @@ def write_progress_jsonl(
                     status = "failure"
                     _move_instance(instance, failed_instances, successful_instances)
 
-                if outcome.image_names:
-                    prune_result = prune_docker_images(outcome.image_names)
+                if outcome.image_names or outcome.compose_projects:
+                    prune_result = prune_docker_images(
+                        outcome.image_names, outcome.compose_projects
+                    )
                     print(
                         f"[orchestrator] {status}: {instance} pruned "
-                        f"{prune_result.removed} image tag(s); "
+                        f"{prune_result.removed} image object(s); "
                         f"{prune_result.missing} already absent; "
                         f"{prune_result.failed} failed",
                         flush=True,
@@ -1185,10 +1317,10 @@ def process_entry(
             )
             log.write(msg + "\n")
             print(f"{tag} ERROR: {msg}", flush=True)
-            image_names = collect_new_instance_image_names(
+            image_names, compose_projects = collect_new_instance_docker_refs(
                 state_dir, instance, before_configs
             )
-            return ProcessResult(127, image_names)
+            return ProcessResult(127, image_names, compose_projects)
         log.flush()
 
         if returncode == 0:
@@ -1236,10 +1368,12 @@ def process_entry(
         # Either out of retries or a non-transient failure: stop.
         break
 
-    image_names = collect_new_instance_image_names(state_dir, instance, before_configs)
+    image_names, compose_projects = collect_new_instance_docker_refs(
+        state_dir, instance, before_configs
+    )
     status = "OK" if returncode == 0 else f"FAILED rc={returncode}"
     print(f"{tag} {status} (log: {log_path})", flush=True)
-    return ProcessResult(returncode, image_names)
+    return ProcessResult(returncode, image_names, compose_projects)
 
 
 def run_consumer(
@@ -1333,6 +1467,7 @@ def run_consumer(
                         returncode=returncode,
                         postprocess_status=postprocess_status,
                         image_names=process_result.image_names,
+                        compose_projects=process_result.compose_projects,
                     )
                     outcomes.append(outcome)
                     if progress_queue is not None:
