@@ -20,10 +20,10 @@ skipped (so reruns only fill gaps); pass ``--force`` to rebuild every PR.
 As soon as a PR's ``swegen create`` run succeeds, that task is copied into the
 postprocessed-output tree (``--postprocessed-output``, default
 ``tasks_voyager_postprocessed``) and all post-processing is applied to the *copy*,
-leaving the original task untouched. Post-processing copies obs_download.py into
-the task's environment/, rewrites the Dockerfile base image to the internal
-mirror, replaces the git-clone block with an obs_download fetch, and appends a
-``[cwm_task_metadata]`` table (with the linked issue number) to task.toml.
+leaving the original task untouched. Post-processing rewrites the Dockerfile
+base image to the internal mirror, removes the bug.patch application block, and
+appends a ``[cwm_task_metadata]`` table (with the linked issue number) to
+task.toml.
 
 Within a package, each PR is processed sequentially by shelling out to:
 
@@ -56,13 +56,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-
-# Helper file copied into every postprocessed task's environment/ folder during
-# post-processing. The rewritten Dockerfile COPYs it into the image and runs it
-# to fetch the repo (replacing the original git clone).
-OBS_DOWNLOAD_SRC = (
-    Path(__file__).resolve().parent / "swegen" / "postprocessing" / "obs_download.py"
-)
 
 # Default directory for the post-processed copies of successful tasks. The
 # originals under --output are left untouched; postprocessed copies land here
@@ -120,14 +113,13 @@ DOCKERFILE_BASE_REPLACEMENT = (
     "swesandbox/ubuntu:24.04"
 )
 
-# Post-processing: the skeleton's `RUN git clone <url> src && ... git submodule
-# update` block (see swegen/create/task_skeleton.py generate_dockerfile) is
-# replaced with an obs_download fetch. The repo URL has already been filled in
-# by the time post-processing runs, so it is captured from the matched block and
-# reused verbatim in the replacement.
-DOCKERFILE_CLONE_RE = re.compile(
-    r"RUN git clone (?P<url>\S+) src &&.*?git submodule update --init --recursive",
-    re.DOTALL,
+# Post-processing removes the baseline-reversal patch from copied tasks. The
+# source task still keeps bug.patch and applies it normally.
+DOCKERFILE_BUG_PATCH_RE = re.compile(
+    r"(?m)^[ \t]*(?:#[^\n]*bug\.patch[^\n]*\n)?"
+    r"[ \t]*COPY[ \t]+bug\.patch[ \t]+/tmp/bug\.patch[ \t]*\n"
+    r"[ \t]*RUN[ \t]+patch[ \t]+-p1[ \t]+<[ \t]+/tmp/bug\.patch"
+    r"[ \t]+&&[ \t]+rm[ \t]+/tmp/bug\.patch[ \t]*\n?"
 )
 
 # Env vars forwarded to each `swegen create` subprocess. Maps the CLI flag name
@@ -423,20 +415,6 @@ def submit_slurm_jobs(
     return 0 if failures == 0 and submitted else 1
 
 
-def copy_obs_download(task_dir: Path, source: Path) -> bool:
-    """Copy ``source`` (obs_download.py) into ``task_dir/environment``.
-
-    The environment/ folder is created if it doesn't already exist. Returns True
-    on success, False if the source file is missing.
-    """
-    if not source.is_file():
-        return False
-    env_dir = task_dir / "environment"
-    env_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, env_dir / source.name)
-    return True
-
-
 def task_dir_name(repo: str, pull_number: str) -> str:
     """Compute the task directory name `swegen create` writes for a PR.
 
@@ -518,40 +496,16 @@ def rewrite_dockerfile_base(task_dir: Path) -> bool:
     return True
 
 
-def rewrite_dockerfile_clone(task_dir: Path) -> bool:
-    """Replace the git-clone block in <task_dir>/environment/Dockerfile.
-
-    Swaps the skeleton's ``RUN git clone <url> src && ... git submodule update``
-    block for a ``COPY obs_download.py`` + obs_download fetch of the same repo.
-    The repo URL is captured from the matched block (already filled in by the
-    time post-processing runs) and reused verbatim. Returns True if the block
-    was found and rewritten, False otherwise.
-    """
+def remove_dockerfile_bug_patch(task_dir: Path) -> bool:
+    """Remove the standard bug.patch application block from the Dockerfile."""
     dockerfile = task_dir / "environment" / "Dockerfile"
     if not dockerfile.is_file():
         return False
     text = dockerfile.read_text()
-    match = DOCKERFILE_CLONE_RE.search(text)
-    if not match:
+    new_text, count = DOCKERFILE_BUG_PATCH_RE.subn("", text, count=1)
+    if count == 0:
         return False
-    url = match.group("url")
-    replacement = (
-        # Install uv and a managed Python with the OBS SDK, then fetch the repo
-        # tarball from OBS via obs_download.py instead of cloning from git.
-        "RUN curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-        'ENV PATH="/root/.local/bin:${PATH}"\n'
-        "RUN uv venv --managed-python --python 3.12 /opt/obs-python\n"
-        "RUN uv pip install --python /opt/obs-python/bin/python esdk-obs-python "
-        "--trusted-host pypi.org\n"
-        "COPY obs_download.py /usr/local/bin/obs_download.py\n"
-        f"RUN REPO_FULL_NAME=\"$(echo '{url}' "
-        "| sed -E 's#^[a-z]+://[^/]+/##; s/\\.git$//')\" && \\\n"
-        '    /opt/obs-python/bin/python /usr/local/bin/obs_download.py '
-        '"$REPO_FULL_NAME" src && \\\n'
-        "    cd src && \\\n"
-        "    git submodule update --init --recursive"
-    )
-    dockerfile.write_text(text[: match.start()] + replacement + text[match.end() :])
+    dockerfile.write_text(new_text)
     return True
 
 
@@ -585,16 +539,14 @@ def postprocess_task(
     entry: Entry,
     tasks_dir: Path,
     postprocessed_dir: Path,
-    obs_src: Path | None,
     tokens: list[str] | None,
 ) -> str:
     """Copy one successful task into the postprocessed-output tree, then post-process.
 
     The original task under ``tasks_dir`` is left untouched. The copy under
     ``postprocessed_dir`` gets, in order:
-      - obs_download.py copied into environment/
       - the Dockerfile base image rewritten to the internal mirror
-      - the git-clone block replaced with an obs_download fetch
+      - the bug.patch application block removed from the Dockerfile
       - a ``[cwm_task_metadata]`` table (with linked issue number) on task.toml
 
     Returns a short status string for logging.
@@ -607,16 +559,14 @@ def postprocess_task(
     dst_dir = postprocessed_dir / name
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
-    obs_ok = copy_obs_download(dst_dir, obs_src) if obs_src is not None else False
     issue_number = fetch_issue_number(entry.repo, entry.pull_number, tokens)
     base_ok = rewrite_dockerfile_base(dst_dir)
-    clone_ok = rewrite_dockerfile_clone(dst_dir)
+    bug_patch_ok = remove_dockerfile_bug_patch(dst_dir)
     toml_ok = write_cwm_metadata(dst_dir, entry, issue_number)
 
     parts = [
-        "obs_download copied" if obs_ok else "obs_download MISSING",
         "base rewritten" if base_ok else "base unchanged",
-        "clone replaced" if clone_ok else "clone unchanged",
+        "bug.patch removed" if bug_patch_ok else "bug.patch unchanged",
         "task.toml updated" if toml_ok else "task.toml unchanged",
         f"issue={issue_number or 'none'}",
     ]
@@ -689,7 +639,7 @@ def process_entry(
         "--verbose",
     ]
     # Forward the output directory so tasks land where the orchestrator later
-    # copies obs_download.py.
+    # post-processes them.
     if output_dir is not None:
         base_cmd += ["--output", str(output_dir)]
     # Forward the Claude Code session timeout when set; otherwise let
@@ -806,7 +756,6 @@ def run_consumer(
     github_tokens: list[str] | None = None,
     force: bool = False,
     postprocessed_dir: Path | None = None,
-    obs_src: Path | None = None,
 ) -> list[Outcome]:
     """Consumer thread: pull repo packages off ``work_queue`` until drained.
 
@@ -869,7 +818,6 @@ def run_consumer(
                                 entry,
                                 output_dir,
                                 postprocessed_dir,
-                                obs_src,
                                 token_pool,
                             )
                         except Exception as e:  # never let postprocess abort work
@@ -971,8 +919,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory for the post-processed copies of successful tasks. As each "
-        "PR succeeds, its task is copied here and the obs_download/Dockerfile/"
-        "task.toml rewrites are applied to the copy. Defaults to "
+        "PR succeeds, its task is copied here and the Dockerfile/task.toml "
+        "rewrites are applied to the copy. Defaults to "
         f"'{POSTPROCESSED_OUTPUT_NAME}' alongside --output.",
     )
     # Secrets: default to None here (do NOT pull from os.environ, or --help
@@ -1037,13 +985,6 @@ def main(argv: list[str] | None = None) -> int:
     # successful tasks land). Defaults to a sibling of --output.
     if args.postprocessed_dir is None:
         args.postprocessed_dir = args.tasks_dir.parent / POSTPROCESSED_OUTPUT_NAME
-
-    if not OBS_DOWNLOAD_SRC.is_file():
-        print(
-            f"warning: {OBS_DOWNLOAD_SRC} not found; obs_download.py will NOT be "
-            "copied into postprocessed tasks and the Dockerfile fetch will fail.",
-            file=sys.stderr,
-        )
 
     # Slurm mode: fan the input out across nodes via sbatch (one job per node,
     # each running --workers workers locally), then exit. Each node logs to its
@@ -1115,7 +1056,6 @@ def main(argv: list[str] | None = None) -> int:
                 github_tokens,
                 args.force,
                 args.postprocessed_dir,
-                OBS_DOWNLOAD_SRC,
             ): i
             for i in range(num_consumers)
         }

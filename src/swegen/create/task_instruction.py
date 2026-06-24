@@ -48,6 +48,8 @@ KEEP (is_substantial=true) if the PR:
 - Has meaningful behavioral changes affecting multiple components or modules
 - Requires coordination between different parts of the codebase
 
+SET is_substantial=true IF SPECIFICALLY REQUESTED AT THE END OF THIS PROMPT.
+
 CRITICAL REQUIREMENT for is_substantial=true:
 The PR MUST modify multiple files (at least 2-3 meaningful source code files, not counting trivial changes).
 Single-file changes are almost never substantial enough unless they involve major refactoring or complex logic.
@@ -185,6 +187,7 @@ def _format_user_prompt(
     )
     source_files = total - tests - docs
 
+    print(f"STATUS OF FORCE_GENERATE_INSTRUCTION: {force_generate_instruction}")
     # Modify ending instruction based on force_generate_instruction flag
     if force_generate_instruction:
         ending_instruction = (
