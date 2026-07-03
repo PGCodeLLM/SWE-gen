@@ -67,6 +67,7 @@ from pathlib import Path, PurePosixPath
 # Run-local directory name for post-processed copies of successful tasks.
 POSTPROCESSED_OUTPUT_NAME = "tasks_voyager_postprocessed"
 PROGRESS_JSONL_NAME = "orchestrator-progress.jsonl"
+INSTANCE_STATUS_JSONL_NAME = "orchestrator-instance-status.jsonl"
 DEFAULT_RUNS_DIR = Path("runs")
 DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
 RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -169,6 +170,7 @@ class Outcome:
     returncode: int
     postprocess_status: str = ""
     image_names: tuple[str, ...] = ()
+    image_ids: tuple[str, ...] = ()
     compose_projects: tuple[str, ...] = ()
 
     @property
@@ -182,6 +184,7 @@ class ProcessResult:
 
     returncode: int
     image_names: tuple[str, ...] = ()
+    image_ids: tuple[str, ...] = ()
     compose_projects: tuple[str, ...] = ()
 
 
@@ -193,6 +196,7 @@ class ImagePruneResult:
     removed: int
     missing: int
     failed: int
+    image_ids: tuple[str, ...] = ()
 
 
 def load_entries(jsonl_path: Path) -> list[Entry]:
@@ -367,6 +371,8 @@ def resolve_run_layout(args: argparse.Namespace) -> None:
         args.log_dir = args.run_dir / "orchestrator-logs"
     if args.progress_jsonl is None:
         args.progress_jsonl = args.run_dir / PROGRESS_JSONL_NAME
+    if args.instance_status_jsonl is None:
+        args.instance_status_jsonl = args.run_dir / INSTANCE_STATUS_JSONL_NAME
 
     args.repo_cache_dir = args.repo_cache_dir or DEFAULT_REPO_CACHE_DIR
 
@@ -384,6 +390,7 @@ def create_run_dirs(args: argparse.Namespace) -> None:
         path.mkdir(parents=True, exist_ok=True)
     args.repo_cache_dir.mkdir(parents=True, exist_ok=True)
     args.progress_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    args.instance_status_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
 
 def write_chunk(path: Path, segment: list[Entry]) -> None:
@@ -431,6 +438,8 @@ def build_child_command(
         str(node_log_dir),
         "--progress-jsonl",
         str(node_log_dir / PROGRESS_JSONL_NAME),
+        "--instance-status-jsonl",
+        str(node_log_dir / INSTANCE_STATUS_JSONL_NAME),
         # Shared, flat output dir — outputs are NOT subfoldered per node.
         "--output",
         str(args.tasks_dir),
@@ -701,6 +710,37 @@ def _dangling_image_ids_for_compose_project(compose_project: str) -> tuple[str, 
     return tuple(line.strip() for line in proc.stdout.splitlines() if line.strip())
 
 
+def collect_instance_docker_image_ids(
+    image_names: tuple[str, ...], compose_projects: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Resolve Docker image IDs for all known images used by an instance."""
+    image_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    def add_image_id(image_id: str | None) -> None:
+        if image_id and image_id not in seen_ids:
+            seen_ids.add(image_id)
+            image_ids.append(image_id)
+
+    for image_name in dict.fromkeys(image_names):
+        try:
+            image_id, image_missing = _docker_image_id(image_name)
+        except FileNotFoundError:
+            return tuple(image_ids)
+        if not image_missing:
+            add_image_id(image_id)
+
+    for compose_project in dict.fromkeys(compose_projects):
+        try:
+            dangling_ids = _dangling_image_ids_for_compose_project(compose_project)
+        except FileNotFoundError:
+            return tuple(image_ids)
+        for image_id in dangling_ids:
+            add_image_id(image_id)
+
+    return tuple(image_ids)
+
+
 def prune_docker_images(
     image_names: tuple[str, ...], compose_projects: tuple[str, ...]
 ) -> ImagePruneResult:
@@ -719,7 +759,13 @@ def prune_docker_images(
             image_id, image_missing = _docker_image_id(image_name)
         except FileNotFoundError:
             failed += len(unique_names) - removed - missing - failed
-            return ImagePruneResult(requested, removed, missing, failed)
+            return ImagePruneResult(
+                requested=requested,
+                removed=removed,
+                missing=missing,
+                failed=failed,
+                image_ids=tuple(sorted(image_ids)),
+            )
 
         if image_missing:
             missing += 1
@@ -743,7 +789,9 @@ def prune_docker_images(
         dangling_ids.update(_dangling_image_ids_for_compose_project(compose_project))
     requested += len(dangling_ids)
 
-    for image_id in sorted(image_ids | dangling_ids):
+    all_image_ids = tuple(sorted(image_ids | dangling_ids))
+
+    for image_id in all_image_ids:
         try:
             is_dangling, image_missing = _docker_image_is_dangling(image_id)
         except FileNotFoundError:
@@ -775,11 +823,12 @@ def prune_docker_images(
         removed=removed,
         missing=missing,
         failed=failed,
+        image_ids=all_image_ids,
     )
 
 
-def _load_progress_lists(progress_path: Path) -> tuple[list[str], list[str]]:
-    """Load the last success/failure lists from an existing progress JSONL."""
+def _load_legacy_progress_lists(progress_path: Path) -> tuple[list[str], list[str]]:
+    """Load success/failure lists from pre-status-file progress records."""
     if not progress_path.exists():
         return [], []
 
@@ -812,14 +861,136 @@ def _move_instance(
         target.append(instance)
 
 
-def write_progress_jsonl(
-    progress_queue: "queue.Queue[Outcome | None]", progress_path: Path
+def _apply_instance_status_record(
+    record: dict[str, object],
+    successful_instances: list[str],
+    failed_instances: list[str],
 ) -> None:
-    """Write progress JSONL snapshots and prune completed-instance images."""
-    progress_path.parent.mkdir(parents=True, exist_ok=True)
-    successful_instances, failed_instances = _load_progress_lists(progress_path)
+    """Apply one compact instance-status record to the in-memory lists."""
+    instance = record.get("instance")
+    status = record.get("status")
+    if not isinstance(instance, str):
+        return
+    if status == "success":
+        _move_instance(instance, successful_instances, failed_instances)
+    elif status == "failure":
+        _move_instance(instance, failed_instances, successful_instances)
 
-    with progress_path.open("a") as fh:
+
+def _replay_instance_status_jsonl(
+    instance_status_path: Path,
+    successful_instances: list[str],
+    failed_instances: list[str],
+) -> None:
+    """Replay compact per-instance status updates, ignoring partial/corrupt lines."""
+    if not instance_status_path.exists():
+        return
+
+    try:
+        with instance_status_path.open(errors="replace") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    _apply_instance_status_record(
+                        record, successful_instances, failed_instances
+                    )
+    except OSError:
+        return
+
+
+def _load_progress_lists(
+    progress_path: Path, instance_status_path: Path | None = None
+) -> tuple[list[str], list[str]]:
+    """Load current success/failure lists from legacy progress and status logs."""
+    successful_instances, failed_instances = _load_legacy_progress_lists(progress_path)
+    if instance_status_path is not None:
+        _replay_instance_status_jsonl(
+            instance_status_path, successful_instances, failed_instances
+        )
+    return successful_instances, failed_instances
+
+
+def _create_log_has_success(create_log_path: Path, instance: str) -> bool:
+    """Return True if run-local create.jsonl has a successful task record."""
+    if not create_log_path.exists():
+        return False
+
+    try:
+        with create_log_path.open(errors="replace") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("task_id") == instance:
+                    return True
+                harbor = record.get("harbor")
+                if isinstance(harbor, str) and Path(harbor).name == instance:
+                    return True
+    except OSError:
+        return False
+
+    return False
+
+
+def _instance_artifact_exists(
+    instance: str, output_dir: Path | None, postprocessed_dir: Path | None
+) -> bool:
+    """Return True if one of the run-local produced task directories exists."""
+    candidate_roots = [
+        path for path in (output_dir, postprocessed_dir) if path is not None
+    ]
+    if not candidate_roots:
+        return True
+    return any((root / instance).exists() for root in candidate_roots)
+
+
+def instance_successfully_produced(
+    entry: Entry,
+    state_dir: Path | None,
+    progress_path: Path | None,
+    instance_status_path: Path | None,
+    output_dir: Path | None = None,
+    postprocessed_dir: Path | None = None,
+) -> bool:
+    """Check run-local state for a prior successful production of this instance."""
+    instance = task_dir_name(entry.repo, entry.pull_number)
+    if not _instance_artifact_exists(instance, output_dir, postprocessed_dir):
+        return False
+
+    if state_dir is not None and _create_log_has_success(
+        state_dir / "create.jsonl", instance
+    ):
+        return True
+
+    if progress_path is None:
+        return False
+    successful_instances, _failed_instances = _load_progress_lists(
+        progress_path, instance_status_path
+    )
+    return instance in successful_instances
+
+
+def write_progress_jsonl(
+    progress_queue: "queue.Queue[Outcome | None]",
+    progress_path: Path,
+    instance_status_path: Path,
+) -> None:
+    """Write compact per-task progress and per-instance status JSONL records."""
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    instance_status_path.parent.mkdir(parents=True, exist_ok=True)
+    successful_instances, failed_instances = _load_progress_lists(
+        progress_path, instance_status_path
+    )
+
+    with progress_path.open("a") as progress_fh, instance_status_path.open(
+        "a"
+    ) as status_fh:
         while True:
             outcome = progress_queue.get()
             try:
@@ -836,10 +1007,32 @@ def write_progress_jsonl(
                     status = "failure"
                     _move_instance(instance, failed_instances, successful_instances)
 
+                prune_result = ImagePruneResult(
+                    requested=0,
+                    removed=0,
+                    missing=0,
+                    failed=0,
+                    image_ids=outcome.image_ids,
+                )
                 if outcome.image_names or outcome.compose_projects:
                     prune_result = prune_docker_images(
                         outcome.image_names, outcome.compose_projects
                     )
+
+                image_ids = tuple(
+                    dict.fromkeys((*outcome.image_ids, *prune_result.image_ids))
+                )
+                print(
+                    f"[orchestrator] {status}: {instance} image tags: "
+                    f"{json.dumps(list(outcome.image_names))}",
+                    flush=True,
+                )
+                print(
+                    f"[orchestrator] {status}: {instance} image ids: "
+                    f"{json.dumps(list(image_ids))}",
+                    flush=True,
+                )
+                if outcome.image_names or outcome.compose_projects:
                     print(
                         f"[orchestrator] {status}: {instance} pruned "
                         f"{prune_result.removed} image object(s); "
@@ -853,8 +1046,25 @@ def write_progress_jsonl(
                         flush=True,
                     )
 
-                record = {
-                    "timestamp": datetime.now(UTC).isoformat(),
+                timestamp = datetime.now(UTC).isoformat()
+                total_successes = len(successful_instances)
+                total_failures = len(failed_instances)
+                total_processed = total_successes + total_failures
+                status_record = {
+                    "timestamp": timestamp,
+                    "event": "instance_status",
+                    "status": status,
+                    "instance": instance,
+                    "repo": outcome.entry.repo,
+                    "pull_number": outcome.entry.pull_number,
+                    "worker_id": outcome.worker_id,
+                    "returncode": outcome.returncode,
+                    "total_successes": total_successes,
+                    "total_failures": total_failures,
+                    "total_processed": total_processed,
+                }
+                progress_record = {
+                    "timestamp": timestamp,
                     "event": "task_finished",
                     "status": status,
                     "instance": instance,
@@ -863,14 +1073,23 @@ def write_progress_jsonl(
                     "worker_id": outcome.worker_id,
                     "returncode": outcome.returncode,
                     "postprocess_status": outcome.postprocess_status,
-                    "total_successes": len(successful_instances),
-                    "total_failures": len(failed_instances),
-                    "total_processed": len(successful_instances) + len(failed_instances),
-                    "successful_instances": successful_instances.copy(),
-                    "failed_instances": failed_instances.copy(),
+                    "image_names": list(outcome.image_names),
+                    "image_ids": list(image_ids),
+                    "compose_projects": list(outcome.compose_projects),
+                    "image_prune": {
+                        "requested": prune_result.requested,
+                        "removed": prune_result.removed,
+                        "missing": prune_result.missing,
+                        "failed": prune_result.failed,
+                    },
+                    "total_successes": total_successes,
+                    "total_failures": total_failures,
+                    "total_processed": total_processed,
                 }
-                fh.write(json.dumps(record) + "\n")
-                fh.flush()
+                status_fh.write(json.dumps(status_record) + "\n")
+                status_fh.flush()
+                progress_fh.write(json.dumps(progress_record) + "\n")
+                progress_fh.flush()
             finally:
                 progress_queue.task_done()
 
@@ -1243,8 +1462,8 @@ def process_entry(
     When ``token_pool`` holds more than one token, each run injects a random one
     as GITHUB_TOKEN for cloning/API access; a run that fails with a GitHub
     rate-limit/forbidden error (HTTP 403/429) is retried with a *different* token
-    from the pool. Returns the final return code and any Harbor image tags created
-    during this task's run.
+    from the pool. Returns the final return code plus any Harbor image tags
+    and Docker image IDs observed during this task's run.
     """
     instance = task_dir_name(entry.repo, entry.pull_number)
     before_configs = _instance_harbor_config_paths(state_dir, instance)
@@ -1320,7 +1539,15 @@ def process_entry(
             image_names, compose_projects = collect_new_instance_docker_refs(
                 state_dir, instance, before_configs
             )
-            return ProcessResult(127, image_names, compose_projects)
+            image_ids = collect_instance_docker_image_ids(
+                image_names, compose_projects
+            )
+            return ProcessResult(
+                returncode=127,
+                image_names=image_names,
+                image_ids=image_ids,
+                compose_projects=compose_projects,
+            )
         log.flush()
 
         if returncode == 0:
@@ -1371,9 +1598,15 @@ def process_entry(
     image_names, compose_projects = collect_new_instance_docker_refs(
         state_dir, instance, before_configs
     )
+    image_ids = collect_instance_docker_image_ids(image_names, compose_projects)
     status = "OK" if returncode == 0 else f"FAILED rc={returncode}"
     print(f"{tag} {status} (log: {log_path})", flush=True)
-    return ProcessResult(returncode, image_names, compose_projects)
+    return ProcessResult(
+        returncode=returncode,
+        image_names=image_names,
+        image_ids=image_ids,
+        compose_projects=compose_projects,
+    )
 
 
 def run_consumer(
@@ -1391,6 +1624,8 @@ def run_consumer(
     force: bool = False,
     postprocessed_dir: Path | None = None,
     progress_queue: "queue.Queue[Outcome | None] | None" = None,
+    progress_path: Path | None = None,
+    instance_status_path: Path | None = None,
 ) -> list[Outcome]:
     """Consumer thread: pull repo packages off ``work_queue`` until drained.
 
@@ -1427,6 +1662,20 @@ def run_consumer(
                         f"[worker {worker_id}] ({idx}/{total}) "
                         f"{entry.repo}#{entry.pull_number}"
                     )
+                    if not force and instance_successfully_produced(
+                        entry,
+                        state_dir,
+                        progress_path,
+                        instance_status_path,
+                        output_dir,
+                        postprocessed_dir,
+                    ):
+                        msg = f"{tag} skipped: already successful in this run"
+                        log.write(msg + "\n")
+                        log.flush()
+                        print(msg, flush=True)
+                        continue
+
                     process_result = process_entry(
                         worker_id,
                         entry,
@@ -1467,6 +1716,7 @@ def run_consumer(
                         returncode=returncode,
                         postprocess_status=postprocess_status,
                         image_names=process_result.image_names,
+                        image_ids=process_result.image_ids,
                         compose_projects=process_result.compose_projects,
                     )
                     outcomes.append(outcome)
@@ -1571,6 +1821,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Per-task completion JSONL. Defaults to <run>/orchestrator-progress.jsonl.",
+    )
+    parser.add_argument(
+        "--instance-status-jsonl",
+        type=Path,
+        default=None,
+        help="Per-instance status JSONL. Defaults to <run>/orchestrator-instance-status.jsonl.",
     )
     parser.add_argument(
         "--output",
@@ -1696,6 +1952,7 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     print(f"Per-task progress JSONL -> {args.progress_jsonl}", flush=True)
+    print(f"Per-instance status JSONL -> {args.instance_status_jsonl}", flush=True)
 
     # Producer-consumer: a producer thread feeds repo packages onto the queue;
     # each consumer pulls a package, processes its PRs, then pulls the next.
@@ -1710,7 +1967,7 @@ def main(argv: list[str] | None = None) -> int:
     progress_queue: "queue.Queue[Outcome | None]" = queue.Queue()
     progress_thread = threading.Thread(
         target=write_progress_jsonl,
-        args=(progress_queue, args.progress_jsonl),
+        args=(progress_queue, args.progress_jsonl, args.instance_status_jsonl),
         name="progress-writer",
     )
     progress_thread.start()
@@ -1735,6 +1992,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.force,
                     args.postprocessed_dir,
                     progress_queue,
+                    args.progress_jsonl,
+                    args.instance_status_jsonl,
                 ): i
                 for i in range(num_consumers)
             }

@@ -922,8 +922,6 @@ async def _run_claude_code_session_async(
         extra_args: dict[str, str | None] = {}
         stderr_cb = None
         if os.environ.get("SWEGEN_CC_DEBUG", "").strip().lower() in ("1", "true", "yes"):
-            debug_file = jobs_dir / f"{task_id}-cc-debug.log"
-            extra_args["debug-file"] = str(debug_file)  # implicitly enables --debug
 
             def stderr_cb(line: str) -> None:
                 # Surface only error-ish stderr inline; full detail is in debug_file.
@@ -932,10 +930,6 @@ async def _run_claude_code_session_async(
                     k in low for k in ("error", "socket", "econn", "etimedout", "fetch", "timeout")
                 ):
                     print(f"[cc-stderr] {line.rstrip()}", flush=True)
-
-            logger.info("Claude Code debug log: %s", debug_file)
-            if verbose:
-                print(f"[SDK] CC debug log: {debug_file}", flush=True)
 
         # Pin all SDK rounds for this instance to one model via a stable
         # X-Session-ID header, so a router fronting multiple models keeps this
