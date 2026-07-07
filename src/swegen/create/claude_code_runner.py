@@ -32,174 +32,60 @@ class ClaudeCodeResult:
     cc_output: str | None = None
 
 
-# The prompt for CC when using a reference task (much simpler task)
-CC_REFERENCE_PROMPT = """
-## Your Task: Fill In Skeleton Using Reference Task as Example
+def _format_dockerfile_hint_section(
+    reference_task_id: str | None,
+    reference_pr: int | None,
+    dataset_path: Path,
+    logger: logging.Logger,
+) -> str:
+    """Return an optional prompt section containing only a prior Dockerfile."""
+    if not reference_task_id or reference_pr is None:
+        return ""
 
-**GREAT NEWS**: We have a working task from PR #{reference_pr} (task: `{reference_task_id}`)!
+    reference_dockerfile_path = (
+        dataset_path / reference_task_id / "environment" / "Dockerfile"
+    ).resolve()
+    try:
+        reference_dockerfile = reference_dockerfile_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError as e:
+        logger.warning(
+            "Skipping Dockerfile hint from %s: could not read %s: %s",
+            reference_task_id,
+            reference_dockerfile_path,
+            e,
+        )
+        return ""
 
-Your job is MUCH SIMPLER than usual:
-1. **Look at the reference task** to see what was added (runtime, packages, env vars, build steps, test command)
-2. **Fill in your skeleton's TODOs** with the same things
-3. **Update test file paths** to match this PR
-4. **Run harbor validation** to confirm it works
+    return CC_DOCKERFILE_HINT_SECTION.format(
+        reference_pr=reference_pr,
+        reference_task_id=reference_task_id,
+        reference_dockerfile_path=reference_dockerfile_path,
+        reference_dockerfile=reference_dockerfile,
+    )
 
-## Context
 
-**Repository**: {repo} (cloned at `{repo_path}`)
-**Current PR**: #{pr_number}
-**Reference Task**: `{reference_task_id}` (from PR #{reference_pr}, tested and validated)
-**Current Task Directory**: `{task_dir}` ← Your skeleton (CORRECT hashes already!)
-**Reference Task Directory**: `{reference_task_dir}` ← Working example to learn from
-**Dataset Path**: `{dataset_path}`
+CC_DOCKERFILE_HINT_SECTION = """
+## Prior Successful Dockerfile Hint
 
-## Test Files for This PR
+A Harbor task for the same repository succeeded for PR #{reference_pr}
+(`{reference_task_id}`). Its Dockerfile is included below as a hint for
+runtime installation, system packages, package manager setup, dependency
+installation, environment variables, build commands, and post-patch rebuild
+commands.
 
-{test_files_list}
+**Use this as a hint only.** Your current skeleton remains the source of truth:
+- Do not copy the whole Dockerfile.
+- Do not copy git clone/fetch/checkout SHAs from the hint.
+- Do not copy patch filenames or PR-specific paths from the hint.
+- No previous `test.sh` is provided; determine the test command for the current PR.
 
-## What's Already Done
+Reference Dockerfile path: `{reference_dockerfile_path}`
 
-✓ Skeleton Dockerfile with CORRECT git SHAs ({head_sha}) and basic structure
-✓ Skeleton test.sh with TODO for test command
-✓ bug.patch and fix.patch are ready
-✓ instruction.md and task.toml are ready
-✓ Reference task has working Dockerfile and test.sh as examples
-
-## IMPORTANT: Your Skeleton Already Has Correct Hashes!
-
-**DO NOT copy files from reference and replace hashes** - that's error-prone!
-
-Instead:
-1. Read `{task_dir}/environment/Dockerfile` - it has TODO comments
-2. Read `{reference_task_dir}/environment/Dockerfile` - see what was filled in
-3. Add the same things to YOUR skeleton's TODO sections
-
-The skeleton already has:
-✓ Correct git clone URL
-✓ Correct HEAD SHA ({head_sha})
-✓ Basic apt packages (git, curl, patch, build-essential)
-✓ Correct bug.patch application
-
-## Your Process
-
-### Step 1: Compare Reference Dockerfile to Your Skeleton
-
-Read both files:
-```bash
-# Your skeleton (has TODO comments to fill in)
-cat {task_dir}/environment/Dockerfile
-
-# Reference (shows what was filled in for a similar PR)
-cat {reference_task_dir}/environment/Dockerfile
-```
-
-Look for what the reference added beyond the basic skeleton:
-- Language runtime installation (Python, Node.js, Go, Rust, Ruby, Java, etc.)
-- Additional system packages (python3-dev, libssl-dev, etc.)
-- Package manager setup
-- Environment variables (CI=true, NODE_ENV=test, etc.)
-- Dependency installation commands
-- Build steps
-- Post-patch rebuild steps
-
-### Step 2: Fill In Your Skeleton's TODOs
-
-**CRITICAL: Always use Ubuntu base image**
-- The skeleton Dockerfile starts with `FROM ubuntu:24.04` - **DO NOT change this**
-- **NEVER** use language-specific base images (node:XX, python:XX, golang:XX)
-- Install language runtimes via apt-get or official installers
-
-Add the same things from the reference to your skeleton. For example:
-
-**If reference has:**
 ```dockerfile
-# Install Python
-RUN apt-get update && apt-get install -y \\
-    python3 python3-pip python3-venv python3-dev \\
-    && rm -rf /var/lib/apt/lists/*
+{reference_dockerfile}
 ```
-
-**Then replace your TODO:**
-```dockerfile
-# TODO: Install language runtime
-```
-
-**With the same installation commands.**
-
-**DO NOT just copy the entire reference file** - the git SHAs would be wrong!
-**DO fill in the TODOs** using the reference as a guide.
-
-### Step 3: Fill In test.sh Test Command
-
-Read both test files:
-```bash
-# Your skeleton (has TODO for test command)
-cat {task_dir}/tests/test.sh
-
-# Reference (shows what test command worked)
-cat {reference_task_dir}/tests/test.sh
-```
-
-**CRITICAL**: Update the test command to run ONLY the test files for THIS PR!
-
-**Current test files for THIS PR**:
-{test_files_list}
-
-The reference test.sh will show you the test runner pattern.
-**Copy the pattern but update the file paths** to match this PR's test files.
-
-**DO NOT use**:
-- `npm test`, `pytest`, `go test ./...` without specific paths ❌ (runs entire suite)
-- Any command without specific file paths ❌
-
-Replace the TODO placeholder with the actual test command running THIS PR's test files.
-
-### Step 4: Run Harbor Validation
-
-For each validation attempt, increment the run number (-1, -2, -3, etc.):
-
-Before running ```harbor run```, make sure to either ```sg docker``` or ```newgrp docker``` to avoid Docker permission issues.
-
-```bash
-# Test NOP - should get reward=0
-harbor run {harbor_config_args} --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
-
-# Test Oracle - should get reward=1
-harbor run {harbor_config_args} --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
-```
-
-If you need to re-run after fixing issues, increment the number:
-- First NOP attempt: `{task_id}-nop-1`, second: `{task_id}-nop-2`, etc.
-- First Oracle attempt: `{task_id}-oracle-1`, second: `{task_id}-oracle-2`, etc.
-
-### Step 5: Fix Issues (if validation fails)
-
-If harbor fails, check:
-1. **Test file paths** - Most common issue (make sure you updated them for THIS PR)
-2. **Missing build step** - Did you copy the build steps from reference?
-3. **Missing packages** - Did you copy the system packages from reference?
-4. **Post-patch rebuild** - For compiled languages, you MUST rebuild after applying bug.patch
-
-### Step 6: Final Cleanup
-
-**Once both NOP (reward=0) and Oracle (reward=1) pass**, clean up your files:
-
-1. **Remove ALL TODO comments** from Dockerfile and test.sh
-2. **Remove ALL template/example comments** that are no longer relevant
-3. **Keep only meaningful comments** that explain non-obvious steps
-
-**Files to clean:**
-- `{task_dir}/environment/Dockerfile` - Remove TODOs, keep comments explaining non-standard steps
-- `{task_dir}/tests/test.sh` - Remove TODOs and example templates, keep test-specific comments
-
-## Tips
-
-- **Your skeleton is the source of truth** - it has correct hashes
-- **Reference is just an example** - shows you what to fill in
-- **Don't copy entire files** - just the extra pieces (runtime, packages, env vars, build steps)
-- **Update test paths** - most PRs touch different test files
-
-You're done when both NOP (reward=0) and Oracle (reward=1) pass AND files are cleaned up!
 """
 
 # The prompt for CC to analyze repo and fill in skeleton (from scratch)
@@ -219,6 +105,8 @@ You have a skeleton Harbor task that needs to be completed. Your job is to:
 **Dataset Path**: `{dataset_path}`
 
 The repo is already cloned locally. You can browse it, read files, and run commands.
+
+{dockerfile_hint_section}
 
 ## Skeleton Files to Complete
 
@@ -742,8 +630,8 @@ def run_claude_code_session(
         test_files: List of test file paths
         timeout: Maximum time for session
         verbose: If True, stream output to console
-        reference_task_id: If provided, task_id to copy Dockerfile/test.sh from
-        reference_pr: If provided, PR number of the reference task
+        reference_task_id: If provided, task_id whose Dockerfile is included as a hint
+        reference_pr: If provided, PR number of the Dockerfile hint task
         head_sha: If provided, new HEAD SHA to use in Dockerfile
         environment: Environment type for Harbor runs (docker, daytona, etc.)
         jobs_dir: Directory for Harbor job output. Defaults to
@@ -835,41 +723,32 @@ async def _run_claude_code_session_async(
     else:
         test_files_list = "  (none)"
 
-    # Choose prompt based on whether we're using a reference task
-    if reference_task_id and reference_pr:
-        reference_task_dir = (dataset_path / reference_task_id).resolve()
-        prompt_text = CC_REFERENCE_PROMPT.format(
-            repo=repo,
-            pr_number=pr_number,
-            reference_pr=reference_pr,
-            reference_task_id=reference_task_id,
-            reference_task_dir=reference_task_dir,
-            repo_path=repo_path,
-            task_dir=task_dir,
-            task_id=task_id,
-            dataset_path=dataset_path,
-            jobs_dir=jobs_dir,
-            test_files_list=test_files_list,
-            head_sha=head_sha or "(check metadata)",
-            environment=environment,
-            harbor_config_args=harbor_config_args,
-        )
+    dockerfile_hint_section = _format_dockerfile_hint_section(
+        reference_task_id=reference_task_id,
+        reference_pr=reference_pr,
+        dataset_path=dataset_path,
+        logger=logger,
+    )
+    prompt_text = CC_PROMPT.format(
+        repo=repo,
+        pr_number=pr_number,
+        repo_path=repo_path,
+        task_dir=task_dir,
+        task_id=task_id,
+        dataset_path=dataset_path,
+        jobs_dir=jobs_dir,
+        test_files_list=test_files_list,
+        environment=environment,
+        harbor_config_args=harbor_config_args,
+        dockerfile_hint_section=dockerfile_hint_section,
+    )
+    if dockerfile_hint_section:
         logger.info(
-            f"Using reference prompt (copying from {reference_task_id}, PR #{reference_pr})"
+            "Using full prompt with Dockerfile hint from %s, PR #%s",
+            reference_task_id,
+            reference_pr,
         )
     else:
-        prompt_text = CC_PROMPT.format(
-            repo=repo,
-            pr_number=pr_number,
-            repo_path=repo_path,
-            task_dir=task_dir,
-            task_id=task_id,
-            dataset_path=dataset_path,
-            jobs_dir=jobs_dir,
-            test_files_list=test_files_list,
-            environment=environment,
-            harbor_config_args=harbor_config_args,
-        )
         logger.info("Using full prompt (generating from skeleton)")
 
     # Create hook for logging Harbor validation attempts

@@ -24,7 +24,7 @@ class CreateConfig:
         force: Bypass local dedupe and regenerate existing tasks
         state_dir: Directory for run-local state/logs/jobs
         repo_cache_dir: Directory for shared git repository cache
-        use_cache: Reuse cached Dockerfiles/test.sh from previous tasks
+        use_cache: Reuse successful Dockerfiles from previous tasks as hints
         require_minimum_difficulty: Require 3+ source files for task
         min_source_files: Minimum number of source files required (default: 3)
         max_source_files: Maximum number of source files allowed to avoid large refactors (default: 10)
@@ -85,7 +85,7 @@ class FarmConfig:
         dry_run: Only show what would run (no task generation)
         docker_prune_batch: Run docker cleanup after every N PRs (0 to disable)
         skip_list: Path to file with task IDs to skip
-        no_cache: Disable reusing cached Dockerfiles/test.sh
+        no_cache: Disable reusing successful Dockerfiles as hints
         require_minimum_difficulty: Require 3+ source files for task
         min_source_files: Minimum number of source files required (default: 3)
         max_source_files: Maximum number of source files allowed to avoid large refactors (default: 10)

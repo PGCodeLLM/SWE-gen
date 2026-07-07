@@ -32,21 +32,30 @@ class TaskReferenceStore:
         self.reference_file = reference_file or Path(".swegen/task_references.json")
         self.reference_file.parent.mkdir(parents=True, exist_ok=True)
 
-    def _load_references(self) -> dict[str, TaskReference]:
+    def _load_references(self) -> dict[str, list[TaskReference]]:
         """Load all references from file."""
         if not self.reference_file.exists():
             return {}
 
         try:
             data = json.loads(self.reference_file.read_text())
-            return {repo: TaskReference(**ref_data) for repo, ref_data in data.items()}
+            references: dict[str, list[TaskReference]] = {}
+            for repo, ref_data in data.items():
+                if isinstance(ref_data, list):
+                    references[repo] = [
+                        TaskReference(**item) for item in ref_data if isinstance(item, dict)
+                    ]
+                elif isinstance(ref_data, dict):
+                    # Backward compatibility with the old one-reference-per-repo format.
+                    references[repo] = [TaskReference(**ref_data)]
+            return references
         except Exception as e:
             logger.warning(f"Failed to load task references: {e}")
             return {}
 
-    def _save_references(self, references: dict[str, TaskReference]) -> None:
+    def _save_references(self, references: dict[str, list[TaskReference]]) -> None:
         """Save all references to file."""
-        data = {repo: asdict(ref) for repo, ref in references.items()}
+        data = {repo: [asdict(ref) for ref in refs] for repo, refs in references.items()}
         self.reference_file.write_text(json.dumps(data, indent=2))
 
     def save(
@@ -75,9 +84,15 @@ class TaskReferenceStore:
                 created_at=datetime.now(UTC).isoformat(),
             )
 
-            # Load, update, save
             references = self._load_references()
-            references[repo] = reference
+            repo_references = references.setdefault(repo, [])
+            repo_references[:] = [
+                ref
+                for ref in repo_references
+                if not (ref.task_id == task_id or ref.pr_number == pr_number)
+            ]
+            repo_references.append(reference)
+            repo_references.sort(key=lambda ref: ref.pr_number)
             self._save_references(references)
 
             logger.info(f"✓ Saved task reference for {repo} → {task_id}")
@@ -90,14 +105,18 @@ class TaskReferenceStore:
     def get(
         self,
         repo: str,
+        current_pr_number: int | None = None,
         max_age_days: int = 180,
+        tasks_root: Path | None = None,
     ) -> TaskReference | None:
         """
         Get reference to a successful task for reuse.
 
         Args:
             repo: Repository name (owner/repo)
+            current_pr_number: Current PR number, used to choose the closest reference
             max_age_days: Maximum age of reference in days (default: 180)
+            tasks_root: If provided, require the reference Dockerfile to exist
 
         Returns:
             TaskReference if valid reference exists, None otherwise
@@ -109,15 +128,49 @@ class TaskReferenceStore:
                 logger.debug(f"No task reference found for {repo}")
                 return None
 
-            reference = references[repo]
+            candidates: list[TaskReference] = []
+            for reference in references[repo]:
+                if current_pr_number is not None and reference.pr_number == current_pr_number:
+                    continue
 
-            # Check age
-            if reference.created_at:
-                created = datetime.fromisoformat(reference.created_at)
-                age_days = (datetime.now(UTC) - created).days
-                if age_days > max_age_days:
-                    logger.debug(f"Reference too old for {repo}: {age_days} days > {max_age_days}")
-                    return None
+                # Check age
+                if reference.created_at:
+                    created = datetime.fromisoformat(reference.created_at)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=UTC)
+                    age_days = (datetime.now(UTC) - created).days
+                    if age_days > max_age_days:
+                        logger.debug(
+                            f"Reference too old for {repo}: {age_days} days > {max_age_days}"
+                        )
+                        continue
+
+                if tasks_root is not None:
+                    dockerfile = tasks_root / reference.task_id / "environment" / "Dockerfile"
+                    if not dockerfile.is_file():
+                        logger.debug(
+                            "Reference Dockerfile missing for %s: %s",
+                            reference.task_id,
+                            dockerfile,
+                        )
+                        continue
+
+                candidates.append(reference)
+
+            if not candidates:
+                logger.debug(f"No usable task reference found for {repo}")
+                return None
+
+            if current_pr_number is None:
+                reference = max(candidates, key=lambda ref: ref.created_at or "")
+            else:
+                reference = min(
+                    candidates,
+                    key=lambda ref: (
+                        abs(ref.pr_number - current_pr_number),
+                        ref.pr_number,
+                    ),
+                )
 
             logger.info(
                 f"✓ Found task reference for {repo} → {reference.task_id} "

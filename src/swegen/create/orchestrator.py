@@ -15,10 +15,10 @@ from .task_instruction import evaluate_and_generate_task
 from .task_reference import TaskReference, TaskReferenceStore
 from .task_skeleton import (
     SkeletonParams,
-    generate_instruction_md,
-    generate_task_toml,
     generate_dockerfile,
+    generate_instruction_md,
     generate_solve_sh,
+    generate_task_toml,
     generate_test_sh,
 )
 from .utils import check_multi_file_requirement, identify_test_files
@@ -211,12 +211,19 @@ class PRToHarborPipeline:
             if reference_store:
                 task_reference = reference_store.get(
                     repo=self.repo,
+                    current_pr_number=self.pr_number,
                     max_age_days=180,
+                    tasks_root=tasks_root,
                 )
                 if task_reference:
+                    created_at = (
+                        task_reference.created_at[:10]
+                        if task_reference.created_at
+                        else "unknown date"
+                    )
                     logger.info(
-                        f"Found task reference: {task_reference.task_id} "
-                        f"(from PR #{task_reference.pr_number}, created {task_reference.created_at[:10]})"
+                        f"Found Dockerfile hint reference: {task_reference.task_id} "
+                        f"(from PR #{task_reference.pr_number}, created {created_at})"
                     )
 
             # Step 7: Generate diffs from local repo (language-agnostic)
@@ -243,7 +250,7 @@ class PRToHarborPipeline:
                     if test_file.is_file():
                         try:
                             # Read as text, skip binary files
-                            content = test_file.read_text(encoding='utf-8', errors='ignore')
+                            content = test_file.read_text(encoding="utf-8", errors="ignore")
                             # Store with relative path from tests/ dir
                             rel_path = test_file.relative_to(test_dir)
                             test_contents[str(rel_path)] = content
@@ -358,13 +365,11 @@ class PRToHarborPipeline:
             if run_cc:
                 if task_reference:
                     logger.info(
-                        f"Running CC with reference task {task_reference.task_id} "
-                        f"from PR #{task_reference.pr_number} (should be much faster)..."
+                        f"Running CC with Dockerfile hint from {task_reference.task_id} "
+                        f"(PR #{task_reference.pr_number})..."
                     )
                 else:
-                    logger.info(
-                        "Running CC session (will detect language automatically)..."
-                    )
+                    logger.info("Running CC session (will detect language automatically)...")
 
                 cc_result = run_claude_code_session(
                     repo=self.repo,
@@ -386,7 +391,7 @@ class PRToHarborPipeline:
                 if cc_result.success:
                     logger.info("✓ CC completed task successfully!")
                     # Save reference to this successful task for future PRs
-                    if reference_store and not task_reference:
+                    if reference_store:
                         reference_store.save(
                             repo=self.repo,
                             task_id=self.task_id,

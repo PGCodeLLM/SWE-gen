@@ -23,6 +23,7 @@ from swegen.tools.validate_utils import ValidationError, run_nop_oracle
 from . import MissingIssueError, PRToHarborPipeline, TrivialPRError
 from .claude_code_runner import ClaudeCodeResult, run_claude_code_session
 from .repo_cache import RepoCache
+from .task_reference import TaskReferenceStore
 
 # -----------------------------------------------------------------------------
 # Helper functions for run_reversal phases
@@ -505,13 +506,13 @@ def run_reversal(config: CreateConfig) -> None:
                 console.print(
                     Rule(
                         Text(
-                            f"Claude Code: Adapt from PR #{task_reference.pr_number}",
+                            f"Claude Code: Dockerfile hint from PR #{task_reference.pr_number}",
                             style="bold magenta",
                         )
                     )
                 )
                 console.print(
-                    f"[dim]Reference: {task_reference.task_id} | Timeout: {config.cc_timeout}s | Verbose: {str(verbose).lower()}[/dim]"
+                    f"[dim]Hint: {task_reference.task_id}/environment/Dockerfile | Timeout: {config.cc_timeout}s | Verbose: {str(verbose).lower()}[/dim]"
                 )
             else:
                 console.print(Rule(Text("Claude Code", style="bold magenta")))
@@ -640,6 +641,15 @@ def run_reversal(config: CreateConfig) -> None:
         _handle_validation_failure(
             console, harbor_validation_failed, cc_validation_failed, harbor_actually_ran
         )
+
+        task_was_validated = bool(cc_result and cc_result.success) or harbor_actually_ran
+        if config.use_cache and task_was_validated:
+            reference_file = state_dir / "task_references.json"
+            TaskReferenceStore(reference_file=reference_file).save(
+                repo=pipeline.repo,
+                task_id=task_id,
+                pr_number=config.pr,
+            )
 
         # Save state record (non-fatal if fails)
         _save_state_record(

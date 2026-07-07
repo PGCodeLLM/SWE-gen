@@ -9,12 +9,12 @@ from dotenv import load_dotenv
 from harbor.models.environment_type import EnvironmentType
 from rich.console import Console
 
+from swegen.analyze import AnalyzeArgs, run_analyze
+from swegen.analyze.classifier import VERDICT_MODEL
 from swegen.config import CreateConfig, FarmConfig
 from swegen.create import MissingIssueError, TrivialPRError
 from swegen.create.create import run_reversal
 from swegen.farm import StreamFarmer
-from swegen.analyze import AnalyzeArgs, run_analyze
-from swegen.analyze.classifier import VERDICT_MODEL
 from swegen.tools.validate import ValidateArgs, run_validate
 from swegen.tools.validate_utils import ValidationError
 
@@ -68,7 +68,9 @@ def create_cmd(
         Path("data_cache/repos"), help="Shared git repo cache dir", show_default=True
     ),
     no_cache: bool = typer.Option(
-        False, "--no-cache", help="Disable reusing cached Dockerfiles/test.sh from previous tasks"
+        False,
+        "--no-cache",
+        help="Disable using successful Dockerfiles from previous tasks as hints",
     ),
     require_minimum_difficulty: bool = typer.Option(
         True,
@@ -321,7 +323,6 @@ def analyze(
 
 
 
-
 @app.command(help="Continuous PR farming - stream through entire PR history")
 def farm(
     repo: str = typer.Argument(
@@ -359,7 +360,9 @@ def farm(
     skip_list: str
     | None = typer.Option(None, help="Path to file with task IDs to skip (one per line)"),
     no_cache: bool = typer.Option(
-        False, "--no-cache", help="Disable reusing cached Dockerfiles/test.sh"
+        False,
+        "--no-cache",
+        help="Disable using successful Dockerfiles from previous tasks as hints",
     ),
     require_minimum_difficulty: bool = typer.Option(
         True,
