@@ -132,6 +132,10 @@ VOYAGER_PATH_MARKER = (
 )
 FROM_RE = re.compile(r"^FROM\s+\S+(?P<suffix>.*)$")
 HEAD_SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+LOG_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00\s+"
+)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 GIT_FETCH_HEAD_RE = re.compile(
     r"\bgit fetch(?: --depth \d+)? origin (?P<sha>[0-9a-f]{40})\b"
 )
@@ -168,6 +172,7 @@ class Outcome:
     worker_id: int
     entry: Entry
     returncode: int
+    failure_reason: str = ""
     postprocess_status: str = ""
     image_names: tuple[str, ...] = ()
     image_ids: tuple[str, ...] = ()
@@ -183,6 +188,7 @@ class ProcessResult:
     """Local result from a consumer's `swegen create` subprocess."""
 
     returncode: int
+    failure_reason: str = ""
     image_names: tuple[str, ...] = ()
     image_ids: tuple[str, ...] = ()
     compose_projects: tuple[str, ...] = ()
@@ -197,6 +203,55 @@ class ImagePruneResult:
     missing: int
     failed: int
     image_ids: tuple[str, ...] = ()
+
+
+class TimestampedLog:
+    """Line-prefixing wrapper for orchestrator worker logs."""
+
+    def __init__(self, fh):
+        self._fh = fh
+        self._at_line_start = True
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(UTC).isoformat(timespec="seconds")
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start:
+                self._fh.write(f"{self._timestamp()} ")
+            self._fh.write(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        return len(text)
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def fileno(self) -> int:
+        return self._fh.fileno()
+
+
+def run_command_to_log(
+    cmd: list[str], env: dict[str, str], log: TimestampedLog
+) -> int:
+    """Run a command and timestamp each combined stdout/stderr line."""
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        log.write(line)
+        log.flush()
+    return proc.wait()
 
 
 def load_entries(jsonl_path: Path) -> list[Entry]:
@@ -1063,6 +1118,8 @@ def write_progress_jsonl(
                     "total_failures": total_failures,
                     "total_processed": total_processed,
                 }
+                if not outcome.ok:
+                    status_record["failure_reason"] = outcome.failure_reason
                 progress_record = {
                     "timestamp": timestamp,
                     "event": "task_finished",
@@ -1418,6 +1475,70 @@ def _is_github_rate_limited(output_tail: str) -> bool:
     return any(sig in output_tail for sig in GITHUB_RATE_LIMIT_SIGNATURES)
 
 
+def _clean_log_line(line: str) -> str:
+    """Remove local log adornments before storing a compact failure reason."""
+    line = ANSI_ESCAPE_RE.sub("", line).strip()
+    line = LOG_TIMESTAMP_RE.sub("", line).strip()
+    return line
+
+
+def _meaningful_failure_lines(output_tail: str) -> list[str]:
+    """Return non-noise lines from a failed attempt's log tail."""
+    lines: list[str] = []
+    for raw_line in output_tail.splitlines():
+        line = _clean_log_line(raw_line)
+        if not line:
+            continue
+        if set(line) <= {"=", "#", "-", "─", "╭", "╮", "╰", "╯", "│"}:
+            continue
+        if line.startswith("$ "):
+            continue
+        lines.append(line)
+    return lines
+
+
+def failure_reason_from_output(output_tail: str, returncode: int) -> str:
+    """Extract a short human-readable reason from a failed `swegen create` run."""
+    if _is_github_rate_limited(output_tail):
+        return "GitHub rate limit or forbidden response"
+    if _is_retryable_failure(output_tail):
+        return "Transient network/API error"
+
+    lines = _meaningful_failure_lines(output_tail)
+    lowered = [(line, line.lower()) for line in lines]
+
+    priority_markers = (
+        ("validation failed", "Validation failed (NOP or Oracle)"),
+        ("cc did not complete task", None),
+        ("cc session timed out", None),
+        ("claude code session timed out", None),
+        ("claude code session failed", None),
+        ("skipped (trivial pr)", "Trivial PR"),
+        ("trivial pr", None),
+        ("missing linked issue", None),
+        ("task already exists", None),
+        ("fileexistserror", None),
+        ("validationerror", "Validation failed (NOP or Oracle)"),
+        ("trivialprerror", "Trivial PR"),
+        ("missingissueerror", "Missing linked issue"),
+    )
+    for marker, summary in priority_markers:
+        for line, lower in reversed(lowered):
+            if marker in lower:
+                if summary is not None:
+                    return summary
+                return line
+
+    for prefix in ("Error:", "RuntimeError:", "ValueError:", "Exception:"):
+        for line in reversed(lines):
+            if line.startswith(prefix):
+                return line
+
+    if lines:
+        return lines[-1]
+    return f"swegen create exited with return code {returncode}"
+
+
 def _mask_token(token: str | None) -> str:
     """Render a token for logs without leaking it (prefix only)."""
     if not token:
@@ -1493,6 +1614,7 @@ def process_entry(
         base_cmd += ["--cc-timeout", str(cc_timeout)]
 
     returncode = 1
+    final_output_tail = ""
 
     # Pick a random GitHub token for this entry; rotate to a different one if we
     # hit a rate limit. Tracks which tokens we've already tried.
@@ -1520,14 +1642,7 @@ def process_entry(
         start_size = os.fstat(log.fileno()).st_size
 
         try:
-            proc = subprocess.run(
-                cmd,
-                env=attempt_env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            returncode = proc.returncode
+            returncode = run_command_to_log(cmd, attempt_env, log)
         except FileNotFoundError:
             # Not transient — abort retries for this entry.
             msg = (
@@ -1544,6 +1659,7 @@ def process_entry(
             )
             return ProcessResult(
                 returncode=127,
+                failure_reason=msg,
                 image_names=image_names,
                 image_ids=image_ids,
                 compose_projects=compose_projects,
@@ -1562,6 +1678,7 @@ def process_entry(
                 output_tail = reader.read()
         except OSError:
             pass
+        final_output_tail = output_tail
 
         rate_limited = _is_github_rate_limited(output_tail)
         if attempt < max_retries and (
@@ -1601,8 +1718,12 @@ def process_entry(
     image_ids = collect_instance_docker_image_ids(image_names, compose_projects)
     status = "OK" if returncode == 0 else f"FAILED rc={returncode}"
     print(f"{tag} {status} (log: {log_path})", flush=True)
+    failure_reason = ""
+    if returncode != 0:
+        failure_reason = failure_reason_from_output(final_output_tail, returncode)
     return ProcessResult(
         returncode=returncode,
+        failure_reason=failure_reason,
         image_names=image_names,
         image_ids=image_ids,
         compose_projects=compose_projects,
@@ -1644,7 +1765,8 @@ def run_consumer(
     outcomes: list[Outcome] = []
     log_path = log_dir / f"worker-{worker_id}.log"
 
-    with log_path.open("w") as log:
+    with log_path.open("w") as raw_log:
+        log = TimestampedLog(raw_log)
         while True:
             package = work_queue.get()
             try:
@@ -1714,6 +1836,7 @@ def run_consumer(
                         worker_id=worker_id,
                         entry=entry,
                         returncode=returncode,
+                        failure_reason=process_result.failure_reason,
                         postprocess_status=postprocess_status,
                         image_names=process_result.image_names,
                         image_ids=process_result.image_ids,
