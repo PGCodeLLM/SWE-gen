@@ -73,8 +73,13 @@ DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
 RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 SWEGEN_IMAGE_SUFFIX = "-swegenimage"
 
-# Slurm nodes to distribute across when --slurm is set (lux-3-bm-cpu-[01-10]).
-SLURM_NODES = [f"lux-3-bm-cpu-{i:02d}" for i in range(1, 11) if i != 8]  # CPU 8 is borked
+# Slurm nodes to distribute across when --slurm is set.
+SLURM_NODES = [
+    "ecs-z00579134-20260707-bugfix-0003",
+    "ecs-z00579134-20260707-bugfix-0002",
+    "ecs-z00579134-20260707-bugfix-0005",
+    "ecs-z00579134-20260707-bugfix-0006",
+]
 
 # Substrings in a failed `swegen create` run that indicate a transient
 # network/API error worth retrying (vs. a genuine task failure like a trivial
