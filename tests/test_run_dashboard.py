@@ -1,6 +1,11 @@
 import json
 
-from run_dashboard import calculate_status, status_journal_paths, success_ledger_paths
+from run_dashboard import (
+    StatusCache,
+    calculate_status,
+    status_journal_paths,
+    success_ledger_paths,
+)
 
 
 def write_jsonl(path, records) -> None:
@@ -140,3 +145,22 @@ def test_recursive_discovery_prunes_backups_and_task_outputs(tmp_path) -> None:
 
     assert status_journal_paths(tmp_path) == [live]
     assert success_ledger_paths(tmp_path) == [ledger]
+
+
+def test_status_cache_serves_last_completed_snapshot(tmp_path, monkeypatch) -> None:
+    calls = 0
+
+    def fake_calculate(*_args):
+        nonlocal calls
+        calls += 1
+        return {"success": calls}
+
+    monkeypatch.setattr("run_dashboard.calculate_status", fake_calculate)
+    cache = StatusCache(tmp_path, tmp_path / "input.jsonl", 0)
+
+    assert json.loads(cache.body()) == {"success": 1}
+    assert json.loads(cache.body()) == {"success": 1}
+    assert calls == 1
+
+    cache.refresh()
+    assert json.loads(cache.body()) == {"success": 2}

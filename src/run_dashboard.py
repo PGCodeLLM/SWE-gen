@@ -452,7 +452,40 @@ refresh(); setInterval(refresh,2000);
 </script></body></html>"""
 
 
-def make_handler(run_dir: Path, input_jsonl: Path, total_entries: int):
+class StatusCache:
+    """Refresh the expensive run scan in one background thread."""
+
+    def __init__(self, run_dir: Path, input_jsonl: Path, total_entries: int):
+        self.run_dir = run_dir
+        self.input_jsonl = input_jsonl
+        self.total_entries = total_entries
+        self._lock = threading.Lock()
+        self._body = b"{}"
+        self.refresh()
+
+    def refresh(self) -> None:
+        body = json.dumps(
+            calculate_status(self.run_dir, self.input_jsonl, self.total_entries),
+            separators=(",", ":"),
+        ).encode()
+        with self._lock:
+            self._body = body
+
+    def body(self) -> bytes:
+        with self._lock:
+            return self._body
+
+    def run(self, stop_event: threading.Event, interval: float = 2.0) -> None:
+        while not stop_event.wait(interval):
+            try:
+                self.refresh()
+            except Exception:
+                # Keep serving the last valid snapshot; the next interval will
+                # retry instead of making every HTTP request redo the scan.
+                continue
+
+
+def make_handler(status_cache: StatusCache):
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/" or self.path.startswith("/?"):
@@ -460,10 +493,7 @@ def make_handler(run_dir: Path, input_jsonl: Path, total_entries: int):
                 content_type = "text/html; charset=utf-8"
                 status = HTTPStatus.OK
             elif self.path == "/api/status":
-                body = json.dumps(
-                    calculate_status(run_dir, input_jsonl, total_entries),
-                    separators=(",", ":"),
-                ).encode()
+                body = status_cache.body()
                 content_type = "application/json"
                 status = HTTPStatus.OK
             elif self.path == "/healthz":
@@ -503,9 +533,18 @@ def main() -> int:
     run_dir = args.run_dir.resolve()
     input_jsonl = args.input_jsonl.resolve()
     total_entries = count_jsonl_entries(input_jsonl)
+    status_cache = StatusCache(run_dir, input_jsonl, total_entries)
+    stop_event = threading.Event()
+    refresh_thread = threading.Thread(
+        target=status_cache.run,
+        args=(stop_event,),
+        name="dashboard-status-refresh",
+        daemon=True,
+    )
+    refresh_thread.start()
     server = ThreadingHTTPServer(
         (args.host, args.port),
-        make_handler(run_dir, input_jsonl, total_entries),
+        make_handler(status_cache),
     )
 
     if args.pid_file:
@@ -513,6 +552,7 @@ def main() -> int:
         args.pid_file.write_text(f"{os.getpid()}\n")
 
     def stop_server(_signum: int, _frame: object) -> None:
+        stop_event.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, stop_server)
@@ -521,6 +561,8 @@ def main() -> int:
         print(f"SWE-gen dashboard listening on http://{args.host}:{args.port}", flush=True)
         server.serve_forever(poll_interval=0.5)
     finally:
+        stop_event.set()
+        refresh_thread.join(timeout=5)
         server.server_close()
         if args.pid_file:
             args.pid_file.unlink(missing_ok=True)
