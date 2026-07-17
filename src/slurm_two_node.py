@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -46,7 +47,9 @@ TOTAL_WORKERS = WORKERS_PER_NODE * 2
 ENDPOINT = "https://arcyleung-ubuntu.tailb940e6.ts.net"
 SAFE_RUN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SECRET_RE = re.compile(
-    r"(?i)(://)[^/@\s]+@|\b(?:sk|ghp)_[A-Za-z0-9_-]{10,}|\bsk-[A-Za-z0-9_-]{10,}"
+    r"(?i)(://)[^/@\s]+@|\bgithub_pat_[A-Za-z0-9_]{10,}|"
+    r"\b(?:sk|ghp)_[A-Za-z0-9_-]{10,}|\bsk-[A-Za-z0-9_-]{10,}|"
+    r"\bAuthorization[\"']?\s*[:=]\s*[\"']?Bearer\s+[A-Za-z0-9._~+/=-]+"
 )
 EXTRA_RUNTIME_FILES = (
     "src/slurm_two_node.py",
@@ -72,6 +75,19 @@ def redact(text: str) -> str:
     return SECRET_RE.sub(
         lambda match: f"{match.group(1)}<REDACTED>@" if match.group(1) else "<REDACTED>", text
     )
+
+
+def private_swegen_config(workspace: Path) -> Path:
+    """Return the required private token-pool config or fail closed."""
+    path = workspace / "swegen.toml"
+    if not path.is_file():
+        raise FileNotFoundError(f"missing private SWE-gen config: {path}")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise PermissionError(
+            f"private SWE-gen config must be mode 0600 (found {mode:04o}): {path}"
+        )
+    return path
 
 
 def command_prefix() -> list[str]:
@@ -185,7 +201,7 @@ def prepare_shards(
 
 def _tracked_files(workspace: Path) -> list[Path]:
     proc = subprocess.run(
-        ["git", "-C", str(workspace), "ls-files", "-z"],
+        command_prefix() + ["git", "-C", str(workspace), "ls-files", "-z"],
         capture_output=True,
         check=True,
     )
@@ -280,6 +296,7 @@ def build_bundle(
     proxy_ca: Path | None,
     credentials: dict[str, str] | None,
 ) -> Path:
+    swegen_config = private_swegen_config(workspace)
     fd, raw_path = tempfile.mkstemp(prefix=f"swegen-{node.index}-", suffix=".tar.gz")
     os.close(fd)
     bundle = Path(raw_path)
@@ -304,6 +321,7 @@ def build_bundle(
             _add_file(tar, path, str(path.relative_to(workspace)))
         for route, path in env_files.items():
             _add_file(tar, path, f".slurm-secrets/env/{ROUTE_ENV_FILES[route]}", 0o600)
+        _add_file(tar, swegen_config, ".slurm-secrets/swegen.toml", 0o600)
         if credentials is not None:
             content = "".join(
                 f"export {key}={shlex.quote(value)}\n" for key, value in credentials.items()
@@ -363,6 +381,8 @@ def stage_node(
     extract = (
         "set -euo pipefail; umask 077; "
         f"mkdir -p {shlex.quote(remote_path)}; "
+        f"find {shlex.quote(remote_path)} -maxdepth 1 -type f "
+        "-name 'swegen.toml' -delete; "
         f"tar -xzf - -C {shlex.quote(remote_path)}"
     )
     with bundle.open("rb") as fh:
@@ -505,6 +525,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"missing source JSONL: {source}")
     if not args.uv_bin.is_file():
         raise SystemExit(f"missing uv binary: {args.uv_bin}")
+    if args.action != "plan":
+        try:
+            private_swegen_config(workspace)
+        except (FileNotFoundError, PermissionError) as exc:
+            raise SystemExit(str(exc)) from exc
 
     env_files = {route: workspace / filename for route, filename in ROUTE_ENV_FILES.items()}
     missing_env = [str(path) for path in env_files.values() if not path.is_file()]

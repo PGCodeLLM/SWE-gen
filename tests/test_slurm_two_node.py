@@ -41,6 +41,20 @@ def test_duplicate_or_wrong_node_count_is_rejected() -> None:
         slurm.validate_nodes([slurm.DEFAULT_NODES[0], slurm.DEFAULT_NODES[0]])
 
 
+def test_private_swegen_config_is_required_and_mode_0600(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="missing private SWE-gen config"):
+        slurm.private_swegen_config(tmp_path)
+
+    config = tmp_path / "swegen.toml"
+    config.write_text('[github]\ngh_tokens = ["test-token"]\n')
+    config.chmod(0o644)
+    with pytest.raises(PermissionError, match="mode 0600"):
+        slurm.private_swegen_config(tmp_path)
+
+    config.chmod(0o600)
+    assert slurm.private_swegen_config(tmp_path) == config
+
+
 def test_prepare_shards_filters_completed_and_preserves_repo_ownership(tmp_path) -> None:
     source = tmp_path / "source.jsonl"
     write_source(source)
@@ -87,6 +101,22 @@ def test_submit_argv_contains_no_credentials(tmp_path, monkeypatch) -> None:
     assert "sk-" not in rendered
 
 
+def test_tracked_files_runs_git_as_runtime_user_when_prefixed(tmp_path, monkeypatch) -> None:
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("ok\n")
+    captured: list[str] = []
+
+    def fake_run(argv, **_kwargs):
+        captured.extend(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=b"tracked.txt\0", stderr=b"")
+
+    monkeypatch.setattr(slurm, "command_prefix", lambda: ["sudo", "-u", "alex", "-H"])
+    monkeypatch.setattr(slurm.subprocess, "run", fake_run)
+
+    assert slurm._tracked_files(tmp_path) == [tracked]
+    assert captured[:5] == ["sudo", "-u", "alex", "-H", "git"]
+
+
 def test_bundle_contains_only_node_shards_and_private_env_files(tmp_path, monkeypatch) -> None:
     workspace = tmp_path
     (workspace / "src").mkdir()
@@ -110,6 +140,9 @@ def test_bundle_contains_only_node_shards_and_private_env_files(tmp_path, monkey
         env_files[route] = path
     uv = workspace / "uv"
     uv.write_bytes(b"uv")
+    swegen_config = workspace / "swegen.toml"
+    swegen_config.write_text('[github]\ngh_tokens = ["test-token"]\n')
+    swegen_config.chmod(0o600)
     node = slurm.validate_nodes(slurm.DEFAULT_NODES)[0]
 
     bundle = slurm.build_bundle(
@@ -136,5 +169,21 @@ def test_bundle_contains_only_node_shards_and_private_env_files(tmp_path, monkey
         assert members[".slurm-secrets/env/.env_hk"].mode == 0o600
         assert members[".slurm-secrets/env/.env_de"].mode == 0o600
         assert members[".slurm-secrets/credentials.env"].mode == 0o600
+        assert members[".slurm-secrets/swegen.toml"].mode == 0o600
+        assert "swegen.toml" not in members
     finally:
         bundle.unlink(missing_ok=True)
+
+
+def test_slurm_worker_uses_authenticated_quota_and_isolated_docker_configs() -> None:
+    worker = Path("src/slurm_node_worker.sh").read_text()
+    launcher = Path("run_orchestrator.sh").read_text()
+
+    assert "https://api.github.com/rate_limit" in worker
+    assert "github_remaining" in worker
+    assert "SWEGEN_DOCKER_CONFIG_DIR" in worker
+    assert ".slurm-secrets/docker/$shard_name" in worker
+    assert "docker_build_proxy=ok" in worker
+    assert "env.HTTP_PROXY" in launcher
+    assert 'export DOCKER_CONFIG="$SWEGEN_DOCKER_CONFIG_DIR"' in launcher
+    assert "umask 0077" in worker

@@ -20,9 +20,13 @@ set -a
 source "$SWEGEN_PROXY_ENV_FILE"
 set +a
 
-# Keep shared cache files writable by the cache group, including repositories
-# created by a launcher invoked through sudo.
-umask 0002
+# Slurm run artifacts may contain verbose SDK output, so keep them private.
+# The controller's long-lived local farm still uses the shared cache group.
+if [[ -n "${SWEGEN_SLURM_NODE:-}" ]]; then
+  umask 0077
+else
+  umask 0002
+fi
 
 # Normalize the four common HTTP proxy names in case .env only defines one
 # casing. The model hostname is deliberately absent from NO_PROXY because
@@ -42,6 +46,28 @@ ENV_NO_PROXY="${no_proxy:-${NO_PROXY:-}}"
 INTERNAL_NO_PROXY="*.huaweicloud.com,100.*,10.*,.huawei.com,127.0.0.1,7.244.3.251,10.170.22.223,10.170.22.98"
 export no_proxy="${ENV_NO_PROXY:+$ENV_NO_PROXY,}$INTERNAL_NO_PROXY"
 export NO_PROXY="$no_proxy"
+
+# Docker does not automatically inherit shell proxy variables into Dockerfile
+# RUN steps. Slurm supplies a unique directory per orchestrator so concurrent
+# SG/HK/DE groups cannot overwrite one shared Docker client configuration.
+cleanup_docker_proxy_config() {
+  if [[ -n "${SWEGEN_DOCKER_CONFIG_DIR:-}" ]]; then
+    find "$SWEGEN_DOCKER_CONFIG_DIR" -maxdepth 1 -type f -name 'config.json*' -delete \
+      2>/dev/null || true
+  fi
+}
+if [[ -n "${SWEGEN_DOCKER_CONFIG_DIR:-}" ]]; then
+  export DOCKER_CONFIG="$SWEGEN_DOCKER_CONFIG_DIR"
+  install -d -m 0700 "$DOCKER_CONFIG"
+  docker_config_tmp=$(mktemp "$DOCKER_CONFIG/config.json.tmp.XXXXXX")
+  jq -n \
+    '{proxies:{default:{httpProxy:env.HTTP_PROXY,httpsProxy:env.HTTPS_PROXY,noProxy:env.NO_PROXY}}}' \
+    >"$docker_config_tmp"
+  chmod 0600 "$docker_config_tmp"
+  mv "$docker_config_tmp" "$DOCKER_CONFIG/config.json"
+  unset docker_config_tmp
+  trap cleanup_docker_proxy_config EXIT
+fi
 
 default_ca_bundle=/etc/ssl/certs/ca-certificates.crt
 if [[ -f "$PWD/.slurm-secrets/combined-ca.crt" ]]; then
@@ -137,9 +163,21 @@ SWEGEN_CLAUDE_FAST_MODEL="${SWEGEN_CLAUDE_FAST_MODEL:-gpt-5.3-codex-spark}"
 SWEGEN_CLAUDE_FAST_FALLBACK_MODEL="${SWEGEN_CLAUDE_FAST_FALLBACK_MODEL:-gpt-5.6-terra}"
 if [[ "$SWEGEN_CLAUDE_FAST_MODEL" != "$SWEGEN_CLAUDE_FAST_FALLBACK_MODEL" ]]; then
   fast_model_catalog=$(
-    curl --silent --show-error --connect-timeout 10 --max-time 20 \
-      -H "Authorization: Bearer $OPENAI_API_KEY" \
-      "$OPENAI_BASE_URL/models" 2>/dev/null || true
+    python - <<'PY' 2>/dev/null || true
+import os
+
+import requests
+
+ca_bundle = os.environ.get("SWEGEN_CA_BUNDLE") or True
+response = requests.get(
+    os.environ["OPENAI_BASE_URL"].rstrip("/") + "/models",
+    headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+    timeout=(10, 20),
+    verify=ca_bundle,
+)
+response.raise_for_status()
+print(response.text)
+PY
   )
   if ! jq --exit-status --arg model "$SWEGEN_CLAUDE_FAST_MODEL" \
     'any(.data[]?; .id == $model) or any(.models[]?; .id == $model)' \
@@ -166,8 +204,8 @@ export BASH_MAX_TIMEOUT_MS=1800000
 # Do not allow ~/.claude/settings.json to override the endpoint or model for
 # batch workers. Use a per-user temporary directory so a prior sudo invocation
 # cannot leave root-owned Claude state in the shared worktree.
-export CLAUDE_CONFIG_DIR="${TMPDIR:-/tmp}/swegen-claude-${UID}"
-mkdir -p "$CLAUDE_CONFIG_DIR"
+export CLAUDE_CONFIG_DIR="${SWEGEN_CLAUDE_CONFIG_DIR:-${TMPDIR:-/tmp}/swegen-claude-${UID}}"
+install -d -m 0700 "$CLAUDE_CONFIG_DIR"
 
 export SWEGEN_SSL_NO_VERIFY=1
 

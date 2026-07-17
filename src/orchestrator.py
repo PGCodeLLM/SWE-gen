@@ -1673,6 +1673,20 @@ def failure_reason_from_output(output_tail: str, returncode: int) -> str:
     lowered = [(line, line.lower()) for line in lines]
 
     priority_markers = (
+        (
+            "server certificate verification failed",
+            "Git clone TLS certificate verification failed",
+        ),
+        (
+            "unable to connect to archive.ubuntu.com",
+            "Docker build could not reach Ubuntu package mirrors",
+        ),
+        (
+            "unable to connect to security.ubuntu.com",
+            "Docker build could not reach Ubuntu package mirrors",
+        ),
+        ("unable to locate package git", "Docker build dependency installation failed"),
+        ("validation incomplete", "Claude/Harbor validation incomplete"),
         ("validation failed", "Validation failed (NOP or Oracle)"),
         ("cc did not complete task", None),
         ("cc session timed out", None),
@@ -2247,6 +2261,18 @@ def main(argv: list[str] | None = None) -> int:
             github_tokens = load_github_tokens()
         except Exception:
             github_tokens = []
+    if os.environ.get("SWEGEN_DELETE_CONFIG_AFTER_LOAD") == "1":
+        config_path = os.environ.get("SWEGEN_CONFIG", "").strip()
+        if config_path:
+            try:
+                Path(config_path).unlink(missing_ok=True)
+            except OSError as error:
+                print(
+                    f"error: could not remove private token-pool config after load: {error}",
+                    file=sys.stderr,
+                )
+                return 3
+        os.environ.pop("SWEGEN_CONFIG", None)
     configured_github_tokens = len(github_tokens)
     if github_tokens:
         github_tokens = preflight_github_tokens(github_tokens)
@@ -2277,6 +2303,19 @@ def main(argv: list[str] | None = None) -> int:
             "(random per task, rotating on rate limit).",
             flush=True,
         )
+
+    raw_start_delay = os.environ.pop("SWEGEN_ORCHESTRATOR_START_DELAY_SECONDS", "0")
+    try:
+        start_delay = int(raw_start_delay)
+    except ValueError:
+        print("error: invalid orchestrator startup delay", file=sys.stderr)
+        return 2
+    if start_delay < 0:
+        print("error: orchestrator startup delay must be non-negative", file=sys.stderr)
+        return 2
+    if start_delay:
+        print(f"Initial orchestrator stagger: {start_delay}s", flush=True)
+        time.sleep(start_delay)
 
     resolve_run_layout(args)
     create_run_dirs(args)
