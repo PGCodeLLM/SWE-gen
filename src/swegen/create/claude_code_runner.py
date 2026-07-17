@@ -17,7 +17,7 @@ from claude_agent_sdk import (
 )
 
 from swegen.create.claude_code_utils import Colors, print_sdk_message
-from swegen.model_settings import load_model_settings, session_header_env
+from swegen.model_settings import claude_session_env, load_model_settings
 from swegen.tools.harbor_runner import parse_harbor_outcome, suffixed_docker_config_args
 
 
@@ -512,6 +512,9 @@ For each validation attempt, increment the run number (-1, -2, -3, etc.):
 
 Before running ```harbor run```, make sure to either ```sg docker``` or ```newgrp docker``` to avoid Docker permission issues.
 
+**Timeout requirement:** Docker builds and `harbor run` commands may take a while. Set the Bash tool timeout to
+`1800000` milliseconds (30 minutes) for these commands. Do not use the old `600000` millisecond limit.
+
 ```bash
 # Test NOP - should get reward=0 (tests FAIL on buggy code)
 harbor run {harbor_config_args} --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
@@ -810,10 +813,45 @@ async def _run_claude_code_session_async(
                 ):
                     print(f"[cc-stderr] {line.rstrip()}", flush=True)
 
-        # Pin all SDK rounds for this instance to one model via a stable
-        # X-Session-ID header, so a router fronting multiple models keeps this
-        # task on one model and reuses its KV cache across turns.
-        session_env = session_header_env(task_id)
+        # Build the shared SDK environment: pin this instance via X-Session-ID
+        # and route Claude Code's internal lightweight calls to our fast model.
+        session_env = claude_session_env(task_id)
+
+        # Claude Code's Node/Bun transport understands HTTP(S) proxy URLs but
+        # not SOCKS directly. HTTPS uses the worker's local HTTP-to-SOCKS
+        # bridge; plain HTTP can retain the separate SG proxy for package and
+        # tool traffic.
+        claude_proxy = os.environ.get("SWEGEN_CLAUDE_PROXY", "").strip()
+        if claude_proxy:
+            claude_http_proxy = os.environ.get(
+                "SWEGEN_CLAUDE_HTTP_PROXY", claude_proxy
+            ).strip() or claude_proxy
+            session_env.update(
+                {
+                    "http_proxy": claude_http_proxy,
+                    "https_proxy": claude_proxy,
+                    "HTTP_PROXY": claude_http_proxy,
+                    "HTTPS_PROXY": claude_proxy,
+                    "ALL_PROXY": claude_proxy,
+                }
+            )
+
+        requested_effort = os.environ.get(
+            "SWEGEN_AGENT_REASONING_EFFORT", "high"
+        ).strip().lower()
+        supported_efforts = {"low", "medium", "high", "xhigh", "max"}
+        if requested_effort not in supported_efforts:
+            logger.warning(
+                "Unsupported SWEGEN_AGENT_REASONING_EFFORT=%r; using high",
+                requested_effort,
+            )
+            requested_effort = "high"
+
+        if verbose:
+            print(
+                f"[SDK] Reasoning: adaptive | Effort: {requested_effort}",
+                flush=True,
+            )
 
         # Configure SDK options
         options = ClaudeAgentOptions(
@@ -822,6 +860,8 @@ async def _run_claude_code_session_async(
             cwd=os.getcwd(),  # Run from project root
             model=model_settings.model,
             env=session_env,
+            thinking={"type": "adaptive"},
+            effort=requested_effort,
             extra_args=extra_args,
             stderr=stderr_cb,
             hooks=(

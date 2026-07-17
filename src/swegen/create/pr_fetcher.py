@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
+import time
 from urllib.parse import urlparse
 
 import requests
+
+from swegen.net import github_requests_kwargs, requests_ssl_kwargs
 
 
 class GitHubPRFetcher:
@@ -42,11 +46,79 @@ class GitHubPRFetcher:
         return repo
 
     def _api_get(self, endpoint: str) -> dict:
-        """Make a GET request to GitHub API."""
+        """Make a reset-aware, retrying GET request to the GitHub API."""
         url = f"{self.api_base}{endpoint}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+        logger = logging.getLogger("swegen")
+        attempts = max(1, int(os.environ.get("SWEGEN_GITHUB_API_ATTEMPTS", "4")))
+        base_delay = max(
+            0.0, float(os.environ.get("SWEGEN_GITHUB_RETRY_BASE_SECONDS", "5"))
+        )
+        max_wait = max(
+            base_delay,
+            float(os.environ.get("SWEGEN_GITHUB_MAX_WAIT_SECONDS", "3600")),
+        )
+
+        for attempt in range(1, attempts + 1):
+            response = requests.get(
+                url,
+                headers=self.headers,
+                timeout=30,
+                **github_requests_kwargs(),
+                **requests_ssl_kwargs(),
+            )
+            if response.status_code < 400:
+                return response.json()
+
+            retryable = response.status_code in {403, 429, 500, 502, 503, 504}
+            if retryable and attempt < attempts:
+                retry_after = response.headers.get("Retry-After", "").strip()
+                remaining = response.headers.get("X-RateLimit-Remaining", "").strip()
+                reset = response.headers.get("X-RateLimit-Reset", "").strip()
+
+                delay: float | None = None
+                if retry_after:
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        delay = None
+                if delay is None and remaining == "0" and reset:
+                    try:
+                        delay = max(1.0, float(reset) - time.time() + 1.0)
+                    except ValueError:
+                        delay = None
+                if delay is None:
+                    delay = base_delay * (2 ** (attempt - 1))
+
+                delay = min(max_wait, delay) + random.uniform(0.0, 1.0)
+                logger.warning(
+                    "GitHub API %s for %s; retrying in %.1fs (%d/%d)",
+                    response.status_code,
+                    endpoint,
+                    delay,
+                    attempt + 1,
+                    attempts,
+                )
+                time.sleep(delay)
+                continue
+
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as error:
+                message = ""
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        message = str(payload.get("message") or "").strip()
+                except (ValueError, TypeError):
+                    pass
+                if message:
+                    raise requests.HTTPError(
+                        f"{error}; GitHub message: {message}",
+                        response=response,
+                    ) from error
+                raise
+
+        raise RuntimeError("unreachable GitHub API retry state")
 
     def _get_upstream_repo(self) -> str | None:
         """Get the upstream (parent) repo if current repo is a fork.
@@ -67,7 +139,7 @@ class GitHubPRFetcher:
 
     def fetch_pr_metadata(self, allow_unmerged: bool = False) -> dict:
         """Fetch PR metadata from GitHub API.
-        
+
         Args:
             allow_unmerged: If True, allow unmerged PRs (for testing/preview). Default False.
         """
@@ -144,7 +216,12 @@ class GitHubPRFetcher:
             headers["Accept"] = "application/vnd.github.mockingbird-preview+json"
 
             url = f"{self.api_base}{timeline_url}"
-            response = requests.get(url, headers=headers)
+            response = requests.get(
+                url,
+                headers=headers,
+                **github_requests_kwargs(),
+                **requests_ssl_kwargs(),
+            )
             response.raise_for_status()
             timeline = response.json()
 
@@ -190,7 +267,11 @@ class GitHubPRFetcher:
                 issue_num = int(match.group(2))
                 if issue_num != self.pr_number or repo_from_url != self.repo:
                     issue_refs[(repo_from_url, issue_num)] = None
-                    logger.debug("  Found cross-repo URL reference: %s#%d", repo_from_url, issue_num)
+                    logger.debug(
+                        "  Found cross-repo URL reference: %s#%d",
+                        repo_from_url,
+                        issue_num,
+                    )
 
             # Pattern 2: Cross-repo references like owner/repo#123
             cross_repo_pattern = r"(?<!\w)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)"

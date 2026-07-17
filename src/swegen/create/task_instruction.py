@@ -16,7 +16,7 @@ MAX_TOTAL_TEST_LENGTH = 10000  # Max total chars for all test files
 MIN_INSTRUCTION_LENGTH = 100
 OPENAI_API_TIMEOUT = 90.0
 MAX_COMPLETION_TOKENS = 4096
-MODEL_NAME = "gpt-5.5"
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 DEBUG_REASON_TRUNCATE_LENGTH = 100
 
 COMBINED_SYSTEM_PROMPT = """You are evaluating GitHub pull requests and converting substantial ones into SWE-bench tasks.

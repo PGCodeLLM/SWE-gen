@@ -59,10 +59,16 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+
+import requests
+from dotenv import load_dotenv
+
+from swegen.net import github_requests_kwargs, requests_ssl_kwargs
 
 # Run-local directory name for post-processed copies of successful tasks.
 POSTPROCESSED_OUTPUT_NAME = "tasks_voyager_postprocessed"
@@ -91,6 +97,7 @@ RETRYABLE_ERROR_SIGNATURES = (
     "Internal server error",
     "502 Bad Gateway",
     "503 Service Unavailable",
+    "503 Server Error: Service Unavailable",
     "504 Gateway Timeout",
     "529",
 )
@@ -111,10 +118,18 @@ GITHUB_RATE_LIMIT_SIGNATURES = (
     "status code 429",
     "returned error: 403",
     "returned error: 429",
+    "403 Client Error: Forbidden for url: https://api.github.com/",
+    "429 Client Error: Too Many Requests for url: https://api.github.com/",
+    "503 Server Error: Service Unavailable for url: https://api.github.com/",
 )
 
 # Base seconds to back off between retries (scaled by attempt number).
 RETRY_BACKOFF_SEC = 5
+
+# Batch runs should not let one Claude session occupy a worker indefinitely.
+# Explicitly cap forwarded --cc-timeout values at three hours; shorter values
+# remain valid for targeted runs.
+MAX_CC_TIMEOUT_SECONDS = 3 * 60 * 60
 
 # Post-processing: the skeleton Dockerfile's base image is rewritten to the
 # internal mirror so generated tasks build against it.
@@ -153,6 +168,11 @@ SECRET_ENV_VARS = {
     "anthropic_base_url": "ANTHROPIC_BASE_URL",
     "openai_base_url": "OPENAI_BASE_URL",
 }
+
+WORKER_PROXY_POOL_ENV = "SWEGEN_WORKER_PROXY_POOL"
+CLAUDE_PROXY_POOL_ENV = "SWEGEN_CLAUDE_PROXY_POOL"
+PROXY_CAPACITY_ENV = "SWEGEN_PROXY_WORKERS_PER_ENDPOINT"
+DEFAULT_PROXY_CAPACITY = 16
 
 
 @dataclass
@@ -246,6 +266,10 @@ def run_command_to_log(
         text=True,
         errors="replace",
         bufsize=1,
+        # Give every PR attempt its own process group. This lets the stale-task
+        # watchdog terminate one wedged Claude/Harbor tree without taking down
+        # the long-lived multi-worker orchestrator or neighboring tasks.
+        start_new_session=True,
     )
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -344,15 +368,23 @@ def split_into_segments(items: list[Entry], n: int) -> list[list[Entry]]:
 
 
 def build_packages(
-    items: list[Entry], output_dir: Path, force: bool
+    items: list[Entry],
+    output_dir: Path,
+    force: bool,
+    *,
+    state_dir: Path | None = None,
+    progress_path: Path | None = None,
+    instance_status_path: Path | None = None,
+    postprocessed_dir: Path | None = None,
 ) -> tuple[list[list[Entry]], int]:
     """Group entries into one "package" per repo for the producer-consumer queue.
 
     A package holds every PR of a single repo that still needs processing. Unless
-    ``force`` is set, PRs whose task directory already exists under ``output_dir``
-    are dropped (a rerun only fills the gaps); when every PR of a repo is dropped,
-    that repo produces no package at all. Within a package the PRs are ordered
-    highest PR number to lowest, matching the old per-segment ordering.
+    ``force`` is set, only instances recorded as successfully produced are
+    dropped. A failed or interrupted task may still have a partial task directory;
+    it must remain in the package so a resumed run can overwrite and retry it.
+    Within a package the PRs are ordered highest PR number to lowest, matching the
+    old per-segment ordering.
 
     Returns ``(packages, skipped)`` where ``skipped`` is the number of existing
     PRs filtered out. Largest packages are returned first so consumers start the
@@ -372,7 +404,14 @@ def build_packages(
             kept = [
                 e
                 for e in entries
-                if not (output_dir / task_dir_name(e.repo, e.pull_number)).exists()
+                if not instance_successfully_produced(
+                    e,
+                    state_dir,
+                    progress_path,
+                    instance_status_path,
+                    output_dir,
+                    postprocessed_dir,
+                )
             ]
             skipped += len(entries) - len(kept)
         if kept:
@@ -391,6 +430,119 @@ def build_child_env(args: argparse.Namespace) -> dict[str, str]:
         value = getattr(args, flag_name)
         if value:
             env[env_name] = value
+    return env
+
+
+def _proxy_pool(env: dict[str, str], key: str) -> list[str]:
+    return [item.strip() for item in env.get(key, "").split(",") if item.strip()]
+
+
+def _proxy_bypass_value(env: dict[str, str], proxy_urls: list[str]) -> str:
+    """Return NO_PROXY with every proxy endpoint host included exactly."""
+    entries: list[str] = []
+    seen: set[str] = set()
+
+    for value in (env.get("no_proxy", ""), env.get("NO_PROXY", "")):
+        for item in value.split(","):
+            item = item.strip()
+            normalized = item.casefold()
+            if item and normalized not in seen:
+                seen.add(normalized)
+                entries.append(item)
+
+    for proxy_url in proxy_urls:
+        host = urlsplit(proxy_url).hostname
+        normalized = host.casefold() if host else ""
+        if host and normalized not in seen:
+            seen.add(normalized)
+            entries.append(host)
+
+    return ",".join(entries)
+
+
+def _proxy_capacity(env: dict[str, str]) -> int:
+    raw = env.get(PROXY_CAPACITY_ENV, str(DEFAULT_PROXY_CAPACITY)).strip()
+    try:
+        capacity = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{PROXY_CAPACITY_ENV} must be an integer, got {raw!r}") from error
+    if capacity <= 0:
+        raise ValueError(f"{PROXY_CAPACITY_ENV} must be positive")
+    return capacity
+
+
+def validate_worker_proxy_config(env: dict[str, str], workers: int) -> list[str]:
+    """Validate proxy pools and return human-readable worker assignments."""
+    socks_pool = _proxy_pool(env, WORKER_PROXY_POOL_ENV)
+    claude_pool = _proxy_pool(env, CLAUDE_PROXY_POOL_ENV)
+    if not socks_pool and not claude_pool:
+        return []
+    if not socks_pool or not claude_pool:
+        raise ValueError(
+            f"{WORKER_PROXY_POOL_ENV} and {CLAUDE_PROXY_POOL_ENV} must both be set"
+        )
+    if len(socks_pool) != len(claude_pool):
+        raise ValueError("worker SOCKS and Claude proxy pools must have equal lengths")
+
+    capacity = _proxy_capacity(env)
+    maximum = len(socks_pool) * capacity
+    if workers > maximum:
+        raise ValueError(
+            f"{workers} workers exceed proxy capacity {maximum} "
+            f"({len(socks_pool)} endpoints x {capacity})"
+        )
+
+    assignments: list[str] = []
+    for index, socks_proxy in enumerate(socks_pool):
+        first = index * capacity
+        if first >= workers:
+            break
+        last = min(workers, first + capacity) - 1
+        assignments.append(
+            f"workers {first}-{last}: {socks_proxy} "
+            f"(Claude bridge {claude_pool[index]})"
+        )
+    return assignments
+
+
+def worker_child_env(base_env: dict[str, str], worker_id: int) -> dict[str, str]:
+    """Return a child environment pinned to this worker's proxy endpoint."""
+    socks_pool = _proxy_pool(base_env, WORKER_PROXY_POOL_ENV)
+    if not socks_pool:
+        return base_env
+    claude_pool = _proxy_pool(base_env, CLAUDE_PROXY_POOL_ENV)
+    capacity = _proxy_capacity(base_env)
+    endpoint_index = worker_id // capacity
+    if endpoint_index >= len(socks_pool) or endpoint_index >= len(claude_pool):
+        raise ValueError(f"worker {worker_id} has no configured proxy endpoint")
+
+    socks_proxy = socks_pool[endpoint_index]
+    claude_proxy = claude_pool[endpoint_index]
+    plain_http_proxy = base_env.get("GIT_PROXY", "").strip() or claude_proxy
+    no_proxy = _proxy_bypass_value(base_env, socks_pool)
+    env = base_env.copy()
+    env.update(
+        {
+            # Some HTTP client stacks accept a socks5:// URL syntactically but
+            # still send an HTTP CONNECT request to it. Route all HTTPS traffic
+            # through our HTTP-to-SOCKS bridge so only the bridge ever speaks
+            # the raw SOCKS5 protocol. Plain HTTP stays on the SG proxy.
+            "http_proxy": plain_http_proxy,
+            "https_proxy": claude_proxy,
+            "HTTP_PROXY": plain_http_proxy,
+            "HTTPS_PROXY": claude_proxy,
+            "ALL_PROXY": claude_proxy,
+            "SWEGEN_CLAUDE_PROXY": claude_proxy,
+            "SWEGEN_CLAUDE_HTTP_PROXY": plain_http_proxy,
+            "SWEGEN_ASSIGNED_SOCKS_PROXY": socks_proxy,
+            "SWEGEN_PROXY_ENDPOINT_INDEX": str(endpoint_index),
+            # A worker may probe or connect to its SOCKS endpoint directly.
+            # Exact host entries are required because wildcard forms such as
+            # ``10.*`` are not interpreted consistently across HTTP stacks.
+            "no_proxy": no_proxy,
+            "NO_PROXY": no_proxy,
+        }
+    )
     return env
 
 
@@ -1546,6 +1698,61 @@ def _mask_token(token: str | None) -> str:
     return f"{token[:8]}…" if len(token) > 8 else "…"
 
 
+def preflight_github_tokens(tokens: list[str]) -> list[str]:
+    """Return only tokens that can currently authenticate to GitHub.
+
+    A failed pool must stop the batch before workers turn every queued PR into a
+    false failure. Set ``SWEGEN_GITHUB_PREFLIGHT=0`` only for deliberate offline
+    or mocked runs.
+    """
+    enabled = os.environ.get("SWEGEN_GITHUB_PREFLIGHT", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return list(tokens)
+
+    healthy: list[str] = []
+    for index, token in enumerate(tokens, start=1):
+        try:
+            response = requests.get(
+                "https://api.github.com/user",
+                params={"swegen_preflight": time.time_ns()},
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"token {token}",
+                    "Cache-Control": "no-cache",
+                },
+                timeout=20,
+                **github_requests_kwargs(),
+                **requests_ssl_kwargs(),
+            )
+        except requests.RequestException as error:
+            print(
+                f"warning: GitHub token {index} ({_mask_token(token)}) preflight "
+                f"failed: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            continue
+
+        if response.status_code == 200:
+            healthy.append(token)
+            continue
+
+        remaining = response.headers.get("X-RateLimit-Remaining", "unknown")
+        reset_text = response.headers.get("X-RateLimit-Reset", "")
+        reset_note = ""
+        try:
+            reset_seconds = max(0, int(reset_text) - int(time.time()))
+            reset_note = f", reset in {reset_seconds}s"
+        except (TypeError, ValueError):
+            pass
+        print(
+            f"warning: GitHub token {index} ({_mask_token(token)}) is unavailable: "
+            f"HTTP {response.status_code}, remaining={remaining}{reset_note}",
+            file=sys.stderr,
+        )
+
+    return healthy
+
+
 def pick_github_token(pool: list[str], exclude: set[str]) -> str | None:
     """Pick a random token from ``pool``, preferring ones not in ``exclude``.
 
@@ -1762,11 +1969,19 @@ def run_consumer(
     happens incrementally rather than in a batch at the end.
     """
     token_pool = github_tokens or []
+    worker_env = worker_child_env(env, worker_id)
     outcomes: list[Outcome] = []
     log_path = log_dir / f"worker-{worker_id}.log"
 
     with log_path.open("w") as raw_log:
         log = TimestampedLog(raw_log)
+        assigned_proxy = worker_env.get("SWEGEN_ASSIGNED_SOCKS_PROXY")
+        if assigned_proxy:
+            log.write(
+                f"[worker {worker_id}] LLM proxy: {assigned_proxy}; "
+                f"Claude bridge: {worker_env['SWEGEN_CLAUDE_PROXY']}\n"
+            )
+            log.flush()
         while True:
             package = work_queue.get()
             try:
@@ -1802,7 +2017,7 @@ def run_consumer(
                         worker_id,
                         entry,
                         tag,
-                        env,
+                        worker_env,
                         swegen_bin,
                         log,
                         log_path,
@@ -1982,11 +2197,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # `swegen` loads .env in its Typer entry point; this standalone batch
+    # orchestrator needs the same behavior when invoked directly.
+    load_dotenv()
     args = parse_args(argv)
 
     if args.workers < 1:
         print("error: --workers must be >= 1", file=sys.stderr)
         return 2
+    if args.cc_timeout is not None and args.cc_timeout > MAX_CC_TIMEOUT_SECONDS:
+        print(
+            f"Capping --cc-timeout from {args.cc_timeout}s to "
+            f"{MAX_CC_TIMEOUT_SECONDS}s (3 hours).",
+            flush=True,
+        )
+        args.cc_timeout = MAX_CC_TIMEOUT_SECONDS
     if not args.jsonl.exists():
         print(f"error: input file not found: {args.jsonl}", file=sys.stderr)
         return 2
@@ -2010,6 +2235,23 @@ def main(argv: list[str] | None = None) -> int:
             github_tokens = load_github_tokens()
         except Exception:
             github_tokens = []
+    configured_github_tokens = len(github_tokens)
+    if github_tokens:
+        github_tokens = preflight_github_tokens(github_tokens)
+        if not github_tokens:
+            print(
+                "error: none of the configured GitHub tokens passed preflight; "
+                "refusing to mark queued PRs as failed. Retry after the token "
+                "rate limits or GitHub 503 responses recover.",
+                file=sys.stderr,
+            )
+            return 3
+        if len(github_tokens) != configured_github_tokens:
+            print(
+                f"Using {len(github_tokens)}/{configured_github_tokens} GitHub "
+                "tokens that passed preflight.",
+                flush=True,
+            )
     if not github_tokens:
         print(
             "warning: no GitHub token configured (via --github-token, environment, "
@@ -2028,8 +2270,16 @@ def main(argv: list[str] | None = None) -> int:
     create_run_dirs(args)
     env = build_child_env(args)
 
+    try:
+        proxy_assignments = validate_worker_proxy_config(env, args.workers)
+    except ValueError as error:
+        print(f"error: invalid worker proxy configuration: {error}", file=sys.stderr)
+        return 2
+
     print(f"Run: {args.run_name} -> {args.run_dir}", flush=True)
     print(f"Repo cache: {args.repo_cache_dir}", flush=True)
+    for assignment in proxy_assignments:
+        print(f"Proxy assignment: {assignment}", flush=True)
 
     # Slurm mode: fan the input out across nodes via sbatch (one job per node,
     # each running --workers workers locally), then exit. Each node logs to its
@@ -2043,13 +2293,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return submit_slurm_jobs(entries, args, env)
 
-    # Group the entries into one package per repo, dropping PRs whose task dir
-    # already exists (unless --force). Empty repos yield no package.
-    packages, skipped = build_packages(entries, args.tasks_dir, args.force)
+    # Group the entries into one package per repo, dropping only instances that
+    # were already recorded as successful. Failed/interrupted task directories
+    # are retried and overwritten by `swegen create --force`.
+    packages, skipped = build_packages(
+        entries,
+        args.tasks_dir,
+        args.force,
+        state_dir=args.run_dir,
+        progress_path=args.progress_jsonl,
+        instance_status_path=args.instance_status_jsonl,
+        postprocessed_dir=args.postprocessed_dir,
+    )
     if skipped:
         print(
-            f"Skipping {skipped} PR(s) whose task dir already exists under "
-            f"{args.tasks_dir}/ (use --force to rebuild).",
+            f"Skipping {skipped} PR(s) already recorded as successful in "
+            f"{args.run_dir}/ (use --force to rebuild).",
             flush=True,
         )
     if not packages:

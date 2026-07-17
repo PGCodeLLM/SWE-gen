@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import IO
 
 logger = logging.getLogger("swegen")
 
@@ -30,7 +35,19 @@ class TaskReferenceStore:
             reference_file: Path to JSON file storing references (default: .swegen/task_references.json)
         """
         self.reference_file = reference_file or Path(".swegen/task_references.json")
+        self.lock_file = self.reference_file.with_name(f"{self.reference_file.name}.lock")
         self.reference_file.parent.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def _locked(self, *, exclusive: bool) -> Iterator[IO[str]]:
+        """Hold a cross-process advisory lock for reference store access."""
+        with self.lock_file.open("a+", encoding="utf-8") as lock_fh:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(lock_fh.fileno(), operation)
+            try:
+                yield lock_fh
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
     def _load_references(self) -> dict[str, list[TaskReference]]:
         """Load all references from file."""
@@ -56,7 +73,16 @@ class TaskReferenceStore:
     def _save_references(self, references: dict[str, list[TaskReference]]) -> None:
         """Save all references to file."""
         data = {repo: [asdict(ref) for ref in refs] for repo, refs in references.items()}
-        self.reference_file.write_text(json.dumps(data, indent=2))
+        temporary = self.reference_file.with_name(f".{self.reference_file.name}.tmp.{os.getpid()}")
+        try:
+            with temporary.open("w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, self.reference_file)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def save(
         self,
@@ -84,16 +110,17 @@ class TaskReferenceStore:
                 created_at=datetime.now(UTC).isoformat(),
             )
 
-            references = self._load_references()
-            repo_references = references.setdefault(repo, [])
-            repo_references[:] = [
-                ref
-                for ref in repo_references
-                if not (ref.task_id == task_id or ref.pr_number == pr_number)
-            ]
-            repo_references.append(reference)
-            repo_references.sort(key=lambda ref: ref.pr_number)
-            self._save_references(references)
+            with self._locked(exclusive=True):
+                references = self._load_references()
+                repo_references = references.setdefault(repo, [])
+                repo_references[:] = [
+                    ref
+                    for ref in repo_references
+                    if not (ref.task_id == task_id or ref.pr_number == pr_number)
+                ]
+                repo_references.append(reference)
+                repo_references.sort(key=lambda ref: ref.pr_number)
+                self._save_references(references)
 
             logger.info(f"✓ Saved task reference for {repo} → {task_id}")
             return True
@@ -122,7 +149,8 @@ class TaskReferenceStore:
             TaskReference if valid reference exists, None otherwise
         """
         try:
-            references = self._load_references()
+            with self._locked(exclusive=False):
+                references = self._load_references()
 
             if repo not in references:
                 logger.debug(f"No task reference found for {repo}")

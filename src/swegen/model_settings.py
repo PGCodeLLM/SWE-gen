@@ -13,6 +13,12 @@ logger = logging.getLogger("swegen")
 # the out-of-the-box behavior matches what the runner previously hardcoded.
 DEFAULT_MODEL = "qwen3.5-397b-a17b-alex-swe-gen"
 
+# Claude Code uses its Haiku tier for internal lightweight work such as
+# built-in Explore subagents and Bash command-path extraction.  Our compatible
+# endpoint serves that role under this model name instead.
+DEFAULT_CLAUDE_FAST_MODEL = "gpt-5.3-codex-spark"
+CLAUDE_FAST_MODEL_ENV = "SWEGEN_CLAUDE_FAST_MODEL"
+
 # Env var pointing at an alternate config file location (otherwise swegen.toml in
 # the current working directory is used).
 CONFIG_PATH_ENV = "SWEGEN_CONFIG"
@@ -91,6 +97,35 @@ def session_header_env(instance_id: str, header: str = "X-Session-ID") -> dict[s
     existing = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
     value = f"{existing}\n{line}" if existing else line
     return {"ANTHROPIC_CUSTOM_HEADERS": value}
+
+
+def claude_session_env(instance_id: str, header: str = "X-Session-ID") -> dict[str, str]:
+    """Return environment overrides shared by every Claude SDK session.
+
+    Claude Code has two names for its lightweight internal model.  The legacy
+    ``ANTHROPIC_SMALL_FAST_MODEL`` takes precedence for fast helpers such as
+    Bash command-path extraction, while the built-in ``haiku`` tier used by
+    Explore subagents resolves through ``ANTHROPIC_DEFAULT_HAIKU_MODEL``.
+    Setting both prevents either path from falling back to Claude Haiku.
+
+    ``SWEGEN_CLAUDE_FAST_MODEL`` is the preferred SWE-Gen override.  Existing
+    Claude Code model variables remain valid fallbacks for direct invocations.
+    """
+    env = session_header_env(instance_id, header)
+    fast_model = (
+        os.environ.get(CLAUDE_FAST_MODEL_ENV)
+        or os.environ.get("ANTHROPIC_SMALL_FAST_MODEL")
+        or os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+        or DEFAULT_CLAUDE_FAST_MODEL
+    ).strip()
+    if fast_model:
+        env.update(
+            {
+                "ANTHROPIC_SMALL_FAST_MODEL": fast_model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": fast_model,
+            }
+        )
+    return env
 
 
 def load_github_token() -> str | None:

@@ -64,17 +64,42 @@ class RepoCache:
             raise ValueError(f"Invalid repo format: {repo}. Expected 'owner/repo'")
         return parts[0], parts[1]
 
+    @staticmethod
+    def _decode_subprocess_output(output: bytes | str | None) -> str:
+        """Return captured subprocess output without hiding decoding failures."""
+        if output is None:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode(errors="replace").strip()
+        return output.strip()
+
+    def _raise_git_command_error(
+        self, command: str, error: subprocess.CalledProcessError
+    ) -> None:
+        """Log and raise a Git failure while preserving its diagnostic stderr."""
+        stderr = self._decode_subprocess_output(error.stderr)
+        message = f"{command} failed with exit code {error.returncode}"
+        if stderr:
+            message += f"\nGit stderr:\n{stderr}"
+        else:
+            message += "\nGit produced no stderr."
+        self.logger.error("%s", message)
+        raise RuntimeError(message) from error
+
     def _clone(self, repo_url: str, repo_path: Path, head_sha: str) -> None:
         """Clone a repository and checkout the specified commit."""
         repo_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Full clone for maximum CC context
         self.logger.debug("Cloning %s...", repo_url)
-        subprocess.run(
-            ["git", "clone", repo_url, str(repo_path)],
-            check=True,
-            capture_output=True,
-        )
+        try:
+            subprocess.run(
+                ["git", "clone", repo_url, str(repo_path)],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as error:
+            self._raise_git_command_error("git clone", error)
 
         # Checkout the target commit
         self._checkout(repo_path, head_sha)
@@ -84,12 +109,15 @@ class RepoCache:
         self.logger.debug("Fetching updates for %s...", repo_path)
 
         # Fetch all refs
-        subprocess.run(
-            ["git", "fetch", "--all"],
-            cwd=str(repo_path),
-            check=True,
-            capture_output=True,
-        )
+        try:
+            subprocess.run(
+                ["git", "fetch", "--all"],
+                cwd=str(repo_path),
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as error:
+            self._raise_git_command_error("git fetch --all", error)
 
         # Try to checkout the commit
         self._checkout(repo_path, head_sha)

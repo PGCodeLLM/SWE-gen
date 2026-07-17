@@ -23,7 +23,10 @@ class SkeletonParams:
     pr_number: int
 
 
-def generate_dockerfile(params: SkeletonParams) -> str:
+def generate_dockerfile(
+    params: SkeletonParams,
+    proxy_ca_filename: str | None = None,
+) -> str:
     """
     Generate a minimal, language-agnostic Dockerfile skeleton.
 
@@ -44,16 +47,26 @@ def generate_dockerfile(params: SkeletonParams) -> str:
     - If the PR was squash-merged/rebased, that commit may not be on any normal branch.
     - In that case, fetching `refs/pull/<n>/head` is a robust fallback without fetching ALL PR refs.
     """
+    proxy_ca_copy = ""
+    proxy_ca_install = ""
+    if proxy_ca_filename:
+        proxy_ca_copy = f"COPY {proxy_ca_filename} /tmp/{proxy_ca_filename}\n\n"
+        proxy_ca_install = f"""    && mkdir -p /usr/local/share/ca-certificates \\
+    && cp /tmp/{proxy_ca_filename} /usr/local/share/ca-certificates/{proxy_ca_filename} \\
+    && update-ca-certificates \\
+    && rm /tmp/{proxy_ca_filename} \\
+"""
+
     return f"""FROM ubuntu:24.04
 
 # Base system packages (common to all languages)
-RUN apt-get update && apt-get install -y \\
+{proxy_ca_copy}RUN apt-get update && apt-get install -y \\
     git \\
     curl \\
     ca-certificates \\
     patch \\
     build-essential \\
-    && rm -rf /var/lib/apt/lists/*
+{proxy_ca_install}    && rm -rf /var/lib/apt/lists/*
 
 # TODO: Install language runtime
 # Analyze the repo to determine what's needed. Examples:
@@ -254,10 +267,10 @@ def generate_task_toml(instruction_data: dict) -> str:
             "category": instruction_data.get("category", "bugfix"),
             "tags": instruction_data.get("tags", []),
         },
-        verifier=VerifierConfig(timeout_sec=600.0),
-        agent=AgentConfig(timeout_sec=600.0),
+        verifier=VerifierConfig(timeout_sec=1800.0),
+        agent=AgentConfig(timeout_sec=1800.0),
         environment=EnvironmentConfig(
-            build_timeout_sec=600.0,
+            build_timeout_sec=1800.0,
             cpus=1,
             memory_mb=2048,
             storage_mb=10240,

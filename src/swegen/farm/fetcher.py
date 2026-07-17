@@ -11,6 +11,7 @@ import requests
 from rich.console import Console
 
 from swegen.create import is_test_file
+from swegen.net import github_requests_kwargs, requests_ssl_kwargs
 
 from .farm_hand import PRCandidate, _slug
 from .state import StreamState
@@ -172,7 +173,14 @@ class StreamingPRFetcher:
             params: dict[str, Any] = {**params_base, "page": page}
 
             try:
-                resp = requests.get(url, headers=self.headers, params=params, timeout=30)
+                resp = requests.get(
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=30,
+                    **github_requests_kwargs(),
+                    **requests_ssl_kwargs(),
+                )
                 resp.raise_for_status()
             except requests.exceptions.RequestException as exc:
                 self.console.print(f"[red]API error on page {page}: {exc}[/red]")
@@ -229,7 +237,13 @@ class StreamingPRFetcher:
                 # Fetch full PR details
                 try:
                     pr_url = f"{self.api_base}/repos/{self.repo}/pulls/{pr_number}"
-                    pr_resp = requests.get(pr_url, headers=self.headers, timeout=30)
+                    pr_resp = requests.get(
+                        pr_url,
+                        headers=self.headers,
+                        timeout=30,
+                        **github_requests_kwargs(),
+                        **requests_ssl_kwargs(),
+                    )
                     pr_resp.raise_for_status()
                     pr_full = pr_resp.json()
                     time.sleep(self.api_delay)
@@ -306,7 +320,14 @@ class StreamingPRFetcher:
 
         while True:
             params = {"page": page, "per_page": 100}
-            resp = requests.get(files_url, headers=self.headers, params=params, timeout=30)
+            resp = requests.get(
+                files_url,
+                headers=self.headers,
+                params=params,
+                timeout=30,
+                **github_requests_kwargs(),
+                **requests_ssl_kwargs(),
+            )
             resp.raise_for_status()
 
             files = resp.json()

@@ -388,18 +388,20 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.1.20"
+version = "0.2.120"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "mcp" },
+    { name = "sniffio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/41/78/be7848b0a148269e07c3248967b4c382624967b15e9cc00351f5f7374583/claude_agent_sdk-0.1.20.tar.gz", hash = "sha256:bc3cb24f2dc8c7dc7362f52764051b20dbfcc16ec3e3d39787c4946d7ced3848", size = 56178, upload-time = "2026-01-16T21:20:11.864Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/7f/7b69aed292a4edecae132e4dbe6b6decb4e88ec142fc91d117b19058c9e0/claude_agent_sdk-0.2.120.tar.gz", hash = "sha256:e428552f79a76e0d85789369eeb58249b33f350200124e5fc86b24168bd00805", size = 268639, upload-time = "2026-07-15T23:18:50.997Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/e6/b34b8358a31cfc9c65df014d038036dbc86bd5f45ff6befc98e2cdb3407a/claude_agent_sdk-0.1.20-py3-none-macosx_11_0_arm64.whl", hash = "sha256:3ff7ab0930fd34fd533fa6216af698df71e7c3a4fcbd2f29eb9d0cd7b51fdfa5", size = 54068867, upload-time = "2026-01-16T21:19:55.29Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/dc/08606e7a7377ca841ff6a961b0db930d13a98656b30176860c28d3407bcf/claude_agent_sdk-0.1.20-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:7756d35e6b5774270e880403513a347a9a4a504bfa28fd6a51cb0ed724a7851e", size = 68266982, upload-time = "2026-01-16T21:20:00.365Z" },
-    { url = "https://files.pythonhosted.org/packages/00/e3/d8de4f94a1c670ea4c4a933a272b291b85bd6471ac7a28875ef8ae768185/claude_agent_sdk-0.1.20-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:82dfb7d4f6494c9a977b5593773b91c507bcdd76437f289e2b8f8a91ae5f95c1", size = 69980411, upload-time = "2026-01-16T21:20:04.71Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/9f/af71db6b54e9de08e37c10e0a4d5ea7482227b15a63ee9f97b1599cd3ffc/claude_agent_sdk-0.1.20-py3-none-win_amd64.whl", hash = "sha256:7a5675b1c0bf489a5c82c79f6ad47c3915a50da66e1329dcb0d08332a04889d3", size = 72183062, upload-time = "2026-01-16T21:20:09.069Z" },
+    { url = "https://files.pythonhosted.org/packages/80/85/5e8958704db0f8195e63f8ec4a80c5fb14756edc785bb3535e0dc5d91104/claude_agent_sdk-0.2.120-py3-none-macosx_11_0_arm64.whl", hash = "sha256:c5ead9fb4bdaf70069978703ec6d74b30bd269e9632a4aea4dc8c4e999ac3a1b", size = 71110966, upload-time = "2026-07-15T23:18:54.743Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/53/c6cdad82ac100c8a45887999614e9fe206b77b43790dacc6de42b156ad4c/claude_agent_sdk-0.2.120-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:1248591c7bffeb6e10e8cd169e0766854951fba8816e3e7d81a003f8bfca6f08", size = 76067995, upload-time = "2026-07-15T23:18:58.398Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/f8/248e3f58d0f0aa7d76bd34b11b18135cc124f5b9a9b55219cc1ca03d662a/claude_agent_sdk-0.2.120-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:abc73ccdf3decca566cd18084e74bc2f2d10b8b77cc1fd5ed4299d5c15e5078b", size = 81027434, upload-time = "2026-07-15T23:19:03.318Z" },
+    { url = "https://files.pythonhosted.org/packages/11/59/6adb0c53534646f1d5ddc41226ff37b2adc413a472e2f87a9011548a137f/claude_agent_sdk-0.2.120-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:888070c246c92e102c52001d26532cd3646a700656d7c368f2f91a1d3c16b534", size = 82084704, upload-time = "2026-07-15T23:19:08.729Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/06/036b8dce1e86ecd5e2e1ddc281736cdb33bad6d24e748b9553e235b028fe/claude_agent_sdk-0.2.120-py3-none-win_amd64.whl", hash = "sha256:bc1441c94f60c9e7b4b8c641742fedf68451f573062ef69dd43d86a61b1fb219", size = 81958518, upload-time = "2026-07-15T23:19:13.082Z" },
 ]
 
 [[package]]
@@ -1066,6 +1068,9 @@ wheels = [
 [package.optional-dependencies]
 http2 = [
     { name = "h2" },
+]
+socks = [
+    { name = "socksio" },
 ]
 
 [[package]]
@@ -2335,6 +2340,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pysocks"
+version = "1.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bd/11/293dd436aea955d45fc4e8a35b6ae7270f5b8e00b53cf6c024c83b657a11/PySocks-1.7.1.tar.gz", hash = "sha256:3f8804571ebe159c380ac6de37643bb4685970655d3bba243530d6558b799aa0", size = 284429, upload-time = "2019-09-20T02:07:35.714Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/59/b4572118e098ac8e46e399a1dd0f2d85403ce8bbaad9ec79373ed6badaf9/PySocks-1.7.1-py3-none-any.whl", hash = "sha256:2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5", size = 16725, upload-time = "2019-09-20T02:06:22.938Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2803,6 +2817,15 @@ wheels = [
 ]
 
 [[package]]
+name = "socksio"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/5c/48a7d9495be3d1c651198fd99dbb6ce190e2274d0f28b9051307bdec6b85/socksio-1.0.0.tar.gz", hash = "sha256:f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac", size = 19055, upload-time = "2020-04-17T15:50:34.664Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/c3/6eeb6034408dac0fa653d126c9204ade96b819c936e136c5e8a6897eee9c/socksio-1.0.0-py3-none-any.whl", hash = "sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3", size = 12763, upload-time = "2020-04-17T15:50:31.878Z" },
+]
+
+[[package]]
 name = "sortedcontainers"
 version = "2.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2930,9 +2953,11 @@ dependencies = [
     { name = "docker" },
     { name = "gitpython" },
     { name = "harbor" },
+    { name = "httpx", extra = ["socks"] },
     { name = "openai" },
     { name = "pydantic" },
     { name = "pygithub" },
+    { name = "pysocks" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -2958,14 +2983,16 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=25.12.0" },
-    { name = "claude-agent-sdk", specifier = ">=0.1.20" },
+    { name = "claude-agent-sdk", specifier = ">=0.2.120" },
     { name = "click", specifier = ">=8.3.1" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "gitpython", specifier = ">=3.1.46" },
     { name = "harbor", specifier = ">=0.1.41" },
+    { name = "httpx", extras = ["socks"] },
     { name = "openai", specifier = ">=2.15.0" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pygithub", specifier = ">=2.8.1" },
+    { name = "pysocks" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "pyyaml", specifier = ">=6.0.3" },

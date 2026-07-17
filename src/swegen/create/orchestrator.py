@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -338,8 +339,28 @@ class PRToHarborPipeline:
             # bug.patch
             (paths.environment_dir / "bug.patch").write_text(bug_diff)
 
+            # Optionally include a private proxy CA in the Docker build context.
+            # Host trust stores are not inherited by Docker build containers.
+            proxy_ca_filename = None
+            proxy_ca_bundle = os.environ.get("SWEGEN_PROXY_CA_BUNDLE", "").strip()
+            if proxy_ca_bundle:
+                proxy_ca_source = Path(proxy_ca_bundle).expanduser().resolve()
+                if not proxy_ca_source.is_file():
+                    raise FileNotFoundError(
+                        f"SWEGEN_PROXY_CA_BUNDLE is not a file: {proxy_ca_source}"
+                    )
+                proxy_ca_filename = "swegen-proxy-ca.crt"
+                shutil.copy2(
+                    proxy_ca_source,
+                    paths.environment_dir / proxy_ca_filename,
+                )
+                logger.info("Added proxy CA to Docker build context: %s", proxy_ca_source)
+
             # Dockerfile (with TODOs for CC)
-            dockerfile = generate_dockerfile(skeleton_params)
+            dockerfile = generate_dockerfile(
+                skeleton_params,
+                proxy_ca_filename=proxy_ca_filename,
+            )
             (paths.environment_dir / "Dockerfile").write_text(dockerfile)
 
             # test.sh (with TODOs for CC)

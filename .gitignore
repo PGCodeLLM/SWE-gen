@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 .env
+.env_*
 env/
 venv/
 ENV/
@@ -74,6 +75,7 @@ node_modules
 successful_*/
 200_sampled_from_successful_*/
 setup_tokens.sh
+test_swegen.sh
 get_merge_commit_ids.py
 reward_hacking_detector/hacking_checker.toml
 reward_hacking_detector/hacking_checker_CODEX_ONLY.toml
