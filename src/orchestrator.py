@@ -79,8 +79,10 @@ DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
 RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 SWEGEN_IMAGE_SUFFIX = "-swegenimage"
 
-# Slurm nodes to distribute across when --slurm is set (lux-3-bm-cpu-[01-10]).
-SLURM_NODES = [f"lux-3-bm-cpu-{i:02d}" for i in range(1, 11) if i != 8]  # CPU 8 is borked
+# The legacy in-process Slurm fan-out assumed a shared filesystem and obsolete
+# node names.  It remains parseable only to emit a migration error; new Slurm
+# runs are planned and staged by ``src/slurm_two_node.py``.
+SLURM_NODES: list[str] = []
 
 # Substrings in a failed `swegen create` run that indicate a transient
 # network/API error worth retrying (vs. a genuine task failure like a trivial
@@ -1270,6 +1272,14 @@ def write_progress_jsonl(
                     "total_failures": total_failures,
                     "total_processed": total_processed,
                 }
+                runtime_metadata = {
+                    "slurm_node": os.environ.get("SWEGEN_SLURM_NODE", "").strip(),
+                    "slurm_route": os.environ.get("SWEGEN_SLURM_ROUTE", "").strip(),
+                    "slurm_group": os.environ.get("SWEGEN_SLURM_GROUP", "").strip(),
+                }
+                status_record.update(
+                    {key: value for key, value in runtime_metadata.items() if value}
+                )
                 if not outcome.ok:
                     status_record["failure_reason"] = outcome.failure_reason
                 progress_record = {
@@ -1295,6 +1305,9 @@ def write_progress_jsonl(
                     "total_failures": total_failures,
                     "total_processed": total_processed,
                 }
+                progress_record.update(
+                    {key: value for key, value in runtime_metadata.items() if value}
+                )
                 status_fh.write(json.dumps(status_record) + "\n")
                 status_fh.flush()
                 progress_fh.write(json.dumps(progress_record) + "\n")
@@ -2127,9 +2140,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--slurm",
         action="store_true",
-        help=f"Distribute the input across slurm nodes {SLURM_NODES[0]}.."
-        f"{SLURM_NODES[-1]} via sbatch (one job per node, each running "
-        "--workers workers), then exit. Without this flag everything runs locally.",
+        help="Deprecated legacy Slurm mode. Use src/slurm_two_node.py, which "
+        "stages node-local workspaces and preserves the 8+8+8 proxy topology.",
     )
     parser.add_argument(
         "--runs-dir",
@@ -2281,17 +2293,13 @@ def main(argv: list[str] | None = None) -> int:
     for assignment in proxy_assignments:
         print(f"Proxy assignment: {assignment}", flush=True)
 
-    # Slurm mode: fan the input out across nodes via sbatch (one job per node,
-    # each running --workers workers locally), then exit. Each node logs to its
-    # own subfolder; all nodes share the flat output dir.
     if args.slurm:
         print(
-            f"Distributing {len(entries)} entries across up to "
-            f"{len(SLURM_NODES)} node(s) via sbatch "
-            f"(--workers {args.workers} per node):",
-            flush=True,
+            "error: the legacy --slurm mode assumes a shared filesystem and "
+            "obsolete node names. Use `python src/slurm_two_node.py ...` instead.",
+            file=sys.stderr,
         )
-        return submit_slurm_jobs(entries, args, env)
+        return 2
 
     # Group the entries into one package per repo, dropping only instances that
     # were already recorded as successful. Failed/interrupted task directories

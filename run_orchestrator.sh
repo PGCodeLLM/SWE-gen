@@ -43,8 +43,18 @@ INTERNAL_NO_PROXY="*.huaweicloud.com,100.*,10.*,.huawei.com,127.0.0.1,7.244.3.25
 export no_proxy="${ENV_NO_PROXY:+$ENV_NO_PROXY,}$INTERNAL_NO_PROXY"
 export NO_PROXY="$no_proxy"
 
-export SWEGEN_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-export SWEGEN_PROXY_CA_BUNDLE=/data/work/alex/ProxyCA260122.crt
+default_ca_bundle=/etc/ssl/certs/ca-certificates.crt
+if [[ -f "$PWD/.slurm-secrets/combined-ca.crt" ]]; then
+  default_ca_bundle="$PWD/.slurm-secrets/combined-ca.crt"
+fi
+export SWEGEN_CA_BUNDLE="${SWEGEN_CA_BUNDLE:-$default_ca_bundle}"
+unset default_ca_bundle
+default_proxy_ca=/data/work/alex/ProxyCA260122.crt
+if [[ -f "$PWD/.slurm-secrets/ProxyCA260122.crt" ]]; then
+  default_proxy_ca="$PWD/.slurm-secrets/ProxyCA260122.crt"
+fi
+export SWEGEN_PROXY_CA_BUNDLE="${SWEGEN_PROXY_CA_BUNDLE:-$default_proxy_ca}"
+unset default_proxy_ca
 export REQUESTS_CA_BUNDLE="$SWEGEN_CA_BUNDLE"
 export CURL_CA_BUNDLE="$SWEGEN_CA_BUNDLE"
 export SSL_CERT_FILE="$SWEGEN_CA_BUNDLE"

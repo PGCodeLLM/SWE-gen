@@ -19,19 +19,149 @@ from typing import Any
 CREATE_INSTANCE_RE = re.compile(r"--repo\x00([^\x00]+)\x00--pr\x00([^\x00]+)")
 STATUS_JOURNAL_GLOB = "orchestrator-instance-status*.jsonl"
 BACKUP_MARKER = ".before-"
+SUCCESS_LEDGER_NAME = "create.jsonl"
+SLURM_PLAN_NAME = "slurm-plan.json"
+SLURM_HEALTH_NAME = "slurm-health.json"
+SLURM_NODE_DIR_NAMES = {"slurm-nodes", "slurm_nodes"}
+DISCOVERY_PRUNE_DIRS = {
+    ".cache",
+    ".git",
+    ".swegen",
+    "__pycache__",
+    "cache",
+    "caches",
+    "data_cache",
+    "harbor-jobs",
+    "node_modules",
+    "postprocessed-output",
+    "repo-cache",
+    "repo_cache",
+    "repos",
+    "tasks",
+}
+NODE_FIELDS = (
+    "slurm_node",
+    "slurm_node_name",
+    "slurmd_nodename",
+    "node",
+    "node_name",
+    "hostname",
+    "host",
+)
+
+
+def _is_backup_component(name: str) -> bool:
+    lower = name.lower()
+    return (
+        BACKUP_MARKER in lower
+        or lower in {"backup", "backups", "snapshot", "snapshots"}
+        or lower.startswith(("backup-", "snapshot-"))
+        or lower.endswith(("-backup", "-snapshot"))
+    )
+
+
+def _discover_run_files(run_dir: Path, filename_matches: Any) -> list[Path]:
+    """Recursively find live run artifacts without entering output/cache trees."""
+    paths: list[Path] = []
+    if not run_dir.is_dir():
+        return paths
+
+    for root, dirnames, filenames in os.walk(run_dir):
+        dirnames[:] = sorted(
+            dirname
+            for dirname in dirnames
+            if dirname.lower() not in DISCOVERY_PRUNE_DIRS
+            and not _is_backup_component(dirname)
+        )
+        root_path = Path(root)
+        for filename in filenames:
+            if _is_backup_component(filename) or not filename_matches(filename):
+                continue
+            paths.append(root_path / filename)
+    return sorted(paths)
 
 
 def status_journal_paths(run_dir: Path) -> list[Path]:
-    """Return live status journals, excluding timestamped backup snapshots."""
-    return sorted(
-        path
-        for path in run_dir.glob(STATUS_JOURNAL_GLOB)
-        if path.is_file() and BACKUP_MARKER not in path.name
+    """Return live local and Slurm status journals under the run directory."""
+    return _discover_run_files(
+        run_dir,
+        lambda name: name.startswith("orchestrator-instance-status")
+        and name.endswith(".jsonl"),
     )
+
+
+def success_ledger_paths(run_dir: Path) -> list[Path]:
+    """Return authoritative success ledgers from local and Slurm node state."""
+    return _discover_run_files(run_dir, lambda name: name == SUCCESS_LEDGER_NAME)
+
+
+def _string_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _node_from_record(record: dict[str, Any]) -> tuple[str | None, bool]:
+    for field in NODE_FIELDS:
+        node = _string_value(record.get(field))
+        if node:
+            return node, field.startswith("slurm")
+
+    slurm = record.get("slurm")
+    if isinstance(slurm, dict):
+        for field in NODE_FIELDS:
+            node = _string_value(slurm.get(field))
+            if node:
+                return node, True
+    return None, False
+
+
+def _node_from_path(path: Path, run_dir: Path | None) -> tuple[str | None, bool]:
+    if run_dir is None:
+        return None, False
+    try:
+        parts = path.relative_to(run_dir).parts
+    except ValueError:
+        return None, False
+
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() in SLURM_NODE_DIR_NAMES and index + 1 < len(parts) - 1:
+            return parts[index + 1], True
+    # The legacy Slurm launcher stored one directory per node beneath this
+    # exact folder. Do not interpret similarly named flat proxy log folders as
+    # machines.
+    for index, part in enumerate(parts[:-1]):
+        if part == "orchestrator-logs" and index + 1 < len(parts) - 1:
+            return parts[index + 1], True
+    return None, False
+
+
+def _enrich_node_identity(
+    record: dict[str, Any], source_path: Path, run_dir: Path | None
+) -> dict[str, Any]:
+    enriched = dict(record)
+    node, is_slurm = _node_from_record(enriched)
+    if node is None:
+        node, is_slurm = _node_from_path(source_path, run_dir)
+    if node is not None:
+        enriched["node"] = node
+        if is_slurm:
+            enriched["node_scope"] = "slurm"
+    return enriched
+
+
+def _copy_node_identity(target: dict[str, Any], source: dict[str, Any]) -> None:
+    if not _string_value(target.get("node")) and _string_value(source.get("node")):
+        target["node"] = source["node"]
+    if target.get("node_scope") != "slurm" and source.get("node_scope") == "slurm":
+        target["node_scope"] = "slurm"
 
 
 def load_latest_statuses(
     status_paths: Path | Iterable[Path],
+    *,
+    run_dir: Path | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Return the latest status per instance across one or more journals."""
     latest: dict[str, dict[str, Any]] = {}
@@ -64,14 +194,16 @@ def load_latest_statuses(
                     index,
                 )
                 if instance not in sequence or key >= sequence[instance]:
-                    latest[instance] = record
+                    latest[instance] = _enrich_node_identity(record, status_path, run_dir)
                     sequence[instance] = key
 
     order = sorted(latest, key=sequence.__getitem__, reverse=True)
     return latest, order
 
 
-def load_success_ledger(create_path: Path) -> dict[str, dict[str, Any]]:
+def load_success_ledger(
+    create_path: Path, *, run_dir: Path | None = None
+) -> dict[str, dict[str, Any]]:
     """Load the run's authoritative successful-instance ledger."""
     successes: dict[str, dict[str, Any]] = {}
     sequence: dict[str, tuple[str, int]] = {}
@@ -101,23 +233,36 @@ def load_success_ledger(create_path: Path) -> dict[str, dict[str, Any]]:
                 timestamp = ""
             key = (timestamp, index)
             if instance not in sequence or key >= sequence[instance]:
-                successes[instance] = {
+                success_record = {
                     "instance": instance,
                     "status": "success",
                     "timestamp": timestamp,
                     "worker_id": None,
                 }
+                successes[instance] = _enrich_node_identity(
+                    success_record, create_path, run_dir
+                )
                 sequence[instance] = key
     return successes
 
 
 def collect_latest_statuses(run_dir: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Merge every live journal and reconcile it with successful creations."""
-    latest, _order = load_latest_statuses(status_journal_paths(run_dir))
-    for instance, success_record in load_success_ledger(run_dir / "create.jsonl").items():
-        current = latest.get(instance)
-        if current is None or current.get("status") != "success":
-            latest[instance] = success_record
+    latest, _order = load_latest_statuses(
+        status_journal_paths(run_dir), run_dir=run_dir
+    )
+    for ledger_path in success_ledger_paths(run_dir):
+        for instance, success_record in load_success_ledger(
+            ledger_path, run_dir=run_dir
+        ).items():
+            current = latest.get(instance)
+            if current is None or current.get("status") != "success":
+                latest[instance] = success_record
+            elif str(success_record.get("timestamp", "")) >= str(
+                current.get("timestamp", "")
+            ):
+                _copy_node_identity(success_record, current)
+                latest[instance] = success_record
 
     order = sorted(
         latest,
@@ -128,6 +273,15 @@ def collect_latest_statuses(run_dir: Path) -> tuple[dict[str, dict[str, Any]], l
         reverse=True,
     )
     return latest, order
+
+
+def load_slurm_health(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / SLURM_HEALTH_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def count_jsonl_entries(path: Path) -> int:
@@ -175,6 +329,21 @@ def calculate_status(
     processed = success + failure
     total = total_entries if total_entries is not None else count_jsonl_entries(input_jsonl)
     active = active_instances(run_dir)
+    slurm_health = load_slurm_health(run_dir)
+    slurm_active = slurm_health.get("active_workers", 0)
+    slurm_expected = slurm_health.get("expected_workers", 0)
+    if not isinstance(slurm_active, int):
+        slurm_active = 0
+    if not isinstance(slurm_expected, int):
+        slurm_expected = 0
+
+    success_by_node: dict[str, int] = {}
+    for record in latest.values():
+        if record.get("status") != "success":
+            continue
+        node = _string_value(record.get("node"))
+        if node and record.get("node_scope") == "slurm":
+            success_by_node[node] = success_by_node.get(node, 0) + 1
 
     recent = []
     for instance in order[:25]:
@@ -186,6 +355,7 @@ def calculate_status(
                 "timestamp": record.get("timestamp", ""),
                 "reason": record.get("failure_reason", ""),
                 "worker_id": record.get("worker_id"),
+                "node": record.get("node", "controller"),
             }
         )
 
@@ -197,8 +367,12 @@ def calculate_status(
         "processed": processed,
         "total": total,
         "remaining": max(total - processed, 0),
-        "active_workers": len(active),
+        "active_workers": len(active) + slurm_active,
+        "active_workers_local": len(active),
+        "active_workers_slurm": slurm_active,
+        "slurm_expected_workers": slurm_expected,
         "active_instances": active,
+        "success_by_slurm_node": dict(sorted(success_by_node.items())),
         "yield_percent": round((success / processed * 100) if processed else 0.0, 2),
         "dataset_yield_percent": round((success / total * 100) if total else 0.0, 4),
         "completion_percent": round((processed / total * 100) if total else 0.0, 2),
@@ -244,13 +418,13 @@ DASHBOARD_HTML = r"""<!doctype html>
   <header><div><h1>SWE-gen Live Yield</h1><div class="sub">Run <span id="run">—</span></div></div><div id="connection" class="live">● LIVE</div></header>
   <div class="grid">
     <div class="card wide"><div class="label">Validation yield</div><div id="yield" class="value">—</div><div id="yieldFormula" class="formula">successful NOP+Oracle / processed</div><div class="bar"><div id="yieldBar" class="fill"></div></div></div>
-    <div class="card"><div class="label">Successful</div><div id="success" class="value success">—</div><div class="formula">NOP=0 and Oracle=1</div></div>
+    <div class="card"><div class="label">Successful across all nodes</div><div id="success" class="value success">—</div><div id="successByNode" class="formula">NOP=0 and Oracle=1</div></div>
     <div class="card"><div class="label">Failed</div><div id="failure" class="value failure">—</div><div class="formula">latest result per instance</div></div>
     <div class="card wide"><div class="label">Dataset completion</div><div id="completion" class="value">—</div><div id="completionFormula" class="formula">processed / total input</div><div class="bar"><div id="completionBar" class="fill"></div></div></div>
     <div class="card"><div class="label">Dataset yield</div><div id="datasetYield" class="value">—</div><div id="datasetYieldFormula" class="formula">successful / total input</div></div>
-    <div class="card"><div class="label">Active workers</div><div id="active" class="value">—</div><div id="activeInstances" class="formula instances"></div></div>
+    <div class="card"><div class="label">Active workers</div><div id="active" class="value">—</div><div id="activeScope" class="formula"></div><div id="activeInstances" class="formula instances"></div></div>
   </div>
-  <section class="card"><div class="label">Recent completed instances</div><table><thead><tr><th>Instance</th><th>Status</th><th>Reason</th><th>Updated</th></tr></thead><tbody id="recent"></tbody></table></section>
+  <section class="card"><div class="label">Recent completed instances</div><table><thead><tr><th>Instance</th><th>Node</th><th>Status</th><th>Reason</th><th>Updated</th></tr></thead><tbody id="recent"></tbody></table></section>
   <div class="muted" style="margin-top:12px">Updated <span id="updated">—</span> · refreshes every 2 seconds</div>
 </main>
 <script>
@@ -261,14 +435,17 @@ async function refresh() {
     const r = await fetch('/api/status', {cache:'no-store'}); if (!r.ok) throw new Error(r.status);
     const d = await r.json();
     run.textContent=d.run; yield.textContent=d.yield_percent.toFixed(2)+'%'; success.textContent=fmt(d.success); failure.textContent=fmt(d.failure);
+    const nodeParts=Object.entries(d.success_by_slurm_node||{}).map(([node,count])=>`${node}: ${fmt(count)}`);
+    successByNode.textContent=nodeParts.length ? `Slurm · ${nodeParts.join(' · ')}` : 'NOP=0 and Oracle=1';
     yieldFormula.textContent=`${fmt(d.success)} successful / ${fmt(d.processed)} processed`;
     yieldBar.style.width=Math.min(d.yield_percent,100)+'%'; completion.textContent=d.completion_percent.toFixed(2)+'%';
     completionFormula.textContent=`${fmt(d.processed)} processed / ${fmt(d.total)} total · ${fmt(d.remaining)} remaining`;
     completionBar.style.width=Math.min(d.completion_percent,100)+'%'; datasetYield.textContent=d.dataset_yield_percent.toFixed(4)+'%';
     datasetYieldFormula.textContent=`${fmt(d.success)} successful / ${fmt(d.total)} total input`;
-    active.textContent=fmt(d.active_workers); activeInstances.textContent=d.active_instances.join(', ');
+    active.textContent=fmt(d.active_workers); activeScope.textContent=`${fmt(d.active_workers_local)} local + ${fmt(d.active_workers_slurm)} Slurm / ${fmt(d.slurm_expected_workers)} expected Slurm`;
+    activeInstances.textContent=d.active_instances.join(', ');
     updated.textContent=d.updated_at; connection.textContent='● LIVE'; connection.className='live';
-    recent.innerHTML=d.recent.map(x=>`<tr><td>${esc(x.instance)}</td><td class="${x.status}">${esc(x.status)}</td><td>${esc(x.reason)}</td><td>${esc(x.timestamp)}</td></tr>`).join('');
+    recent.innerHTML=d.recent.map(x=>`<tr><td>${esc(x.instance)}</td><td>${esc(x.node)}</td><td class="${x.status}">${esc(x.status)}</td><td>${esc(x.reason)}</td><td>${esc(x.timestamp)}</td></tr>`).join('');
   } catch (e) { connection.textContent='● DISCONNECTED'; connection.className='failure'; }
 }
 refresh(); setInterval(refresh,2000);
