@@ -205,6 +205,30 @@ The pipeline uses a **language-agnostic approach**:
 
 </details>
 
+## Voyager/CWM Postprocessing
+
+Postprocessing is an extra step performed by [`src/orchestrator.py`](src/orchestrator.py), not by the regular `swegen create` or `swegen farm` commands. After a `swegen create` subprocess succeeds, the orchestrator immediately copies the generated task from `<run>/tasks/<task-id>/` to `<run>/tasks_voyager_postprocessed/<task-id>/` (or the directory supplied with `--postprocessed-output`). All rewrites are applied to the copy; the original generated task is left untouched.
+
+The orchestrator accepts optional `base_commit` and `image_ref` fields on each input JSONL record in addition to `repo` and `pull_number`:
+
+```json
+{"repo":"owner/repo","pull_number":"123","base_commit":"<40-character SHA>","image_ref":"<Voyager image>"}
+```
+
+For every successful task, postprocessing currently does the following:
+
+1. **Fetches linked-issue metadata** — It queries GitHub for linked issues and deterministically chooses the lowest issue number. If the lookup fails or the PR has no linked issue, postprocessing continues with an empty issue number.
+2. **Selects the Docker base image** — When `image_ref` (or its alias `voyager_image_ref`) is present, the first Dockerfile `FROM` image is replaced with that prebuilt repository image while preserving any suffix such as a build-stage alias. Otherwise, an exact `FROM ubuntu:24.04` is replaced with the configured internal Ubuntu mirror; other base images are left unchanged.
+3. **Uses the repository preloaded in the image** — It inserts Dockerfile commands that move `/app/<owner>/<repo>` to the working checkout path (normally `/app/src`) and creates a symlink from the original location to the new location.
+4. **Replaces a generated clone with a checkout** — When it can determine a 40-character commit SHA, it replaces the `RUN git clone ...` block with a detached checkout in the preloaded repository followed by `git submodule update --init || true`. It prefers the PR HEAD SHA found in the clone block and falls back to the JSONL `base_commit`. If no SHA can be determined, the clone block is retained.
+5. **Appends task metadata** — If `task.toml` does not already contain `[cwm_task_metadata]`, it appends `repo_full_name`, `pr_id`, `issue_number`, `training_domain = "feature"`, and `source_commit` (the input `base_commit`).
+
+This automatic path does not remove or rewrite `bug.patch`, tests, instructions, or solution files. It preserves SWE-gen's normal patch-based reversed baseline: the task's existing Dockerfile steps still apply `bug.patch` after the repository checkout to expose the buggy state.
+
+Postprocessing status is written to the worker log and `orchestrator-progress.jsonl`. A postprocessing exception is recorded as `ERROR: ...`, but it does not change the already-successful `swegen create` result or modify the original task.
+
+There is also a separate batch converter at [`src/coder-data-platform/postprocess.py`](src/coder-data-platform/postprocess.py). Unlike the automatic orchestrator path, that script resolves a repository image through CWM, checks out the mapped base commit, removes the OBS bootstrap and `bug.patch` application, validates the transformed Dockerfile, copies only successful conversions, and records skipped instances in `postprocess_failures.log`.
+
 ## Datasets
 
 <p>
