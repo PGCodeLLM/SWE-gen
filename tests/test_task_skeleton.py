@@ -1,6 +1,5 @@
 from swegen.create.task_skeleton import SkeletonParams, generate_dockerfile
 
-
 PARAMS = SkeletonParams(
     repo_url="https://github.com/example/project.git",
     head_sha="a" * 40,

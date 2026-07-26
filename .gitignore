@@ -6,6 +6,9 @@ __pycache__/
 .Python
 .env
 .env_*
+models*.yaml
+swegen-config.yaml
+.swegen-control-token
 env/
 venv/
 ENV/
@@ -13,6 +16,8 @@ ENV/
 pip-log.txt
 pip-delete-this-directory.txt
 .pytest_cache/
+.ruff_cache/
+.uv-cache/
 .coverage
 htmlcov/
 *.egg-info/
@@ -43,9 +48,13 @@ output/
 # Temporary files
 *.diff
 *.patch
+*.orig
 .tmp/
 
 runs/
+slurm-runtime/
+.validation-smoke/
+.slurm-tools/
 jobs/
 .swegen/
 .cursor/
@@ -83,4 +92,6 @@ swegen.toml
 data_cache/
 boyuan_graphing/
 boyuan_hack_example/
-runs/
+slurm-candidate-runtime/
+.claude-tmp/
+.env.ats

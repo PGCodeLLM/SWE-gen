@@ -20,6 +20,17 @@ set -a
 source "$SWEGEN_PROXY_ENV_FILE"
 set +a
 
+# Slurm bundles keep model credentials separate from route proxy files.  Load
+# them after the selected route so a newly staged backend/key cannot be
+# overwritten by legacy values retained in .env, .env_hk, or .env_de.
+SWEGEN_RUNTIME_CREDENTIALS_FILE="${SWEGEN_RUNTIME_CREDENTIALS_FILE:-$PWD/.slurm-secrets/credentials.env}"
+if [[ -s "$SWEGEN_RUNTIME_CREDENTIALS_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$SWEGEN_RUNTIME_CREDENTIALS_FILE"
+  set +a
+fi
+
 # Slurm run artifacts may contain verbose SDK output, so keep them private.
 # The controller's long-lived local farm still uses the shared cache group.
 if [[ -n "${SWEGEN_SLURM_NODE:-}" ]]; then
@@ -69,6 +80,17 @@ if [[ -n "${SWEGEN_DOCKER_CONFIG_DIR:-}" ]]; then
   trap cleanup_docker_proxy_config EXIT
 fi
 
+# Force harbor's `docker compose build` to use the Docker daemon's built-in
+# BuildKit (the "default"/`docker` buildx driver) instead of the
+# `docker-container` driver, which spawns a separate `buildx_buildkit_*`
+# container (a full buildkitd, ~60-75 threads) PER concurrent build. At
+# validation/generation concurrency, dozens of those buildkitd instances
+# collectively deadlock the shared host dockerd/containerd on futexes,
+# stalling all builds. One shared daemon BuildKit removes the multiplication.
+export DOCKER_BUILDKIT=1
+export BUILDX_BUILDER=default
+export COMPOSE_BAKE=false
+
 default_ca_bundle=/etc/ssl/certs/ca-certificates.crt
 if [[ -f "$PWD/.slurm-secrets/combined-ca.crt" ]]; then
   default_ca_bundle="$PWD/.slurm-secrets/combined-ca.crt"
@@ -114,12 +136,6 @@ export SWEGEN_GITHUB_API_ATTEMPTS="${SWEGEN_GITHUB_API_ATTEMPTS:-6}"
 export SWEGEN_GITHUB_RETRY_BASE_SECONDS="${SWEGEN_GITHUB_RETRY_BASE_SECONDS:-10}"
 export SWEGEN_GITHUB_MAX_WAIT_SECONDS="${SWEGEN_GITHUB_MAX_WAIT_SECONDS:-3600}"
 
-# Clear stale per-worker proxy assignments if the launcher is sourced from a
-# shell that previously ran the SOCKS-backed configuration.
-unset SWEGEN_WORKER_PROXY_POOL SWEGEN_CLAUDE_PROXY_POOL
-unset SWEGEN_PROXY_WORKERS_PER_ENDPOINT SWEGEN_ASSIGNED_SOCKS_PROXY
-unset SWEGEN_PROXY_ENDPOINT_INDEX
-
 SWEGEN_WORKERS="${SWEGEN_WORKERS:-4}"
 SWEGEN_RUN_NAME="${SWEGEN_RUN_NAME:-20260716-sol-max-full-16w}"
 SWEGEN_ORCHESTRATOR_LOG_DIR="${SWEGEN_ORCHESTRATOR_LOG_DIR:-runs/20260716-sol-max-full-16w/orchestrator-logs-4w-env-proxy}"
@@ -141,19 +157,21 @@ fi
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
 export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-$ANTHROPIC_API_KEY}"
 
-# 2. Updated Base URLs: Pointing to your Tailscale endpoint
-export OPENAI_BASE_URL="https://arcyleung-ubuntu.tailb940e6.ts.net/v1"
+# The staged runtime credentials may select a different OpenAI/Anthropic-
+# compatible backend.  Keep the former endpoint as a local-run fallback only.
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://arcyleung-ubuntu.tailb940e6.ts.net/v1}"
 # Claude Code appends /v1/messages itself, unlike the OpenAI client above.
-export ANTHROPIC_BASE_URL="https://arcyleung-ubuntu.tailb940e6.ts.net"
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://arcyleung-ubuntu.tailb940e6.ts.net}"
 
-# 3. Use the flagship model served by the Tailscale endpoint for both clients.
-export OPENAI_MODEL="gpt-5.6-sol"
-export ANTHROPIC_MODEL="$OPENAI_MODEL"
+# 3. Preserve the model role selected by a staged endpoint profile.  These
+# defaults keep local single-endpoint launches backward compatible.
+export OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.6-sol}"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$OPENAI_MODEL}"
 
 # Claude Code can independently select its Opus and Sonnet tiers for spawned
 # Task agents even when the top-level SDK session uses ANTHROPIC_MODEL.
-export ANTHROPIC_DEFAULT_OPUS_MODEL="gpt-5.6-sol"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="gpt-5.6-terra"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-gpt-5.6-sol}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-gpt-5.6-terra}"
 
 # Claude Code otherwise selects claude-haiku-4-5 for built-in Explore
 # subagents and lightweight helpers such as Bash command-path extraction.
