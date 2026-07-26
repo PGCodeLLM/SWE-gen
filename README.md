@@ -174,10 +174,31 @@ The pipeline uses a **language-agnostic approach**:
 [`src/orchestrator.py`](src/orchestrator.py) reads work from the PostgreSQL relation configured as `[database].table` in `swegen.toml` (normally `swegen.pr_tasks`):
 
 ```bash
-uv run python src/orchestrator.py --workers 8
+WORKERS=8 CC_TIMEOUT=6400 ./run_orchestrator.sh
 ```
 
-Repository groups are claimed atomically. The claim transaction excludes future `unlock_time` values, increments `swegen_retries`, and sets a lease derived from the configured Docker, Claude Code, Harbor, hacking-check, and SWR timeouts. Rows with `swegen_bz_passed=true` and `obs_exists=false` are skipped by default; use `--force-rebuild` or `--include-obs-missing` to include them. Rows whose `swegen_retries` have reached `[database].max-retries` are always skipped, and lower-retry PRs are prioritized over higher-retry PRs.
+The launcher accepts additional orchestrator flags directly, mirrors inherited
+HTTP(S), ALL, and NO_PROXY values into both uppercase and lowercase environment
+variables, and runs correctly from any current working directory. It combines
+the system trust roots with the bundled Huawei proxy CA and exports the bundle
+for Requests/OpenSSL, curl, git, pip, and Node, preventing certificate failures
+for proxied GitHub and model API traffic. Docker commands used for SWR
+inspection, login, tagging, and upload are deliberately started with all proxy
+variables removed.
+
+An optional run-level success target can be configured centrally:
+
+```toml
+[orchestrator]
+produce_count = 100
+```
+
+When omitted, workers continue until no eligible database rows remain. When
+set, local and Slurm workers share a locked quota in the run directory, reserve
+capacity before claiming work, and stop after exactly that many instances pass
+the complete Harbor, hacking, postprocessing, SWR, and database-success gate.
+
+Repository groups are claimed atomically. The claim transaction excludes future `unlock_time` values, increments `swegen_retries`, and sets a lease derived from the configured Docker, Claude Code, Harbor, hacking-check, and SWR timeouts. Rows with `swegen_bz_passed=true` and `obs_exists=false` are skipped by default; use `--force-rebuild` or `--include-obs-missing` to include them. Rows whose `swegen_retries` have reached `[database].max-retries` are always skipped, and lower-retry PRs are prioritized over higher-retry PRs. `[database].exclude_languages` excludes matching `primary_language` values, while `[database].pr_category` is an allow-list of categories and defaults to `["feature"]`; both comparisons are case-insensitive.
 
 A task is successful only after the complete production gate:
 

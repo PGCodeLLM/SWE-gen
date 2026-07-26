@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
 from dataclasses import dataclass
 
 from swegen.model_settings import SWRSettings
+
+PROXY_ENVIRONMENT_VARIABLES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "DOCKER_HTTP_PROXY",
+    "DOCKER_HTTPS_PROXY",
+    "DOCKER_NO_PROXY",
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +33,14 @@ class SWRUploadResult:
 def _remote_image_name(instance_id: str, settings: SWRSettings) -> str:
     image = re.sub(r"[^a-z0-9._-]", "-", instance_id.lower())
     return f"{settings.registry}/{settings.repository}/{settings.image_prefix}{image}:latest"
+
+
+def _proxy_free_environment() -> dict[str, str]:
+    """Return the current environment with proxy routing disabled for SWR."""
+    env = os.environ.copy()
+    for name in PROXY_ENVIRONMENT_VARIABLES:
+        env.pop(name, None)
+    return env
 
 
 def upload_image_to_swr(
@@ -37,6 +60,7 @@ def upload_image_to_swr(
     if not refs:
         return SWRUploadResult(False, "No retained Harbor image tag was found")
 
+    swr_env = _proxy_free_environment()
     local_ref = ""
     for candidate in refs:
         inspect = subprocess.run(
@@ -45,6 +69,7 @@ def upload_image_to_swr(
             capture_output=True,
             text=True,
             timeout=settings.push_timeout,
+            env=swr_env,
         )
         if inspect.returncode == 0:
             local_ref = candidate
@@ -70,6 +95,7 @@ def upload_image_to_swr(
                 capture_output=True,
                 text=True,
                 timeout=settings.push_timeout,
+                env=swr_env,
             )
             if login.returncode != 0:
                 last_error = (login.stderr or login.stdout or "docker login failed").strip()
@@ -81,6 +107,7 @@ def upload_image_to_swr(
                 capture_output=True,
                 text=True,
                 timeout=settings.push_timeout,
+                env=swr_env,
             )
             if tag.returncode != 0:
                 last_error = (tag.stderr or tag.stdout or "docker tag failed").strip()
@@ -92,6 +119,7 @@ def upload_image_to_swr(
                 capture_output=True,
                 text=True,
                 timeout=settings.push_timeout,
+                env=swr_env,
             )
             if push.returncode == 0:
                 return SWRUploadResult(True, "uploaded", remote_ref)

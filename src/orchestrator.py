@@ -12,7 +12,10 @@ specified, that existing run directory is reused. Database pass state, OBS
 availability, and leases determine eligibility; ``--force-rebuild`` includes
 already-passed rows and ``--include-obs-missing`` includes missing OBS rows.
 Rows at or above ``[database].max-retries`` remain ineligible, including forced
-rebuild runs, and lower-retry work is claimed first.
+rebuild runs, and lower-retry work is claimed first. ``primary_language`` values
+listed in ``exclude_languages`` are omitted, and only configured ``pr_category``
+values are eligible. When ``[orchestrator].produce_count`` is set, workers share
+a run-level quota and stop after exactly that many fully successful instances.
 
 Each run contains ``tasks/``, ``tasks_bz/``,
 ``orchestrator-logs/``, ``logs/``, ``harbor-jobs/``, and an
@@ -62,9 +65,11 @@ from swegen.model_settings import (
     load_github_tokens,
     load_model_settings,
     load_openai_settings,
+    load_orchestrator_settings,
     load_swr_settings,
     load_timeout_settings,
 )
+from swegen.production_quota import ProductionQuota
 from swegen.proxy import add_proxy_setup, copy_proxy_certificate
 from swegen.swr import upload_image_to_swr
 
@@ -72,6 +77,7 @@ from swegen.swr import upload_image_to_swr
 POSTPROCESSED_OUTPUT_NAME = "tasks_bz"
 PROGRESS_JSONL_NAME = "orchestrator-progress.jsonl"
 INSTANCE_STATUS_JSONL_NAME = "orchestrator-instance-status.jsonl"
+PRODUCTION_QUOTA_NAME = "production-quota.json"
 DEFAULT_RUNS_DIR = Path("runs")
 DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
 RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -143,6 +149,7 @@ class Entry:
     pull_number: str
     base_commit: str = ""
     instance_id: str = ""
+    swegen_retries: int = 0
 
 
 @dataclass
@@ -1332,6 +1339,130 @@ def process_entry(
     )
 
 
+def process_claimed_entry(
+    worker_id: int,
+    entry: Entry,
+    tag: str,
+    database: PRTaskDatabase,
+    env: dict[str, str],
+    swegen_bin: str,
+    log: TimestampedLog,
+    log_path: Path,
+    cc_timeout: int | None,
+    output_dir: Path,
+    state_dir: Path,
+    repo_cache_dir: Path | None,
+    transient_attempts: int,
+    token_pool: list[str],
+    postprocessed_dir: Path,
+) -> Outcome:
+    process_result = process_entry(
+        worker_id,
+        entry,
+        tag,
+        env,
+        swegen_bin,
+        log,
+        log_path,
+        cc_timeout,
+        output_dir,
+        state_dir,
+        repo_cache_dir,
+        transient_attempts,
+    )
+    returncode = process_result.returncode
+    failure_reason = process_result.failure_reason
+    hacking_status = "not run"
+    postprocess_status = ""
+    swr_upload_status = "not run"
+    swr_remote_ref = ""
+    image_prune_allowed = returncode != 0
+
+    if returncode == 0:
+        passed_hacking, hacking_reason = run_hacking_check(
+            entry,
+            output_dir,
+            state_dir,
+        )
+        hacking_status = (
+            f"passed: {hacking_reason}" if passed_hacking else f"failed: {hacking_reason}"
+        )
+        log.write(f"{tag} hacking check: {hacking_status}\n")
+        log.flush()
+        print(f"{tag} hacking check: {hacking_status}", flush=True)
+        if not passed_hacking:
+            returncode = 2
+            failure_reason = hacking_reason
+
+    if returncode == 0:
+        try:
+            postprocess_status = postprocess_task(
+                entry,
+                output_dir,
+                postprocessed_dir,
+                token_pool,
+            )
+            if postprocess_status.startswith("skipped"):
+                raise RuntimeError(postprocess_status)
+        except Exception as exc:
+            postprocess_status = f"ERROR: {exc}"
+            returncode = 3
+            failure_reason = f"Postprocessing failed: {exc}"
+        log.write(f"{tag} postprocess: {postprocess_status}\n")
+        log.flush()
+        print(f"{tag} postprocess: {postprocess_status}", flush=True)
+
+    if returncode == 0:
+        try:
+            upload_result = upload_image_to_swr(
+                entry_instance_id(entry),
+                process_result.image_names,
+                load_swr_settings(),
+            )
+            swr_upload_status = upload_result.status
+            swr_remote_ref = upload_result.remote_ref
+            image_prune_allowed = upload_result.success
+        except Exception as exc:
+            swr_upload_status = f"SWR upload failed ({type(exc).__name__}: {exc})"
+            image_prune_allowed = False
+        log.write(f"{tag} SWR upload: {swr_upload_status}\n")
+        log.flush()
+        print(f"{tag} SWR upload: {swr_upload_status}", flush=True)
+        if not image_prune_allowed:
+            returncode = 4
+            failure_reason = swr_upload_status
+
+    if returncode == 0:
+        try:
+            database.mark_swegen_passed(entry_instance_id(entry))
+        except Exception as exc:
+            returncode = 5
+            failure_reason = f"Database success update failed: {exc}"
+            image_prune_allowed = False
+
+    return Outcome(
+        worker_id=worker_id,
+        entry=entry,
+        returncode=returncode,
+        failure_reason=failure_reason,
+        postprocess_status=postprocess_status,
+        hacking_status=hacking_status,
+        swr_upload_status=swr_upload_status,
+        swr_remote_ref=swr_remote_ref,
+        image_prune_allowed=image_prune_allowed,
+        image_names=tuple(
+            dict.fromkeys(
+                (
+                    *process_result.image_names,
+                    *((swr_remote_ref,) if image_prune_allowed and swr_remote_ref else ()),
+                )
+            )
+        ),
+        image_ids=process_result.image_ids,
+        compose_projects=process_result.compose_projects,
+    )
+
+
 def run_consumer(
     worker_id: int,
     database: PRTaskDatabase,
@@ -1349,6 +1480,7 @@ def run_consumer(
     github_tokens: list[str] | None = None,
     postprocessed_dir: Path | None = None,
     progress_queue: queue.Queue[Outcome | None] | None = None,
+    production_quota: ProductionQuota | None = None,
 ) -> list[Outcome]:
     """Atomically claim and process repository packages until none remain."""
     if output_dir is None or state_dir is None or postprocessed_dir is None:
@@ -1360,22 +1492,35 @@ def run_consumer(
     with log_path.open("w") as raw_log:
         log = TimestampedLog(raw_log)
         while True:
-            claimed = database.claim_repo_package(
-                force_rebuild=force_rebuild,
-                include_obs_missing=include_obs_missing,
-                lease_seconds_per_task=lease_seconds_per_task,
-            )
+            reservation = production_quota.acquire() if production_quota is not None else None
+            if production_quota is not None and reservation is None:
+                break
+            try:
+                claimed = database.claim_repo_package(
+                    force_rebuild=force_rebuild,
+                    include_obs_missing=include_obs_missing,
+                    lease_seconds_per_task=lease_seconds_per_task,
+                )
+            except Exception:
+                if production_quota is not None:
+                    assert reservation is not None
+                    production_quota.complete(reservation, success=False)
+                raise
+            if not claimed:
+                if production_quota is not None:
+                    assert reservation is not None
+                    production_quota.complete(reservation, success=False)
+                break
             package = [
                 Entry(
                     repo=item.repo,
                     pull_number=str(item.pull_number),
                     base_commit=item.base_commit,
                     instance_id=item.instance_id,
+                    swegen_retries=item.swegen_retries,
                 )
                 for item in claimed
             ]
-            if not package:
-                break
 
             repo = package[0].repo
             total = len(package)
@@ -1386,118 +1531,44 @@ def run_consumer(
             log.flush()
 
             for idx, entry in enumerate(package, 1):
+                if idx > 1 and production_quota is not None:
+                    reservation = production_quota.acquire()
+                    if reservation is None:
+                        unprocessed = claimed[idx - 1 :]
+                        released = database.release_claims(unprocessed)
+                        log.write(
+                            f"[worker {worker_id}] production target reached; "
+                            f"released {released}/{len(unprocessed)} unprocessed claim(s)\n"
+                        )
+                        log.flush()
+                        return outcomes
                 tag = f"[worker {worker_id}] ({idx}/{total}) {entry.repo}#{entry.pull_number}"
-                process_result = process_entry(
-                    worker_id,
-                    entry,
-                    tag,
-                    env,
-                    swegen_bin,
-                    log,
-                    log_path,
-                    cc_timeout,
-                    output_dir,
-                    state_dir,
-                    repo_cache_dir,
-                    transient_attempts,
-                )
-                returncode = process_result.returncode
-                failure_reason = process_result.failure_reason
-                hacking_status = "not run"
-                postprocess_status = ""
-                swr_upload_status = "not run"
-                swr_remote_ref = ""
-                image_prune_allowed = returncode != 0
-
-                if returncode == 0:
-                    passed_hacking, hacking_reason = run_hacking_check(
+                assert production_quota is None or reservation is not None
+                try:
+                    outcome = process_claimed_entry(
+                        worker_id,
                         entry,
+                        tag,
+                        database,
+                        env,
+                        swegen_bin,
+                        log,
+                        log_path,
+                        cc_timeout,
                         output_dir,
                         state_dir,
+                        repo_cache_dir,
+                        transient_attempts,
+                        token_pool,
+                        postprocessed_dir,
                     )
-                    hacking_status = (
-                        f"passed: {hacking_reason}"
-                        if passed_hacking
-                        else f"failed: {hacking_reason}"
-                    )
-                    log.write(f"{tag} hacking check: {hacking_status}\n")
-                    log.flush()
-                    print(f"{tag} hacking check: {hacking_status}", flush=True)
-                    if not passed_hacking:
-                        returncode = 2
-                        failure_reason = hacking_reason
-
-                if returncode == 0 and postprocessed_dir is not None:
-                    try:
-                        postprocess_status = postprocess_task(
-                            entry,
-                            output_dir,
-                            postprocessed_dir,
-                            token_pool,
-                        )
-                        if postprocess_status.startswith("skipped"):
-                            raise RuntimeError(postprocess_status)
-                    except Exception as exc:
-                        postprocess_status = f"ERROR: {exc}"
-                        returncode = 3
-                        failure_reason = f"Postprocessing failed: {exc}"
-                    log.write(f"{tag} postprocess: {postprocess_status}\n")
-                    log.flush()
-                    print(f"{tag} postprocess: {postprocess_status}", flush=True)
-
-                if returncode == 0:
-                    try:
-                        upload_result = upload_image_to_swr(
-                            entry_instance_id(entry),
-                            process_result.image_names,
-                            load_swr_settings(),
-                        )
-                        swr_upload_status = upload_result.status
-                        swr_remote_ref = upload_result.remote_ref
-                        image_prune_allowed = upload_result.success
-                    except Exception as exc:
-                        swr_upload_status = f"SWR upload failed ({type(exc).__name__}: {exc})"
-                        image_prune_allowed = False
-                    log.write(f"{tag} SWR upload: {swr_upload_status}\n")
-                    log.flush()
-                    print(f"{tag} SWR upload: {swr_upload_status}", flush=True)
-                    if not image_prune_allowed:
-                        returncode = 4
-                        failure_reason = swr_upload_status
-
-                if returncode == 0:
-                    try:
-                        database.mark_swegen_passed(entry_instance_id(entry))
-                    except Exception as exc:
-                        returncode = 5
-                        failure_reason = f"Database success update failed: {exc}"
-                        image_prune_allowed = False
-
-                outcome = Outcome(
-                    worker_id=worker_id,
-                    entry=entry,
-                    returncode=returncode,
-                    failure_reason=failure_reason,
-                    postprocess_status=postprocess_status,
-                    hacking_status=hacking_status,
-                    swr_upload_status=swr_upload_status,
-                    swr_remote_ref=swr_remote_ref,
-                    image_prune_allowed=image_prune_allowed,
-                    image_names=tuple(
-                        dict.fromkeys(
-                            (
-                                *process_result.image_names,
-                                *(
-                                    (swr_remote_ref,)
-                                    if image_prune_allowed and swr_remote_ref
-                                    else ()
-                                ),
-                            )
-                        )
-                    ),
-                    image_ids=process_result.image_ids,
-                    compose_projects=process_result.compose_projects,
-                )
+                except Exception:
+                    if production_quota is not None:
+                        production_quota.complete(reservation, success=False)
+                    database.release_claims(claimed[idx:])
+                    raise
+                if production_quota is not None:
+                    production_quota.complete(reservation, success=outcome.ok)
                 outcomes.append(outcome)
                 if progress_queue is not None:
                     progress_queue.put(outcome)
@@ -1624,6 +1695,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         database_settings = load_database_settings()
         database = PRTaskDatabase(database_settings)
+        orchestrator_settings = load_orchestrator_settings()
         timeout_settings = load_timeout_settings()
         github_tokens = load_github_tokens()
         model_settings = load_model_settings()
@@ -1657,10 +1729,33 @@ def main(argv: list[str] | None = None) -> int:
 
     resolve_run_layout(args)
     create_run_dirs(args)
+    production_quota: ProductionQuota | None = None
+    if orchestrator_settings.produce_count is not None:
+        stale_after_seconds = max(
+            86400,
+            timeout_settings.total_seconds_per_task(args.cc_timeout) * args.transient_attempts * 2,
+        )
+        production_quota = ProductionQuota(
+            args.run_dir / PRODUCTION_QUOTA_NAME,
+            orchestrator_settings.produce_count,
+            stale_after_seconds=stale_after_seconds,
+        )
     env = build_child_env(args)
 
     print(f"Run: {args.run_name} -> {args.run_dir}", flush=True)
     print(f"Repo cache: {args.repo_cache_dir}", flush=True)
+    if production_quota is None:
+        print("Production target: unbounded (process all eligible PRs)", flush=True)
+    else:
+        quota_snapshot = production_quota.snapshot()
+        print(
+            f"Production target: {quota_snapshot.successes}/{quota_snapshot.limit} "
+            "successful instance(s)",
+            flush=True,
+        )
+        if quota_snapshot.reached:
+            print("Done: configured production target was already reached.", flush=True)
+            return 0
 
     # Slurm workers all claim from the same database; database transactions
     # replace the old JSONL chunking and prevent overlap between nodes.
@@ -1682,6 +1777,15 @@ def main(argv: list[str] | None = None) -> int:
         f"(logs in {args.log_dir}/)",
         flush=True,
     )
+    print(
+        "Eligible PR categories: " + ", ".join(database_settings.pr_categories),
+        flush=True,
+    )
+    if database_settings.exclude_languages:
+        print(
+            "Excluded primary languages: " + ", ".join(database_settings.exclude_languages),
+            flush=True,
+        )
 
     args.postprocessed_dir.mkdir(parents=True, exist_ok=True)
     print(
@@ -1721,6 +1825,7 @@ def main(argv: list[str] | None = None) -> int:
                     github_tokens,
                     args.postprocessed_dir,
                     progress_queue,
+                    production_quota,
                 ): i
                 for i in range(num_consumers)
             }
@@ -1736,12 +1841,21 @@ def main(argv: list[str] | None = None) -> int:
     # Summary
     failures = [o for o in all_outcomes if not o.ok]
     succeeded = len(all_outcomes) - len(failures)
+    final_quota_snapshot = production_quota.snapshot() if production_quota is not None else None
     print("\n" + "=" * 80)
     if not all_outcomes:
-        print("Done: no eligible database rows were available.")
+        if final_quota_snapshot is not None and final_quota_snapshot.reached:
+            print("Done: configured production target was reached.")
+        else:
+            print("Done: no eligible database rows were available.")
         print("=" * 80)
         return 0
     print(f"Done: {succeeded}/{len(all_outcomes)} succeeded, {len(failures)} failed.")
+    if final_quota_snapshot is not None:
+        print(
+            f"Production target: {final_quota_snapshot.successes}/"
+            f"{final_quota_snapshot.limit} successful instance(s)."
+        )
     if failures:
         print("Failed:")
         for o in failures:
@@ -1751,6 +1865,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     print("=" * 80)
 
+    if final_quota_snapshot is not None and final_quota_snapshot.reached:
+        return 0
     return 1 if failures else 0
 
 

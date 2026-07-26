@@ -4,6 +4,7 @@ from pathlib import Path
 
 import orchestrator
 from swegen.database import DatabasePRTask
+from swegen.production_quota import ProductionQuota
 from swegen.swr import SWRUploadResult
 
 
@@ -178,3 +179,81 @@ def test_consumer_retains_image_and_does_not_mark_database_on_upload_failure(
     assert outcome.failure_reason == "push failed"
     assert not outcome.image_prune_allowed
     assert database.marked == []
+
+
+class _TwoTaskDatabase(_OnePackageDatabase):
+    def __init__(self):
+        super().__init__()
+        self.released = []
+
+    def claim_repo_package(self, **_kwargs):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [
+            DatabasePRTask(
+                repo="owner/repo",
+                pull_number=number,
+                base_commit="a" * 40,
+                instance_id=f"owner__repo-{number}",
+                swegen_retries=1,
+            )
+            for number in (1, 2)
+        ]
+
+    def release_claims(self, tasks):
+        self.released.extend(task.instance_id for task in tasks)
+        return len(tasks)
+
+
+def test_consumer_stops_at_success_quota_and_releases_unprocessed_claims(tmp_path, monkeypatch):
+    database = _TwoTaskDatabase()
+    tasks = tmp_path / "tasks"
+    tasks_bz = tmp_path / "tasks_bz"
+    state = tmp_path / "state"
+    logs = tmp_path / "logs"
+    for path in (tasks, tasks_bz, state, logs):
+        path.mkdir()
+    quota = ProductionQuota(
+        state / "production-quota.json",
+        1,
+        stale_after_seconds=3600,
+        poll_interval=0.01,
+    )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "process_entry",
+        lambda *_args, **_kwargs: orchestrator.ProcessResult(
+            returncode=0,
+            image_names=("local-image:latest",),
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "run_hacking_check", lambda *_args: (True, "clean"))
+    monkeypatch.setattr(orchestrator, "postprocess_task", lambda *_args: "postprocessed")
+    monkeypatch.setattr(orchestrator, "load_swr_settings", lambda: object())
+    monkeypatch.setattr(
+        orchestrator,
+        "upload_image_to_swr",
+        lambda *_args: SWRUploadResult(True, "uploaded", "remote:latest"),
+    )
+
+    outcomes = orchestrator.run_consumer(
+        0,
+        database,
+        False,
+        False,
+        10,
+        {},
+        "swegen",
+        logs,
+        output_dir=tasks,
+        state_dir=state,
+        postprocessed_dir=tasks_bz,
+        production_quota=quota,
+    )
+
+    assert [outcome.entry.instance_id for outcome in outcomes] == ["owner__repo-1"]
+    assert database.marked == ["owner__repo-1"]
+    assert database.released == ["owner__repo-2"]
+    assert quota.snapshot().successes == 1

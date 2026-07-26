@@ -53,6 +53,15 @@ class AnalysisSettings:
 
 
 @dataclass(frozen=True)
+class OrchestratorSettings:
+    produce_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.produce_count is not None and self.produce_count < 1:
+            raise ValueError("[orchestrator].produce_count must be >= 1")
+
+
+@dataclass(frozen=True)
 class DatabaseSettings:
     host: str
     port: int
@@ -61,11 +70,31 @@ class DatabaseSettings:
     password: str
     table: str
     max_retries: int = 3
+    exclude_languages: tuple[str, ...] = ()
+    pr_categories: tuple[str, ...] = ("feature",)
     connect_timeout: int = 10
 
     def __post_init__(self) -> None:
         if self.max_retries < 1:
             raise ValueError("[database].max-retries must be >= 1")
+        object.__setattr__(
+            self,
+            "exclude_languages",
+            _normalize_string_values(
+                self.exclude_languages,
+                "[database].exclude_languages",
+                allow_empty=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "pr_categories",
+            _normalize_string_values(
+                self.pr_categories,
+                "[database].pr_category",
+                allow_empty=False,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -79,8 +108,8 @@ class TimeoutSettings:
     swr_upload: int = 1800
     lease_fraction: float = 0.1
 
-    def lease_seconds_per_task(self, claude_code_override: int | None = None) -> int:
-        total = (
+    def total_seconds_per_task(self, claude_code_override: int | None = None) -> int:
+        return (
             self.task_instruction
             + self.docker_build
             + (claude_code_override or self.claude_code)
@@ -89,6 +118,9 @@ class TimeoutSettings:
             + self.hacking_check
             + self.swr_upload
         )
+
+    def lease_seconds_per_task(self, claude_code_override: int | None = None) -> int:
+        total = self.total_seconds_per_task(claude_code_override)
         return max(1, round(total * self.lease_fraction))
 
 
@@ -142,6 +174,26 @@ def _required_string(table: dict[str, Any], section: str, key: str) -> str:
     return value.strip()
 
 
+def _normalize_string_values(
+    values: object,
+    field_name: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{field_name} must be a TOML array of strings")
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must contain only non-empty strings")
+        item = value.strip().lower()
+        if item not in normalized:
+            normalized.append(item)
+    if not normalized and not allow_empty:
+        raise ValueError(f"{field_name} must contain at least one value")
+    return tuple(normalized)
+
+
 def load_model_settings() -> ModelSettings:
     table = _table("model")
     return ModelSettings(
@@ -180,6 +232,16 @@ def load_analysis_settings() -> AnalysisSettings:
     )
 
 
+def load_orchestrator_settings() -> OrchestratorSettings:
+    table = _table("orchestrator")
+    raw_produce_count = table.get("produce_count")
+    if raw_produce_count is None:
+        return OrchestratorSettings()
+    if isinstance(raw_produce_count, bool) or not isinstance(raw_produce_count, int):
+        raise ValueError("[orchestrator].produce_count must be an integer")
+    return OrchestratorSettings(produce_count=raw_produce_count)
+
+
 def load_database_settings() -> DatabaseSettings:
     table = _table("database", required_config=True)
     relation = _required_string(table, "database", "table")
@@ -193,6 +255,16 @@ def load_database_settings() -> DatabaseSettings:
         password=_required_string(table, "database", "password"),
         table=relation,
         max_retries=int(table.get("max-retries", 3)),
+        exclude_languages=_normalize_string_values(
+            table.get("exclude_languages", []),
+            "[database].exclude_languages",
+            allow_empty=True,
+        ),
+        pr_categories=_normalize_string_values(
+            table.get("pr_category", ["feature"]),
+            "[database].pr_category",
+            allow_empty=False,
+        ),
         connect_timeout=int(table.get("connect_timeout", 10)),
     )
 

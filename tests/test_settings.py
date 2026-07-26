@@ -64,7 +64,34 @@ def test_timeout_lease_uses_all_configured_phases():
         swr_upload=60,
         lease_fraction=0.1,
     )
+    assert settings.total_seconds_per_task() == 280
     assert settings.lease_seconds_per_task() == 28
+
+
+def test_orchestrator_produce_count_defaults_to_unbounded(tmp_path, monkeypatch):
+    config = tmp_path / "swegen.toml"
+    config.write_text("[orchestrator]\n")
+    monkeypatch.setattr(model_settings, "DEFAULT_CONFIG_FILE", config)
+
+    assert model_settings.load_orchestrator_settings().produce_count is None
+
+
+def test_orchestrator_produce_count_is_loaded(tmp_path, monkeypatch):
+    config = tmp_path / "swegen.toml"
+    config.write_text("[orchestrator]\nproduce_count = 25\n")
+    monkeypatch.setattr(model_settings, "DEFAULT_CONFIG_FILE", config)
+
+    assert model_settings.load_orchestrator_settings().produce_count == 25
+
+
+@pytest.mark.parametrize("value", ["0", "-1", '"10"', "true"])
+def test_orchestrator_produce_count_must_be_a_positive_integer(value, tmp_path, monkeypatch):
+    config = tmp_path / "swegen.toml"
+    config.write_text(f"[orchestrator]\nproduce_count = {value}\n")
+    monkeypatch.setattr(model_settings, "DEFAULT_CONFIG_FILE", config)
+
+    with pytest.raises(ValueError, match=r"produce_count"):
+        model_settings.load_orchestrator_settings()
 
 
 def test_database_max_retries_is_loaded_from_hyphenated_toml_key(tmp_path, monkeypatch):
@@ -83,7 +110,32 @@ max-retries = 7
     )
     monkeypatch.setattr(model_settings, "DEFAULT_CONFIG_FILE", config)
 
-    assert model_settings.load_database_settings().max_retries == 7
+    settings = model_settings.load_database_settings()
+    assert settings.max_retries == 7
+    assert settings.exclude_languages == ()
+    assert settings.pr_categories == ("feature",)
+
+
+def test_database_language_and_category_filters_are_normalized(tmp_path, monkeypatch):
+    config = tmp_path / "swegen.toml"
+    config.write_text(
+        """
+[database]
+host = "localhost"
+database = "mindforge"
+user = "postgres"
+password = "secret"
+table = "swegen.pr_tasks"
+exclude_languages = ["Python", " rust ", "PYTHON"]
+pr_category = ["Feature", "bugfix", "FEATURE"]
+""".strip()
+        + "\n"
+    )
+    monkeypatch.setattr(model_settings, "DEFAULT_CONFIG_FILE", config)
+
+    settings = model_settings.load_database_settings()
+    assert settings.exclude_languages == ("python", "rust")
+    assert settings.pr_categories == ("feature", "bugfix")
 
 
 @pytest.mark.parametrize("max_retries", [0, -1])
@@ -97,4 +149,31 @@ def test_database_max_retries_must_be_positive(max_retries):
             password="secret",
             table="swegen.pr_tasks",
             max_retries=max_retries,
+        )
+
+
+@pytest.mark.parametrize("pr_categories", [(), [], "feature"])
+def test_database_pr_category_must_be_a_nonempty_array(pr_categories):
+    with pytest.raises(ValueError, match=r"pr_category"):
+        model_settings.DatabaseSettings(
+            host="localhost",
+            port=5432,
+            database="mindforge",
+            user="postgres",
+            password="secret",
+            table="swegen.pr_tasks",
+            pr_categories=pr_categories,
+        )
+
+
+def test_database_exclude_languages_must_be_an_array():
+    with pytest.raises(ValueError, match=r"exclude_languages"):
+        model_settings.DatabaseSettings(
+            host="localhost",
+            port=5432,
+            database="mindforge",
+            user="postgres",
+            password="secret",
+            table="swegen.pr_tasks",
+            exclude_languages="python",
         )

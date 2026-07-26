@@ -35,11 +35,19 @@ class PRTaskDatabase:
         )
 
     @staticmethod
-    def _eligibility_sql(*, force_rebuild: bool, include_obs_missing: bool) -> sql.SQL:
+    def _eligibility_sql(
+        *,
+        force_rebuild: bool,
+        include_obs_missing: bool,
+        exclude_languages: tuple[str, ...] = (),
+    ) -> sql.SQL:
         clauses = [
             sql.SQL("(unlock_time IS NULL OR unlock_time <= CURRENT_TIMESTAMP)"),
             sql.SQL("COALESCE(swegen_retries, 0) < %s"),
         ]
+        if exclude_languages:
+            clauses.append(sql.SQL("NOT (LOWER(COALESCE(primary_language::text, '')) = ANY(%s))"))
+        clauses.append(sql.SQL("LOWER(COALESCE(pr_category::text, '')) = ANY(%s)"))
         if not force_rebuild:
             clauses.append(sql.SQL("COALESCE(swegen_bz_passed, FALSE) = FALSE"))
         if not include_obs_missing:
@@ -63,6 +71,12 @@ class PRTaskDatabase:
         eligible = self._eligibility_sql(
             force_rebuild=force_rebuild,
             include_obs_missing=include_obs_missing,
+            exclude_languages=self.settings.exclude_languages,
+        )
+        eligibility_params: tuple[object, ...] = (
+            self.settings.max_retries,
+            *((list(self.settings.exclude_languages),) if self.settings.exclude_languages else ()),
+            list(self.settings.pr_categories),
         )
         candidates_query = sql.SQL(
             "SELECT repo, "
@@ -75,7 +89,7 @@ class PRTaskDatabase:
 
         with self._connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(candidates_query, (self.settings.max_retries,))
+                cursor.execute(candidates_query, eligibility_params)
                 candidates = cursor.fetchall()
                 for repo, _min_retries, _avg_retries, _task_count in candidates:
                     cursor.execute(
@@ -101,7 +115,7 @@ class PRTaskDatabase:
                     ).format(table=self._relation, eligible=eligible)
                     cursor.execute(
                         update_query,
-                        (lease_seconds, repo, self.settings.max_retries),
+                        (lease_seconds, repo, *eligibility_params),
                     )
                     rows = cursor.fetchall()
                     if not rows:
@@ -131,3 +145,26 @@ class PRTaskDatabase:
                         f"Expected one database row for instance_id={instance_id!r}; "
                         f"updated {cursor.rowcount}"
                     )
+
+    def release_claims(self, tasks: list[DatabasePRTask]) -> int:
+        """Release claimed rows that were not processed because a quota was met.
+
+        Matching the post-claim retry value prevents this cleanup from touching
+        a row that has since expired and been claimed again by another worker.
+        """
+        if not tasks:
+            return 0
+        query = sql.SQL(
+            "UPDATE {table} SET "
+            "unlock_time = CURRENT_TIMESTAMP, "
+            "swegen_retries = GREATEST(COALESCE(swegen_retries, 0) - 1, 0) "
+            "WHERE instance_id = %s AND swegen_retries = %s "
+            "AND unlock_time > CURRENT_TIMESTAMP"
+        ).format(table=self._relation)
+        released = 0
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                for task in tasks:
+                    cursor.execute(query, (task.instance_id, task.swegen_retries))
+                    released += cursor.rowcount
+        return released
