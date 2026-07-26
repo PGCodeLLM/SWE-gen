@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from urllib.parse import urlparse
 
 import requests
+
+from swegen.model_settings import load_github_token
 
 
 class GitHubPRFetcher:
@@ -22,7 +23,7 @@ class GitHubPRFetcher:
         """
         self.repo = self._parse_repo(repo)
         self.pr_number = pr_number
-        self.github_token = github_token or os.environ.get("GITHUB_TOKEN")
+        self.github_token = github_token or load_github_token()
 
         # API setup
         self.api_base = "https://api.github.com"
@@ -67,7 +68,7 @@ class GitHubPRFetcher:
 
     def fetch_pr_metadata(self, allow_unmerged: bool = False) -> dict:
         """Fetch PR metadata from GitHub API.
-        
+
         Args:
             allow_unmerged: If True, allow unmerged PRs (for testing/preview). Default False.
         """
@@ -190,7 +191,9 @@ class GitHubPRFetcher:
                 issue_num = int(match.group(2))
                 if issue_num != self.pr_number or repo_from_url != self.repo:
                     issue_refs[(repo_from_url, issue_num)] = None
-                    logger.debug("  Found cross-repo URL reference: %s#%d", repo_from_url, issue_num)
+                    logger.debug(
+                        "  Found cross-repo URL reference: %s#%d", repo_from_url, issue_num
+                    )
 
             # Pattern 2: Cross-repo references like owner/repo#123
             cross_repo_pattern = r"(?<!\w)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)"
@@ -227,7 +230,7 @@ class GitHubPRFetcher:
         issues = []
         fetched_issues: set[tuple[str, int]] = set()  # Track which we successfully fetched
 
-        for (repo, issue_num) in sorted(issue_refs.keys(), key=lambda x: (x[0], x[1])):
+        for repo, issue_num in sorted(issue_refs.keys(), key=lambda x: (x[0], x[1])):
             # Skip if we already fetched this issue from another repo
             # (in case same issue number exists in both fork and upstream)
             if (repo, issue_num) in fetched_issues:

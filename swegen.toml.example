@@ -1,37 +1,74 @@
-# swegen.toml — optional configuration for the Claude Code task-generation runner.
-#
-# Copy this file to `swegen.toml` in the directory you run swegen from (or point
-# the SWEGEN_CONFIG env var at it) to pick the model and inference endpoint used
-# by the create/farm pipeline.
-#
-# Precedence (highest first):
-#   1. Environment variables  (ANTHROPIC_MODEL, ANTHROPIC_BASE_URL)
-#   2. This file
-#   3. Built-in defaults
-#
-# Every key is optional; omit a key to fall back to the next source.
+# Central SWE-gen configuration. Copy to ./swegen.toml before running SWE-gen.
+# API keys, credentials, endpoints, and model names are intentionally read only
+# from this file; inherited shell/.env values are ignored.
 
-[model]
-# Model name passed to the Claude Code SDK.
-# Overridden by the ANTHROPIC_MODEL env var if set.
-model = "qwen3.5-397b-a17b-alex-swe-gen"
-
-# Inference endpoint (sets ANTHROPIC_BASE_URL for the SDK subprocess).
-# Overridden by the ANTHROPIC_BASE_URL env var if set.
-# Leave commented out to use the SDK/CLI default endpoint.
-# base_url = "https://my-inference-endpoint/v1"
+[database]
+# PostgreSQL database containing the qualified swegen.pr_tasks relation.
+host = "localhost"
+port = 5432
+database = "mindforge"
+user = "postgres"
+password = "Repomind@123"
+table = "swegen.pr_tasks"
+# A row is eligible while COALESCE(swegen_retries, 0) is below this value.
+# Lower-retry PRs are allocated before higher-retry PRs.
+max-retries = 3
+connect_timeout = 10
 
 [github]
-# GitHub token used by the orchestrator to look up linked issue numbers for
-# task metadata. Precedence: --github-token flag > GITHUB_TOKEN env var > this.
-# token = "ghp_..."
+# A token is selected from this pool for GitHub API/clone work.
+gh_tokens = [
+    "ghp_replace_me",
+]
 
-# Pool of GitHub tokens the orchestrator rotates between for cloning and API
-# lookups. A token is chosen at random per task; on a rate-limit/forbidden
-# error (HTTP 429/403) the run is retried with a different token from the pool.
-# Takes precedence over `token` when set. An explicit --github-token flag or a
-# GITHUB_TOKEN env var overrides the pool entirely.
-# gh_tokens = [
-#     "ghp_...",
-#     "ghp_...",
-# ]
+[model]
+# Claude Agent SDK / Claude Code task-generation model and authentication.
+model = "qwen3.5-397b-a17b-alex-swe-gen"
+base_url = "https://replace-with-claude-compatible-endpoint"
+api_key = "replace_me"
+# Instead of api_key, deployments may configure one of these in this file:
+# auth_token = "replace_me"
+# oauth_token = "replace_me"
+
+[openai]
+# OpenAI-compatible endpoint used for PR instruction generation and verdicts.
+api_key = "replace_me"
+base_url = "https://replace-with-openai-compatible-endpoint/v1"
+task_instruction_model = "coder-GLM-51"
+verdict_model = "coder-GLM-51"
+
+[analysis]
+classifier_model = "claude-sonnet-4-5"
+agent_model = "anthropic/claude-sonnet-4-5"
+
+[timeouts]
+# The database lease for a repository group is:
+#   sum(all values below) * lease_fraction
+task_instruction = 90
+docker_build = 600
+claude_code = 3200
+harbor_nop = 600
+harbor_oracle = 600
+hacking_check = 600
+swr_upload = 1800
+lease_fraction = 0.1
+
+[hacking]
+# Every configured checker must return is_hacking=false for the task to pass.
+[[hacking.llm]]
+name = "primary"
+endpoint = "https://replace-with-openai-compatible-endpoint"
+model = "replace-with-hacking-checker-model"
+api_key = "replace_me"
+
+[swr]
+# Successful non-hacking images are tagged as:
+# <registry>/<repository>/<image_prefix><instance_id>:latest
+enabled = true
+registry = "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"
+repository = "swr-coder-data-trajectory"
+username = "replace_me"
+password = "replace_me"
+image_prefix = "ea_sz_"
+retries = 3
+push_timeout = 1800

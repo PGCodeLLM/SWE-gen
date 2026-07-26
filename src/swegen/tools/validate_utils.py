@@ -72,12 +72,14 @@ def run_nop_oracle(
     jobs_dir: Path,
     timeout_multiplier: float | None = None,
     environment: EnvironmentType = EnvironmentType.DOCKER,
+    keep_image: bool = False,
 ) -> tuple[int | None, int | None, dict[str, Path | None]]:
     """Run both NOP and Oracle validations sequentially.
 
     Validations are always run sequentially to avoid Docker conflict issues.
-    NOP keeps the Docker image so Oracle can reuse it (much faster).
-    Oracle deletes the image after running (cleanup).
+    NOP keeps the Docker image so Oracle can reuse it (much faster). When
+    ``keep_image`` is true, Oracle also retains it for the orchestrator's SWR
+    upload; otherwise normal validation cleans it up.
 
     Args:
         task_id: Task identifier
@@ -108,7 +110,7 @@ def run_nop_oracle(
     nop_reward = parse_harbor_outcome(nop_result).reward
     job_dirs["nop"] = nop_result.parent if nop_result else None
 
-    # Oracle: Delete image after running (cleanup)
+    # Orchestrated production keeps the authoritative image for SWR upload.
     _, oracle_result = run_harbor_agent(
         task_id=task_id,
         dataset_path=dataset_path,
@@ -116,7 +118,7 @@ def run_nop_oracle(
         agent="oracle",
         timeout_multiplier=timeout_multiplier,
         capture_output=True,
-        delete_after=True,
+        delete_after=not keep_image,
         environment=environment,
     )
     oracle_reward = parse_harbor_outcome(oracle_result).reward

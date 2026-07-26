@@ -10,6 +10,9 @@ from harbor.models.task.config import (
     VerifierConfig,
 )
 
+from swegen.model_settings import load_timeout_settings
+from swegen.proxy import proxy_setup_block
+
 from .utils import strip_tests_prefix
 
 
@@ -37,7 +40,7 @@ def generate_dockerfile(params: SkeletonParams) -> str:
     - Dependency installation
     - Build steps (if needed)
     - Post-patch rebuild (if needed)
-    
+
     Git clone strategy:
     - Simple + robust: clone, then fetch the exact commit SHA.
     - NOTE: `head_sha` currently comes from the PR's HEAD branch tip (GitHub API).
@@ -45,6 +48,8 @@ def generate_dockerfile(params: SkeletonParams) -> str:
     - In that case, fetching `refs/pull/<n>/head` is a robust fallback without fetching ALL PR refs.
     """
     return f"""FROM ubuntu:24.04
+
+{proxy_setup_block()}
 
 # Base system packages (common to all languages)
 RUN apt-get update && apt-get install -y \\
@@ -248,16 +253,19 @@ def generate_task_toml(instruction_data: dict) -> str:
 
     Uses Harbor's TaskConfig for proper serialization and validation.
     """
+    timeouts = load_timeout_settings()
     config = TaskConfig(
         metadata={
             "difficulty": instruction_data.get("difficulty", "medium"),
             "category": instruction_data.get("category", "bugfix"),
             "tags": instruction_data.get("tags", []),
         },
-        verifier=VerifierConfig(timeout_sec=600.0),
-        agent=AgentConfig(timeout_sec=600.0),
+        verifier=VerifierConfig(
+            timeout_sec=float(max(timeouts.harbor_nop, timeouts.harbor_oracle))
+        ),
+        agent=AgentConfig(timeout_sec=float(max(timeouts.harbor_nop, timeouts.harbor_oracle))),
         environment=EnvironmentConfig(
-            build_timeout_sec=600.0,
+            build_timeout_sec=float(timeouts.docker_build),
             cpus=1,
             memory_mb=2048,
             storage_mb=10240,

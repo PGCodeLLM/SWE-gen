@@ -1,31 +1,5 @@
-# Configuration for the reward-hacking checker (reward_hacking_detector/hacking.py).
+# Deprecated compatibility notice.
 #
-# Copy this file to `hacking_checker.toml` (same folder) and fill in real values:
-#
-#     cp hacking_checker.example.toml hacking_checker.toml
-#
-# The checker sends the SAME request to each LLM below and collates their
-# verdicts. Each `endpoint` must be an OpenAI-compatible base URL — the checker
-# appends "/v1/chat/completions" to it (so use the host/base, NOT the full path,
-# and do NOT include a trailing "/v1").
-#
-# Only name/endpoint/model/api_key are configurable; every other request
-# setting uses the endpoint's defaults.
-
-[[llm]]
-name = "claude-haiku"
-endpoint = "https://your-anthropic-proxy.example.com"
-model = "claude-haiku-4-5"
-api_key = "sk-..."
-
-[[llm]]
-name = "gpt"
-endpoint = "https://api.openai.com"
-model = "gpt-5.2"
-api_key = "sk-..."
-
-[[llm]]
-name = "qwen"
-endpoint = "https://your-openai-compatible-host.example.com"
-model = "qwen-2.5-coder-32b-instruct"
-api_key = "..."
+# Reward-hacking checker endpoints, models, and keys now live in the central
+# repository-level swegen.toml as one or more [[hacking.llm]] tables. See
+# swegen.toml.example for the supported format.

@@ -6,14 +6,13 @@ from swegen.api import (
     classify_trial,
     compute_task_verdict,
 )
-from swegen.config import CreateConfig, FarmConfig, ValidateConfig
+from swegen.config import CreateConfig, ValidateConfig
 
 __version__ = "0.1.0"
 
 __all__ = [
     "Classification",
     "CreateConfig",
-    "FarmConfig",
     "Subtype",
     "TaskVerdict",
     "TrialClassification",

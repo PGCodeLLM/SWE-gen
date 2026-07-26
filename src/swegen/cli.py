@@ -5,20 +5,15 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
 from harbor.models.environment_type import EnvironmentType
-from rich.console import Console
 
 from swegen.analyze import AnalyzeArgs, run_analyze
-from swegen.analyze.classifier import VERDICT_MODEL
-from swegen.config import CreateConfig, FarmConfig
+from swegen.config import CreateConfig
 from swegen.create import MissingIssueError, TrivialPRError
 from swegen.create.create import run_reversal
-from swegen.farm import StreamFarmer
+from swegen.model_settings import configure_current_process
 from swegen.tools.validate import ValidateArgs, run_validate
 from swegen.tools.validate_utils import ValidationError
-
-load_dotenv()
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Task generation CLI")
 
@@ -33,6 +28,7 @@ def _root(
         is_eager=True,
     ),
 ) -> None:
+    configure_current_process("swegen-cli")
     if version:
         try:
             typer.echo(f"swegen {_pkg_version('swe-gen')}")
@@ -106,6 +102,7 @@ def create_cmd(
     ),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Increase output verbosity"),
     quiet: bool = typer.Option(False, "-q", "--quiet", help="Reduce output verbosity"),
+    keep_image: bool = typer.Option(False, "--keep-image", hidden=True),
 ) -> None:
     config = CreateConfig(
         repo=repo,
@@ -126,6 +123,7 @@ def create_cmd(
         generate_name=generate_name,
         verbose=verbose,
         quiet=quiet,
+        keep_image=keep_image,
     )
     try:
         run_reversal(config)
@@ -144,16 +142,18 @@ def validate(
         ...,
         help="Path to Harbor dataset root, specific task directory, or task ID when used with dataset root",
     ),
-    task: str
-    | None = typer.Option(None, "--task", "-t", help="Task ID when --path points to dataset root"),
+    task: str | None = typer.Option(
+        None, "--task", "-t", help="Task ID when --path points to dataset root"
+    ),
     agent: str = typer.Option("both", help="Agent to run: both|nop|oracle", show_default=True),
     jobs_dir: Path = typer.Option(
         Path(".swegen/harbor-jobs"),
         help="Directory to store Harbor job artifacts",
         show_default=True,
     ),
-    timeout_multiplier: float
-    | None = typer.Option(None, help="Multiply default timeouts (e.g., 3.0)"),
+    timeout_multiplier: float | None = typer.Option(
+        None, help="Multiply default timeouts (e.g., 3.0)"
+    ),
     environment: str = typer.Option(
         "docker",
         "-e",
@@ -171,8 +171,7 @@ def validate(
         "--show-passed",
         help="Show passed tasks in output (batch mode: default shows only failures)",
     ),
-    output: Path
-    | None = typer.Option(
+    output: Path | None = typer.Option(
         None, "-o", "--output", help="Write results to file as they complete (batch mode only)"
     ),
     docker_prune_batch: int = typer.Option(
@@ -207,18 +206,21 @@ def analyze(
     agent: str = typer.Option(
         "claude-code", "-a", "--agent", help="Agent to run trials with", show_default=True
     ),
-    model: str = typer.Option(
-        "anthropic/claude-sonnet-4-5",
+    model: str | None = typer.Option(
+        None,
         "-m",
         "--model",
         help="Model to use for agent trials",
-        show_default=True,
     ),
     n_trials: int = typer.Option(
         3, "-k", "--n-trials", help="Number of trials to run", show_default=True
     ),
     n_concurrent: int = typer.Option(
-        3, "-n", "--n-concurrent", help="Number of concurrent trials (1=sequential, 3-5 recommended)", show_default=True
+        3,
+        "-n",
+        "--n-concurrent",
+        help="Number of concurrent trials (1=sequential, 3-5 recommended)",
+        show_default=True,
     ),
     jobs_dir: Path = typer.Option(
         Path(".swegen/analyze-jobs"),
@@ -235,11 +237,10 @@ def analyze(
     skip_classify: bool = typer.Option(
         False, "--skip-classify", help="Skip LLM classification of trial outcomes"
     ),
-    analysis_model: str = typer.Option(
-        "claude-sonnet-4-5",
+    analysis_model: str | None = typer.Option(
+        None,
         "--analysis-model",
         help="Model for Claude Code classification",
-        show_default=True,
     ),
     timeout_multiplier: float = typer.Option(
         1.0, "--timeout-multiplier", help="Multiply default timeouts", show_default=True
@@ -264,11 +265,10 @@ def analyze(
         help="Timeout for verdict synthesis in seconds",
         show_default=True,
     ),
-    verdict_model: str = typer.Option(
-        VERDICT_MODEL,
+    verdict_model: str | None = typer.Option(
+        None,
         "--verdict-model",
         help="OpenAI model for verdict synthesis",
-        show_default=True,
     ),
 ) -> None:
     """
@@ -320,109 +320,3 @@ def analyze(
             verdict_timeout=verdict_timeout,
         )
     )
-
-
-
-@app.command(help="Continuous PR farming - stream through entire PR history")
-def farm(
-    repo: str = typer.Argument(
-        ..., help="GitHub repository in owner/name format (e.g., fastapi/fastapi)"
-    ),
-    output: Path = typer.Option(
-        Path("tasks"), help="Output directory for generated tasks", show_default=True
-    ),
-    state_dir: Path = typer.Option(
-        Path(".swegen"), help="State directory for logs/jobs", show_default=True
-    ),
-    repo_cache_dir: Path = typer.Option(
-        Path("data_cache/repos"), help="Shared git repo cache dir", show_default=True
-    ),
-    force: bool = typer.Option(True, help="Regenerate even if task already exists"),
-    timeout: int = typer.Option(300, help="Timeout per PR in seconds", show_default=True),
-    cc_timeout: int = typer.Option(
-        3200, help="Timeout for Claude Code session in seconds (~53 min default)", show_default=True
-    ),
-    api_delay: float = typer.Option(
-        0.5, help="Delay between GitHub API calls in seconds", show_default=True
-    ),
-    task_delay: int = typer.Option(60, help="Delay between tasks in seconds", show_default=True),
-    reset: bool = typer.Option(False, "--reset", help="Reset state and start from beginning"),
-    resume_from: str
-    | None = typer.Option(
-        None, help="Resume from date (e.g., '2024-01-15' or '2024-01-15T10:30:00Z')"
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Only show what would run (no task generation)"
-    ),
-    docker_prune_batch: int = typer.Option(
-        5, help="Run docker cleanup after every N PRs (0 to disable)", show_default=True
-    ),
-    skip_list: str
-    | None = typer.Option(None, help="Path to file with task IDs to skip (one per line)"),
-    no_cache: bool = typer.Option(
-        False,
-        "--no-cache",
-        help="Disable using successful Dockerfiles from previous tasks as hints",
-    ),
-    require_minimum_difficulty: bool = typer.Option(
-        True,
-        help="Require minimum difficulty (3+ source files); --no-require-minimum-difficulty to skip this check",
-    ),
-    min_source_files: int = typer.Option(
-        3, help="Minimum number of source files required (tests excluded)", show_default=True
-    ),
-    max_source_files: int = typer.Option(
-        10,
-        help="Maximum number of source files to avoid large refactors (tests excluded)",
-        show_default=True,
-    ),
-    environment: str = typer.Option(
-        "docker",
-        "-e",
-        "--env",
-        help="Environment type for Harbor runs (docker|daytona|e2b|modal|runloop|gke)",
-        show_default=True,
-    ),
-    verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable verbose output"),
-    require_issue: bool = typer.Option(
-        True,
-        help="Require PR to have a linked issue (higher quality); --no-require-issue to process all PRs",
-    ),
-    validate: bool = typer.Option(
-        True, help="Run Harbor validation after CC; --no-validate to skip"
-    ),
-) -> None:
-    """
-    Continuously process merged GitHub PRs and convert them to Harbor tasks.
-    Streams PRs page-by-page, processes them immediately, and maintains state for resumable operation.
-    Uses a language-agnostic pipeline that works for any repository.
-    """
-    config = FarmConfig(
-        repo=repo,
-        output=output,
-        state_dir=state_dir,
-        repo_cache_dir=repo_cache_dir,
-        force=force,
-        timeout=timeout,
-        cc_timeout=cc_timeout,
-        api_delay=api_delay,
-        task_delay=task_delay,
-        reset=reset,
-        resume_from=resume_from,
-        dry_run=dry_run,
-        docker_prune_batch=docker_prune_batch,
-        skip_list=skip_list,
-        no_cache=no_cache,
-        require_minimum_difficulty=require_minimum_difficulty,
-        min_source_files=min_source_files,
-        max_source_files=max_source_files,
-        environment=EnvironmentType(environment),
-        verbose=verbose,
-        require_issue=require_issue,
-        validate=validate,
-    )
-
-    console = Console()
-    farmer = StreamFarmer(config.repo, config, console)
-    exit_code = farmer.run()
-    raise typer.Exit(code=exit_code)

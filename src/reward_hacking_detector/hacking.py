@@ -13,16 +13,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from loguru import logger
+from swegen.model_settings import load_timeout_settings
 
+logger = logging.getLogger("swegen.reward_hacking")
 
-# Default location for the checker config, alongside this module.
-DEFAULT_CONFIG_PATH = Path(__file__).parent / "hacking_checker.toml"
-EXAMPLE_CONFIG_PATH = Path(__file__).parent / "hacking_checker.example.toml"
+# Reward-hacking configuration now lives with every other model/credential in
+# the repository-level SWE-gen configuration.
+DEFAULT_CONFIG_PATH = Path("swegen.toml")
+EXAMPLE_CONFIG_PATH = Path("swegen.toml.example")
 
 
 @dataclass
@@ -48,6 +51,15 @@ class LLMConfig:
     endpoint: str  # OpenAI-compatible base URL; "/v1/chat/completions" is appended
     model: str
     api_key: str = ""
+
+
+@dataclass
+class SingleTaskHackResult:
+    """Collated fail-closed verdict for one newly generated Harbor task."""
+
+    is_hacking: bool
+    reason: str
+    llm_results: list[tuple[LLMConfig, HackCheckResult]]
 
 
 # ── LLM inspector prompt ─────────────────────────────────────────────
@@ -363,7 +375,12 @@ async def hack_check(
         try:
             # Generous timeout: reasoning models can be slow, especially under
             # heavy concurrency (many workers sharing one endpoint).
-            timeout = httpx.Timeout(connect=30, read=600, write=30, pool=30)
+            timeout = httpx.Timeout(
+                connect=30,
+                read=load_timeout_settings().hacking_check,
+                write=30,
+                pool=30,
+            )
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, headers=headers, json=payload)
 
@@ -392,9 +409,7 @@ async def hack_check(
             text = data["choices"][0]["message"]["content"]
             raw_content = text  # preserve the untrimmed model output for logging
             if not text or not text.strip():
-                raise RuntimeError(
-                    "LLM returned empty content"
-                )
+                raise RuntimeError("LLM returned empty content")
 
             # Extract JSON object from response (handles plain JSON,
             # markdown fences, or surrounding prose)
@@ -403,7 +418,7 @@ async def hack_check(
             end = text.rfind("}")
             if start == -1 or end <= start:
                 raise RuntimeError(f"No JSON object found in LLM response: {text[:200]}")
-            text = text[start:end + 1]
+            text = text[start : end + 1]
 
             result = json.loads(text)
 
@@ -429,13 +444,17 @@ async def hack_check(
                 raw_response=raw_content,
             )
 
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
-                httpx.PoolTimeout, httpx.RemoteProtocolError) as e:
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.PoolTimeout,
+            httpx.RemoteProtocolError,
+        ) as e:
             # Transient network errors — retry
             last_err = e
             logger.warning(
-                f"{tag}Hack check attempt {attempt + 1}/{_MAX_RETRIES}: "
-                f"{type(e).__name__}: {e}"
+                f"{tag}Hack check attempt {attempt + 1}/{_MAX_RETRIES}: {type(e).__name__}: {e}"
             )
             if attempt < _MAX_RETRIES - 1:
                 await asyncio.sleep(_RETRY_BACKOFF[attempt])
@@ -459,6 +478,7 @@ async def hack_check(
         except Exception as e:
             # Unexpected error — no retry
             import traceback
+
             logger.warning(
                 f"{tag}Hack check unexpected error: {type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
@@ -475,9 +495,7 @@ async def hack_check(
 
     # All retries exhausted
     err_detail = f"{type(last_err).__name__}: {last_err}" if last_err else "unknown"
-    logger.error(
-        f"{tag}Hack check failed after {_MAX_RETRIES} attempts: {err_detail}"
-    )
+    logger.error(f"{tag}Hack check failed after {_MAX_RETRIES} attempts: {err_detail}")
     return HackCheckResult(
         is_hacking=True,
         reason=(
@@ -493,15 +511,14 @@ async def hack_check(
 
 
 def load_llm_configs(config_path: Path | None = None) -> list[LLMConfig]:
-    """Load LLM endpoints from a hacking_checker.toml file.
+    """Load LLM endpoints from ``[[hacking.llm]]`` in swegen.toml.
 
-    The TOML must contain an array of `[[llm]]` tables, each with at least
+    The TOML must contain an array of `[[hacking.llm]]` tables, each with at least
     `endpoint` and `model`, and optionally `name` and `api_key`. All other
     request settings use the endpoint's defaults.
 
     Args:
-        config_path: Path to the TOML file. Defaults to
-            `hacking_checker.toml` next to this module.
+        config_path: Path to swegen.toml. Defaults to the current directory.
 
     Returns:
         A list of LLMConfig in the order they appear in the file.
@@ -510,16 +527,18 @@ def load_llm_configs(config_path: Path | None = None) -> list[LLMConfig]:
     if not config_path.exists():
         raise FileNotFoundError(
             f"Config not found: {config_path}. "
-            f"Copy {EXAMPLE_CONFIG_PATH.name} to {DEFAULT_CONFIG_PATH.name} "
-            "and fill in your endpoints/models/api keys."
+            f"Copy {EXAMPLE_CONFIG_PATH} to {DEFAULT_CONFIG_PATH} and fill it in."
         )
 
     with config_path.open("rb") as f:
         data = tomllib.load(f)
 
-    entries = data.get("llm", [])
+    hacking = data.get("hacking", {})
+    if not isinstance(hacking, dict):
+        raise ValueError(f"[hacking] in {config_path} must be a TOML table")
+    entries = hacking.get("llm", [])
     if not entries:
-        raise ValueError(f"No [[llm]] tables found in {config_path}")
+        raise ValueError(f"No [[hacking.llm]] tables found in {config_path}")
 
     configs: list[LLMConfig] = []
     for i, entry in enumerate(entries):
@@ -528,7 +547,7 @@ def load_llm_configs(config_path: Path | None = None) -> list[LLMConfig]:
             model = entry["model"]
         except KeyError as e:
             raise ValueError(
-                f"[[llm]] entry #{i + 1} in {config_path} is missing required key {e}"
+                f"[[hacking.llm]] entry #{i + 1} in {config_path} is missing required key {e}"
             ) from e
         configs.append(
             LLMConfig(
@@ -653,10 +672,36 @@ async def check_instance(
 
     Returns the (config, result) pairs in the same order as `configs`.
     """
-    results = await asyncio.gather(
-        *(hack_check(test_bundle, cfg, task_id) for cfg in configs)
-    )
-    return list(zip(configs, results))
+    results = await asyncio.gather(*(hack_check(test_bundle, cfg, task_id) for cfg in configs))
+    return list(zip(configs, results, strict=True))
+
+
+async def check_task(
+    instance_dir: Path,
+    config_path: Path | None = None,
+) -> SingleTaskHackResult:
+    """Run the standard checker against one newly produced task.
+
+    A task is accepted only when every configured checker returns
+    ``is_hacking=false``. Unavailable/malformed checker responses already fail
+    closed in :func:`hack_check`.
+    """
+    configs = load_llm_configs(config_path)
+    bundle = build_test_bundle(instance_dir)
+    pairs = await check_instance(bundle, configs, task_id=instance_dir.name)
+    flagged = [(cfg, result) for cfg, result in pairs if result.is_hacking]
+    if flagged:
+        reason = "; ".join(f"{cfg.name}: {result.reason}" for cfg, result in flagged)
+        return SingleTaskHackResult(True, reason, pairs)
+    reason = "; ".join(f"{cfg.name}: {result.reason}" for cfg, result in pairs)
+    return SingleTaskHackResult(False, reason or "All hacking checks passed", pairs)
+
+
+def check_task_sync(
+    instance_dir: Path,
+    config_path: Path | None = None,
+) -> SingleTaskHackResult:
+    return asyncio.run(check_task(instance_dir, config_path))
 
 
 def _iter_instances(input_dir: Path):
@@ -741,8 +786,7 @@ async def run(
     if skip_existing and processed:
         instances = [inst for inst in instances if inst.name not in processed]
         logger.info(
-            f"Skipping {len(processed)} already-processed instance(s) "
-            f"from existing {out_path.name}"
+            f"Skipping {len(processed)} already-processed instance(s) from existing {out_path.name}"
         )
 
     logger.info(
@@ -815,7 +859,7 @@ def main(argv: list[str] | None = None) -> None:
         description=(
             "Run the reward-hacking checker over a directory of Harbor "
             "instances. Each instance's tests/ files are sent to every LLM "
-            "configured in hacking_checker.toml, and verdicts are collated "
+            "configured in swegen.toml, and verdicts are collated "
             "into a JSONL report."
         )
     )
@@ -835,7 +879,7 @@ def main(argv: list[str] | None = None) -> None:
         "--config",
         type=Path,
         default=None,
-        help=f"Path to the checker TOML (default: {DEFAULT_CONFIG_PATH}).",
+        help=f"Path to swegen.toml (default: {DEFAULT_CONFIG_PATH}).",
     )
     parser.add_argument(
         "--max-concurrency",

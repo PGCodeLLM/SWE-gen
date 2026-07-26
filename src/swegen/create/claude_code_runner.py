@@ -17,7 +17,7 @@ from claude_agent_sdk import (
 )
 
 from swegen.create.claude_code_utils import Colors, print_sdk_message
-from swegen.model_settings import load_model_settings, session_header_env
+from swegen.model_settings import claude_runtime_env, load_model_settings
 from swegen.tools.harbor_runner import parse_harbor_outcome, suffixed_docker_config_args
 
 
@@ -113,7 +113,18 @@ The repo is already cloned locally. You can browse it, read files, and run comma
 The skeleton files have been generated with the deterministic parts filled in:
 - Git clone commands with correct SHAs ✓
 - Basic apt packages (git, curl, ca-certificates, patch, build-essential) ✓
+- Huawei restricted-network proxy CA installation ✓
 - bug.patch/fix.patch ✓
+
+### Restricted network requirement
+
+The Docker build runs behind Huawei's secure internet gateway. The block
+between `# BEGIN SWEGEN PROXY CA SETUP` and `# END SWEGEN PROXY CA SETUP`, plus
+`environment/swegen-proxy-ca.crt`, is mandatory. Keep the block immediately
+after the final `FROM` instruction, do not delete or move the certificate, and
+ensure all network-dependent installation commands run after the CA is
+installed. This is what allows apt, git, curl, and language package managers to
+reach the internet in the restricted environment.
 
 **You need to fill in the TODOs:**
 
@@ -517,7 +528,7 @@ Before running ```harbor run```, make sure to either ```sg docker``` or ```newgr
 harbor run {harbor_config_args} --agent nop -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
 
 # Test Oracle - should get reward=1 (tests PASS after applying fix)
-harbor run {harbor_config_args} --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
+harbor run {harbor_config_args} --agent oracle -p {dataset_path}/{task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 {oracle_delete_arg} --env {environment}
 ```
 
 If you need to re-run after fixing issues, increment the number:
@@ -616,6 +627,7 @@ def run_claude_code_session(
     head_sha: str | None = None,
     environment: str = "docker",
     jobs_dir: Path | None = None,
+    keep_image: bool = False,
 ) -> ClaudeCodeResult:
     """
     Run Claude Code session to complete skeleton and make harbor pass.
@@ -668,6 +680,7 @@ def run_claude_code_session(
                 head_sha=head_sha,
                 environment=environment,
                 jobs_dir=jobs_dir,
+                keep_image=keep_image,
             )
         )
     finally:
@@ -697,6 +710,7 @@ async def _run_claude_code_session_async(
     head_sha: str | None = None,
     environment: str = "docker",
     jobs_dir: Path | None = None,
+    keep_image: bool = False,
 ) -> ClaudeCodeResult:
     """Async implementation of Claude Code session."""
     logger = logging.getLogger("swegen")
@@ -741,6 +755,7 @@ async def _run_claude_code_session_async(
         environment=environment,
         harbor_config_args=harbor_config_args,
         dockerfile_hint_section=dockerfile_hint_section,
+        oracle_delete_arg="--no-delete" if keep_image else "",
     )
     if dockerfile_hint_section:
         logger.info(
@@ -774,22 +789,19 @@ async def _run_claude_code_session_async(
             print(f"[SDK] Task dir: {task_dir}", flush=True)
             print("-" * 60, flush=True)
 
-        # Resolve model + endpoint: env var > swegen.toml > default.
+        # Resolve model, endpoint, and authentication only from swegen.toml.
         model_settings = load_model_settings()
-        # The SDK CLI subprocess inherits this process's env, so set the base URL
-        # there when it's configured but not already pinned in the environment
-        # (env stays authoritative).
-        if model_settings.base_url and "ANTHROPIC_BASE_URL" not in os.environ:
-            os.environ["ANTHROPIC_BASE_URL"] = model_settings.base_url
+        if not model_settings.model:
+            raise ValueError("[model].model must be set in swegen.toml")
         logger.info(
             "Using model %s (endpoint: %s)",
             model_settings.model,
-            os.environ.get("ANTHROPIC_BASE_URL") or "default",
+            model_settings.base_url or "default",
         )
         if verbose:
             print(
                 f"[SDK] Model: {model_settings.model} | "
-                f"Endpoint: {os.environ.get('ANTHROPIC_BASE_URL') or 'default'}",
+                f"Endpoint: {model_settings.base_url or 'default'}",
                 flush=True,
             )
 
@@ -813,7 +825,7 @@ async def _run_claude_code_session_async(
         # Pin all SDK rounds for this instance to one model via a stable
         # X-Session-ID header, so a router fronting multiple models keeps this
         # task on one model and reuses its KV cache across turns.
-        session_env = session_header_env(task_id)
+        session_env = claude_runtime_env(task_id)
 
         # Configure SDK options
         options = ClaudeAgentOptions(

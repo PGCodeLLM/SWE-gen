@@ -7,6 +7,8 @@ from pathlib import Path
 
 from harbor.models.task.paths import TaskPaths
 
+from swegen.proxy import copy_proxy_certificate
+
 from .claude_code_runner import ClaudeCodeResult, run_claude_code_session
 from .diff_utils import extract_test_files, generate_diffs
 from .pr_fetcher import GitHubPRFetcher
@@ -341,6 +343,7 @@ class PRToHarborPipeline:
             # Dockerfile (with TODOs for CC)
             dockerfile = generate_dockerfile(skeleton_params)
             (paths.environment_dir / "Dockerfile").write_text(dockerfile)
+            copy_proxy_certificate(paths.environment_dir)
 
             # test.sh (with TODOs for CC)
             test_sh_content = generate_test_sh(extracted_test_files)

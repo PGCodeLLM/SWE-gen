@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -14,6 +13,12 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
+from swegen.model_settings import (
+    configure_current_process,
+    load_analysis_settings,
+    load_model_settings,
+    load_openai_settings,
+)
 from swegen.tools.harbor_runner import (
     harbor_cmd_base,
     parse_harbor_outcome,
@@ -22,7 +27,6 @@ from swegen.tools.harbor_runner import (
 )
 
 from .classifier import (
-    VERDICT_MODEL,
     TrialClassifier,
     classify_baseline_result,
     compute_task_verdict,
@@ -36,35 +40,14 @@ from .models import (
 
 
 def _setup_claude_auth_preference(console: Console) -> None:
-    """Setup Claude Code to prefer OAuth token over API key.
-
-    For Claude Code trials and classification, we prefer OAuth token:
-    1. CLAUDE_CODE_OAUTH_TOKEN (preferred - run 'claude setup-token')
-    2. ANTHROPIC_API_KEY (fallback)
-
-    Displays which authentication method is being used.
-    """
-    has_oauth = bool(os.getenv("CLAUDE_CODE_OAUTH_TOKEN"))
-    has_api_key = bool(os.getenv("ANTHROPIC_API_KEY"))
-
-    if has_oauth:
-        # Prefer OAuth - unset API key to ensure OAuth is used
-        if "ANTHROPIC_API_KEY" in os.environ:
-            os.environ.pop("ANTHROPIC_API_KEY")
-        console.print("[dim]🔐 Claude Code authentication: OAuth token (preferred)[/dim]")
-    elif has_api_key:
-        # Use API key - unset OAuth to ensure API key is used
-        if "CLAUDE_CODE_OAUTH_TOKEN" in os.environ:
-            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN")
-        console.print("[dim]🔐 Claude Code authentication: API key (fallback)[/dim]")
-        console.print(
-            "[dim]   Tip: For better security, use OAuth token ('claude setup-token')[/dim]"
-        )
+    """Display which swegen.toml Claude authentication method is configured."""
+    settings = load_model_settings()
+    if settings.oauth_token:
+        console.print("[dim]🔐 Claude Code authentication: swegen.toml OAuth token[/dim]")
+    elif settings.api_key or settings.auth_token:
+        console.print("[dim]🔐 Claude Code authentication: swegen.toml API token[/dim]")
     else:
-        console.print("[yellow]⚠️  No Claude Code authentication configured[/yellow]")
-        console.print(
-            "[yellow]   Set CLAUDE_CODE_OAUTH_TOKEN (preferred) or ANTHROPIC_API_KEY[/yellow]"
-        )
+        console.print("[yellow]⚠️  No Claude Code authentication configured in swegen.toml[/yellow]")
 
 
 @dataclass
@@ -121,15 +104,15 @@ class AnalyzeArgs:
 
     task_path: Path
     agent: str = "claude-code"
-    model: str = "anthropic/claude-sonnet-4-5"
+    model: str | None = None
     n_trials: int = 3
     n_concurrent: int = 1  # Number of concurrent trials (matches Harbor's -n flag)
     jobs_dir: Path = Path(".swegen/analyze-jobs")
     skip_quality_check: bool = False
     skip_baseline: bool = False  # Skip baseline validation (nop/oracle)
     skip_classify: bool = False  # Skip Claude Code classification
-    analysis_model: str = "claude-sonnet-4-5"  # Model for Claude Code classification
-    verdict_model: str = VERDICT_MODEL  # OpenAI model for verdict synthesis
+    analysis_model: str | None = None
+    verdict_model: str | None = None
     environment: str = "docker"  # Environment type (docker|daytona|e2b|modal|runloop|gke)
     verbose: bool = False
     timeout_multiplier: float = 1.0
@@ -140,6 +123,15 @@ class AnalyzeArgs:
 def run_analyze(args: AnalyzeArgs) -> AnalysisResult:
     """Main entry point for task analysis."""
     console = Console()
+    configure_current_process("swegen-analyze")
+    analysis_settings = load_analysis_settings()
+    if not analysis_settings.agent_model or not analysis_settings.classifier_model:
+        raise ValueError(
+            "[analysis].agent_model and [analysis].classifier_model must be set in swegen.toml"
+        )
+    args.model = args.model or analysis_settings.agent_model
+    args.analysis_model = args.analysis_model or analysis_settings.classifier_model
+    args.verdict_model = args.verdict_model or load_openai_settings().verdict_model
 
     # Resolve task path
     task_path = args.task_path.resolve()

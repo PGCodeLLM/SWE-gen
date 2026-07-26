@@ -369,6 +369,7 @@ def _run_harbor_validations(
     harbor_jobs: Path,
     console: Console,
     environment: EnvironmentType = EnvironmentType.DOCKER,
+    keep_image: bool = False,
 ) -> tuple[list[list[str]], dict[str, str | None]]:
     """Run Harbor validations (nop + oracle) sequentially.
 
@@ -383,6 +384,7 @@ def _run_harbor_validations(
             dataset_path=harbor_root,
             jobs_dir=harbor_jobs,
             environment=environment,
+            keep_image=keep_image,
         )
 
     # Convert paths to strings for job_dirs
@@ -536,6 +538,7 @@ def run_reversal(config: CreateConfig) -> None:
                 head_sha=metadata.get("head_sha"),
                 environment=config.environment.value,
                 jobs_dir=config.state_dir / "harbor-jobs",
+                keep_image=config.keep_image,
             )
 
             gen_secs = time.perf_counter() - t0
@@ -624,7 +627,12 @@ def run_reversal(config: CreateConfig) -> None:
             console.print(Rule(Text("Validations", style="bold blue")))
 
             validation_results, job_dirs = _run_harbor_validations(
-                task_id, harbor_root, harbor_jobs, console, config.environment
+                task_id,
+                harbor_root,
+                harbor_jobs,
+                console,
+                config.environment,
+                config.keep_image,
             )
             results_rows.extend(validation_results)
             harbor_nop_job_dir = job_dirs.get("nop")

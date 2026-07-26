@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from openai import OpenAI
+
+from swegen.model_settings import load_openai_settings, load_timeout_settings
 
 from .utils import CombinedPRTaskEvaluation
 
@@ -14,10 +15,8 @@ MAX_PR_BODY_LENGTH = 2500
 MAX_TEST_FILE_LENGTH = 3000  # Max chars per test file
 MAX_TOTAL_TEST_LENGTH = 10000  # Max total chars for all test files
 MIN_INSTRUCTION_LENGTH = 100
-OPENAI_API_TIMEOUT = 90.0
 MAX_COMPLETION_TOKENS = 4096
-# originally openai
-MODEL_NAME = "coder-GLM-51"
+MODEL_NAME: str | None = None
 DEBUG_REASON_TRUNCATE_LENGTH = 100
 
 COMBINED_SYSTEM_PROMPT = """You are evaluating GitHub pull requests and converting substantial ones into SWE-bench tasks.
@@ -107,12 +106,12 @@ FORMAT RULES:
 - Write naturally, as if explaining to a colleague
 
 EXAMPLE GOOD INSTRUCTION:
-"The email validation is failing for valid email addresses. When calling user.validate_email('test@example.com'), 
-it should return True, but currently returns False for addresses with subdomains. The validation should accept 
+"The email validation is failing for valid email addresses. When calling user.validate_email('test@example.com'),
+it should return True, but currently returns False for addresses with subdomains. The validation should accept
 any email matching the pattern <local>@<domain>.<tld> including subdomains like test@mail.example.com."
 
 EXAMPLE BAD INSTRUCTION:
-"Fix the email validator in utils/auth.py by changing the regex pattern to support subdomains using a more 
+"Fix the email validator in utils/auth.py by changing the regex pattern to support subdomains using a more
 permissive regex."
 
 TAGS:
@@ -141,26 +140,26 @@ Avoid using methods of setup that require starting a Docker container. Such meth
 
 def _sanitize_for_openai(text: str | None) -> str:
     """Sanitize text for OpenAI API calls by replacing problematic Unicode characters.
-    
+
     HTTP headers must be ASCII-only. This function replaces Unicode LINE SEPARATOR
     (U+2028) and PARAGRAPH SEPARATOR (U+2029) which can leak into headers and cause
     UnicodeEncodeError when httpx tries to encode them as ASCII.
-    
+
     Args:
         text: Input text that may contain problematic Unicode characters (can be None)
-        
+
     Returns:
         Sanitized text with U+2028 replaced by '\n' and U+2029 replaced by '\n\n'
         Returns empty string if input is None or not a string
     """
     if not isinstance(text, str):
         return ""
-    
+
     # Replace LINE SEPARATOR (U+2028) with newline
-    text = text.replace('\u2028', '\n')
+    text = text.replace("\u2028", "\n")
     # Replace PARAGRAPH SEPARATOR (U+2029) with double newline
-    text = text.replace('\u2029', '\n\n')
-    
+    text = text.replace("\u2029", "\n\n")
+
     return text
 
 
@@ -224,26 +223,30 @@ def _format_user_prompt(
     # mention test files in the instruction since the agent won't see them
     test_section = ""
     if test_contents and len(test_contents) > 0:
-        test_lines = ["Test Files (for understanding behavior - do NOT reference these in your instruction):"]
+        test_lines = [
+            "Test Files (for understanding behavior - do NOT reference these in your instruction):"
+        ]
         total_length = 0
-        
+
         # Sort by file size (smaller first) to prioritize including more files
         sorted_tests = sorted(test_contents.items(), key=lambda x: len(x[1]))
-        
+
         for test_file, content in sorted_tests:
             # Truncate individual file if too long
             if len(content) > MAX_TEST_FILE_LENGTH:
                 content = content[:MAX_TEST_FILE_LENGTH] + "\n... (truncated)"
-            
+
             # Check if adding this file would exceed total limit
             if total_length + len(content) > MAX_TOTAL_TEST_LENGTH:
-                test_lines.append(f"\n... ({len(test_contents) - len(test_lines) + 1} more test files omitted)")
+                test_lines.append(
+                    f"\n... ({len(test_contents) - len(test_lines) + 1} more test files omitted)"
+                )
                 break
-            
+
             test_lines.append(f"\n--- {test_file} ---")
             test_lines.append(content)
             total_length += len(content)
-        
+
         test_section = "\n".join(test_lines) + "\n\n"
 
     # MODE 1: Linked issues exist - use issue + PR body + tests
@@ -277,7 +280,7 @@ def _format_user_prompt(
         pr_body_truncated = (pr_body or "").strip()
         if len(pr_body_truncated) > MAX_PR_BODY_LENGTH:
             pr_body_truncated = pr_body_truncated[:MAX_PR_BODY_LENGTH] + "\n...(truncated)"
-        
+
         pr_body_section = ""
         if pr_body_truncated:
             pr_body_section = f"PR Description (for additional context):\n{pr_body_truncated}\n\n"
@@ -360,8 +363,7 @@ def evaluate_and_generate_task(
     metadata: dict,
     files: list[dict],
     repo: str,
-    model: str = MODEL_NAME,
-    api_key: str | None = None,
+    model: str | None = None,
     linked_issues: list[dict] | None = None,
     force_generate_instruction: bool = False,
     test_contents: dict[str, str] | None = None,
@@ -375,8 +377,7 @@ def evaluate_and_generate_task(
         metadata: PR metadata dict
         files: List of changed files
         repo: Repository name
-        model: OpenAI model to use
-        api_key: Optional OpenAI API key
+        model: Optional model override; defaults to [openai].task_instruction_model
         linked_issues: Optional list of linked issue dicts (with 'title', 'body', 'number')
         force_generate_instruction: If True, always generate an instruction even if PR seems trivial
         test_contents: Optional dict mapping test file paths to their contents
@@ -390,9 +391,8 @@ def evaluate_and_generate_task(
     """
     logger = logging.getLogger("swegen")
 
-    # Check API key
-    if not (api_key or os.getenv("OPENAI_API_KEY")):
-        raise RuntimeError("OPENAI_API_KEY not set")
+    openai_settings = load_openai_settings()
+    resolved_model = model or openai_settings.task_instruction_model
 
     # Prepare prompt data
     # NOTE: We intentionally do NOT pass diff/commits to avoid leaking the solution
@@ -400,7 +400,7 @@ def evaluate_and_generate_task(
     pr_title = _sanitize_for_openai(metadata.get("title", ""))
     pr_body = _sanitize_for_openai(metadata.get("body", ""))
     changed_files = [f.get("filename", "") for f in files]
-    
+
     # Sanitize linked issues if present
     sanitized_linked_issues = None
     if linked_issues:
@@ -410,13 +410,12 @@ def evaluate_and_generate_task(
             sanitized_issue["title"] = _sanitize_for_openai(issue.get("title", ""))
             sanitized_issue["body"] = _sanitize_for_openai(issue.get("body", ""))
             sanitized_linked_issues.append(sanitized_issue)
-    
+
     # Sanitize test contents if present
     sanitized_test_contents = None
     if test_contents:
         sanitized_test_contents = {
-            path: _sanitize_for_openai(content) 
-            for path, content in test_contents.items()
+            path: _sanitize_for_openai(content) for path, content in test_contents.items()
         }
 
     user_prompt = _format_user_prompt(
@@ -431,8 +430,9 @@ def evaluate_and_generate_task(
     )
 
     client = OpenAI(
-        api_key=api_key or os.getenv("OPENAI_API_KEY"),
-        timeout=OPENAI_API_TIMEOUT,  # Longer timeout for reasoning models
+        api_key=openai_settings.api_key,
+        base_url=openai_settings.base_url,
+        timeout=float(load_timeout_settings().task_instruction),
     )
 
     try:
@@ -440,7 +440,7 @@ def evaluate_and_generate_task(
         # (U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR)
         sanitized_system_prompt = _sanitize_for_openai(COMBINED_SYSTEM_PROMPT)
         sanitized_user_prompt = _sanitize_for_openai(user_prompt)
-        
+
         messages = [
             {"role": "system", "content": sanitized_system_prompt},
             {"role": "user", "content": sanitized_user_prompt},
@@ -450,7 +450,7 @@ def evaluate_and_generate_task(
         # so backends that return clean JSON behave exactly as before.
         try:
             completion = client.beta.chat.completions.parse(
-                model=model,
+                model=resolved_model,
                 messages=messages,
                 response_format=CombinedPRTaskEvaluation,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
@@ -473,14 +473,12 @@ def evaluate_and_generate_task(
                 try:
                     from openai.lib._parsing import type_to_response_format_param
 
-                    response_format = type_to_response_format_param(
-                        CombinedPRTaskEvaluation
-                    )
+                    response_format = type_to_response_format_param(CombinedPRTaskEvaluation)
                 except Exception:
                     response_format = {"type": "json_object"}
 
                 raw = client.chat.completions.create(
-                    model=model,
+                    model=resolved_model,
                     messages=messages,
                     response_format=response_format,
                     max_completion_tokens=MAX_COMPLETION_TOKENS,
@@ -491,7 +489,7 @@ def evaluate_and_generate_task(
                 result = _tolerant_parse_content(content)
             except Exception:
                 # Recovery failed; surface the original strict-parse failure.
-                raise parse_exc
+                raise parse_exc from None
 
         logger.debug(
             f"Combined evaluation: is_substantial={result.is_substantial}, reason={result.reason[:DEBUG_REASON_TRUNCATE_LENGTH]}..."

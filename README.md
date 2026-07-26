@@ -42,9 +42,6 @@ uv pip install swegen
 
 # Generate a task from a merged PR
 swegen create --repo axios/axios --pr 7150
-
-# Or farm all PRs from a repo
-swegen farm fastapi/fastapi
 ```
 
 ## Installation
@@ -53,13 +50,15 @@ swegen farm fastapi/fastapi
 uv pip install swegen
 ```
 
-Ensure these environment variables are set:
+Copy the central configuration example and fill in its credentials, endpoints,
+and models:
 
 ```bash
-export GITHUB_TOKEN=<gh-token>
-export OPENAI_API_KEY=<api-key>
-export ANTHROPIC_API_KEY=<api-key>  # or CLAUDE_CODE_OAUTH_TOKEN
+cp swegen.toml.example swegen.toml
 ```
+
+SWE-gen ignores inherited API-key and model environment variables so every
+worker uses the same explicit configuration.
 
 **Note:** Cloud sandbox environments (Daytona, E2B, Modal, etc.) require additional API keys.
 
@@ -67,7 +66,6 @@ export ANTHROPIC_API_KEY=<api-key>  # or CLAUDE_CODE_OAUTH_TOKEN
 
 **Commands:**
 - `swegen create` — Generate a task from a merged PR
-- `swegen farm` — Continuously process PRs from a repository
 - `swegen validate` — Validate existing task (NOP + Oracle)
 - `swegen analyze` — Deep analysis with agent trials to verify task quality
 
@@ -92,40 +90,6 @@ swegen create --repo <owner/repo> --pr <num>
 - `--max-source-files N` — Maximum number of source files to avoid large refactors (default: 10, tests excluded)
 - `--no-require-issue` — Allow PRs without linked issues (uses PR body/title for instructions)
 - `-v, --verbose` / `-q, --quiet`
-
-</details>
-
-### Continuous PR Farming
-
-Stream through entire PR history, process each sequentially with state persistence.
-
-```bash
-swegen farm fastapi/fastapi
-```
-
-<details>
-<summary>Options</summary>
-
-- `--output PATH` — Output directory for generated tasks (default: `tasks`)
-- `--state-dir PATH` — State directory for cache/logs (default: `.swegen`)
-- `--timeout N` — Timeout per PR in seconds (default: 300)
-- `--cc-timeout N` — Claude Code session timeout (default: 3200)
-- `--task-delay N` — Delay between tasks in seconds (default: 60)
-- `--api-delay N` — Delay between GitHub API calls in seconds (default: 0.5)
-- `--env, -e TYPE` — Environment type: `docker`, `daytona`, `e2b`, `modal`, `runloop`, `gke` (default: `docker`)
-- `--resume-from DATE` — Resume from date or timestamp
-- `--reset` — Reset state and start from beginning
-- `--dry-run` — Preview without generation
-- `--force` — Regenerate even if task already exists (default: true)
-- `--no-validate` — Skip Harbor validation step
-- `--require-issue` / `--no-require-issue` — Require PRs to have linked issues (default: True)
-- `--no-require-minimum-difficulty` — Skip 3+ file and LLM checks
-- `--min-source-files N` — Minimum number of source files required (default: 3, tests excluded)
-- `--max-source-files N` — Maximum number of source files to avoid large refactors (default: 10, tests excluded)
-- `--no-cache` — Disable cached artifacts
-- `--docker-prune-batch N` — Run docker cleanup after every N PRs (default: 5, 0 to disable)
-- `--skip-list PATH` — Path to file with task IDs to skip (one per line)
-- `-v, --verbose`
 
 </details>
 
@@ -205,29 +169,27 @@ The pipeline uses a **language-agnostic approach**:
 
 </details>
 
-## Voyager/CWM Postprocessing
+## Database-backed production pipeline
 
-Postprocessing is an extra step performed by [`src/orchestrator.py`](src/orchestrator.py), not by the regular `swegen create` or `swegen farm` commands. After a `swegen create` subprocess succeeds, the orchestrator immediately copies the generated task from `<run>/tasks/<task-id>/` to `<run>/tasks_voyager_postprocessed/<task-id>/` (or the directory supplied with `--postprocessed-output`). All rewrites are applied to the copy; the original generated task is left untouched.
+[`src/orchestrator.py`](src/orchestrator.py) reads work from the PostgreSQL relation configured as `[database].table` in `swegen.toml` (normally `swegen.pr_tasks`):
 
-The orchestrator accepts optional `base_commit` and `image_ref` fields on each input JSONL record in addition to `repo` and `pull_number`:
-
-```json
-{"repo":"owner/repo","pull_number":"123","base_commit":"<40-character SHA>","image_ref":"<Voyager image>"}
+```bash
+uv run python src/orchestrator.py --workers 8
 ```
 
-For every successful task, postprocessing currently does the following:
+Repository groups are claimed atomically. The claim transaction excludes future `unlock_time` values, increments `swegen_retries`, and sets a lease derived from the configured Docker, Claude Code, Harbor, hacking-check, and SWR timeouts. Rows with `swegen_bz_passed=true` and `obs_exists=false` are skipped by default; use `--force-rebuild` or `--include-obs-missing` to include them. Rows whose `swegen_retries` have reached `[database].max-retries` are always skipped, and lower-retry PRs are prioritized over higher-retry PRs.
 
-1. **Fetches linked-issue metadata** — It queries GitHub for linked issues and deterministically chooses the lowest issue number. If the lookup fails or the PR has no linked issue, postprocessing continues with an empty issue number.
-2. **Selects the Docker base image** — When `image_ref` (or its alias `voyager_image_ref`) is present, the first Dockerfile `FROM` image is replaced with that prebuilt repository image while preserving any suffix such as a build-stage alias. Otherwise, an exact `FROM ubuntu:24.04` is replaced with the configured internal Ubuntu mirror; other base images are left unchanged.
-3. **Uses the repository preloaded in the image** — It inserts Dockerfile commands that move `/app/<owner>/<repo>` to the working checkout path (normally `/app/src`) and creates a symlink from the original location to the new location.
-4. **Replaces a generated clone with a checkout** — When it can determine a 40-character commit SHA, it replaces the `RUN git clone ...` block with a detached checkout in the preloaded repository followed by `git submodule update --init || true`. It prefers the PR HEAD SHA found in the clone block and falls back to the JSONL `base_commit`. If no SHA can be determined, the clone block is retained.
-5. **Appends task metadata** — If `task.toml` does not already contain `[cwm_task_metadata]`, it appends `repo_full_name`, `pr_id`, `issue_number`, `training_domain = "feature"`, and `source_commit` (the input `base_commit`).
+A task is successful only after the complete production gate:
 
-This automatic path does not remove or rewrite `bug.patch`, tests, instructions, or solution files. It preserves SWE-gen's normal patch-based reversed baseline: the task's existing Dockerfile steps still apply `bug.patch` after the repository checkout to expose the buggy state.
+1. Harbor validation produces NOP reward `0` and Oracle reward `1`.
+2. Every `[[hacking.llm]]` configured in `swegen.toml` returns `is_hacking=false` for the newly generated task.
+3. The task is copied from `<run>/tasks/` to `<run>/tasks_bz/` and postprocessed.
+4. The retained Harbor image is uploaded to Huawei SWR.
+5. The database row is updated with `swegen_bz_passed=true`.
 
-Postprocessing status is written to the worker log and `orchestrator-progress.jsonl`. A postprocessing exception is recorded as `ERROR: ...`, but it does not change the already-successful `swegen create` result or modify the original task.
+The `tasks_bz` Dockerfile uses the wce1sr `swesandbox` base, installs the bundled Huawei proxy CA, retains a real clone of the source repository, fetches detached SHAs when necessary, and resets/cleans the repository before checkout to tolerate dirty SWR layers. The local Docker image is pruned only after its SWR upload succeeds.
 
-There is also a separate batch converter at [`src/coder-data-platform/postprocess.py`](src/coder-data-platform/postprocess.py). Unlike the automatic orchestrator path, that script resolves a repository image through CWM, checks out the mapped base commit, removes the OBS bootstrap and `bug.patch` application, validates the transformed Dockerfile, copies only successful conversions, and records skipped instances in `postprocess_failures.log`.
+All gate results and failure reasons—including reward-hacking diagnoses—are written to `orchestrator-progress.jsonl` and `orchestrator-instance-status.jsonl`. API credentials, endpoints, model names, database settings, hacking-checker settings, and SWR credentials are centralized in `swegen.toml`; inherited API/model environment variables are ignored.
 
 ## Datasets
 

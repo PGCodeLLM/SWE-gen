@@ -3,125 +3,296 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("swegen")
 
-# Model used when nothing is configured via env var or swegen.toml. Kept here so
-# the out-of-the-box behavior matches what the runner previously hardcoded.
-DEFAULT_MODEL = "qwen3.5-397b-a17b-alex-swe-gen"
-
-# Env var pointing at an alternate config file location (otherwise swegen.toml in
-# the current working directory is used).
-CONFIG_PATH_ENV = "SWEGEN_CONFIG"
-DEFAULT_CONFIG_FILE = "swegen.toml"
+DEFAULT_CONFIG_FILE = Path("swegen.toml")
+# These values may be required by third-party SDK subprocesses, but users must
+# configure them in swegen.toml.  We deliberately discard inherited values so
+# shell/.env state cannot silently change a run.
+MANAGED_RUNTIME_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "REPO_CREATION_TOKEN",
+)
 
 
 @dataclass(frozen=True)
 class ModelSettings:
-    """Resolved model + endpoint for the Claude Code SDK session.
-
-    Attributes:
-        model: Model name to pass to the SDK.
-        base_url: Inference endpoint (ANTHROPIC_BASE_URL), or None to use the
-            SDK/CLI default.
-    """
-
     model: str
     base_url: str | None = None
+    api_key: str | None = None
+    auth_token: str | None = None
+    oauth_token: str | None = None
 
 
-def _config_path() -> Path:
-    override = os.environ.get(CONFIG_PATH_ENV)
-    return Path(override) if override else Path(DEFAULT_CONFIG_FILE)
+@dataclass(frozen=True)
+class OpenAISettings:
+    api_key: str
+    base_url: str | None
+    task_instruction_model: str
+    verdict_model: str
 
 
-def _read_table(section: str) -> dict:
-    """Read a top-level table (e.g. ``[model]``) from the config file.
+@dataclass(frozen=True)
+class AnalysisSettings:
+    classifier_model: str
+    agent_model: str
 
-    Returns an empty dict if the file is missing or malformed (a malformed file
-    is logged as a warning rather than crashing the pipeline).
-    """
-    path = _config_path()
-    if not path.exists():
+
+@dataclass(frozen=True)
+class DatabaseSettings:
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+    table: str
+    max_retries: int = 3
+    connect_timeout: int = 10
+
+    def __post_init__(self) -> None:
+        if self.max_retries < 1:
+            raise ValueError("[database].max-retries must be >= 1")
+
+
+@dataclass(frozen=True)
+class TimeoutSettings:
+    task_instruction: int = 90
+    docker_build: int = 600
+    claude_code: int = 3200
+    harbor_nop: int = 600
+    harbor_oracle: int = 600
+    hacking_check: int = 600
+    swr_upload: int = 1800
+    lease_fraction: float = 0.1
+
+    def lease_seconds_per_task(self, claude_code_override: int | None = None) -> int:
+        total = (
+            self.task_instruction
+            + self.docker_build
+            + (claude_code_override or self.claude_code)
+            + self.harbor_nop
+            + self.harbor_oracle
+            + self.hacking_check
+            + self.swr_upload
+        )
+        return max(1, round(total * self.lease_fraction))
+
+
+@dataclass(frozen=True)
+class SWRSettings:
+    enabled: bool
+    registry: str
+    repository: str
+    username: str
+    password: str
+    image_prefix: str = "ea_sz_"
+    retries: int = 3
+    push_timeout: int = 1800
+
+
+def config_path() -> Path:
+    """Return the single supported configuration location."""
+    return DEFAULT_CONFIG_FILE
+
+
+def load_config(*, required: bool = False) -> dict[str, Any]:
+    path = config_path()
+    if not path.is_file():
+        if required:
+            raise FileNotFoundError(
+                f"SWE-gen configuration not found: {path}. "
+                "Copy swegen.toml.example to swegen.toml and fill in its values."
+            )
         return {}
     try:
-        with path.open("rb") as f:
-            data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        logger.warning("Ignoring malformed config file %s: %s", path, e)
-        return {}
-    table = data.get(section, {})
-    if not isinstance(table, dict):
-        logger.warning("Ignoring [%s] in %s: expected a table", section, path)
-        return {}
-    return table
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"Could not load {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid configuration in {path}: expected a TOML document")
+    return data
+
+
+def _table(name: str, *, required_config: bool = False) -> dict[str, Any]:
+    value = load_config(required=required_config).get(name, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"[{name}] in {config_path()} must be a TOML table")
+    return value
+
+
+def _required_string(table: dict[str, Any], section: str, key: str) -> str:
+    value = table.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"[{section}].{key} must be set in {config_path()}")
+    return value.strip()
 
 
 def load_model_settings() -> ModelSettings:
-    """Resolve model + endpoint with precedence: env var > swegen.toml > default.
-
-    - model:    ANTHROPIC_MODEL    > [model].model    > DEFAULT_MODEL
-    - base_url: ANTHROPIC_BASE_URL > [model].base_url > None
-    """
-    table = _read_table("model")
-
-    model = os.environ.get("ANTHROPIC_MODEL") or table.get("model") or DEFAULT_MODEL
-    base_url = os.environ.get("ANTHROPIC_BASE_URL") or table.get("base_url") or None
-
-    return ModelSettings(model=model, base_url=base_url)
+    table = _table("model")
+    return ModelSettings(
+        model=str(table.get("model") or "").strip(),
+        base_url=str(table["base_url"]).strip() if table.get("base_url") else None,
+        api_key=str(table["api_key"]).strip() if table.get("api_key") else None,
+        auth_token=(str(table["auth_token"]).strip() if table.get("auth_token") else None),
+        oauth_token=(str(table["oauth_token"]).strip() if table.get("oauth_token") else None),
+    )
 
 
-def session_header_env(instance_id: str, header: str = "X-Session-ID") -> dict[str, str]:
-    """Env mapping that pins a stable per-instance routing header for the SDK.
+def load_openai_settings(*, require_api_key: bool = True) -> OpenAISettings:
+    table = _table("openai", required_config=require_api_key)
+    api_key = str(table.get("api_key") or "").strip()
+    if require_api_key and not api_key:
+        raise ValueError(f"[openai].api_key must be set in {config_path()}")
+    task_instruction_model = str(table.get("task_instruction_model") or "").strip()
+    verdict_model = str(table.get("verdict_model") or "").strip()
+    if require_api_key and not task_instruction_model:
+        raise ValueError(f"[openai].task_instruction_model must be set in {config_path()}")
+    if require_api_key and not verdict_model:
+        raise ValueError(f"[openai].verdict_model must be set in {config_path()}")
+    return OpenAISettings(
+        api_key=api_key,
+        base_url=str(table["base_url"]).strip() if table.get("base_url") else None,
+        task_instruction_model=task_instruction_model,
+        verdict_model=verdict_model,
+    )
 
-    The header value is a deterministic SHA-256 hash of ``instance_id``, so every
-    Claude SDK round for the same instance carries the same ``X-Session-ID``. When
-    the endpoint is a router fronting multiple models, this keeps one instance
-    pinned to one model, maximizing KV cache reuse. The hash is stable across
-    processes and retries (unlike Python's salted ``hash()``).
 
-    Any ``ANTHROPIC_CUSTOM_HEADERS`` already in the environment is preserved; the
-    session header is appended on its own line.
-    """
-    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()
-    line = f"{header}: {digest}"
-    existing = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
-    value = f"{existing}\n{line}" if existing else line
-    return {"ANTHROPIC_CUSTOM_HEADERS": value}
+def load_analysis_settings() -> AnalysisSettings:
+    table = _table("analysis")
+    return AnalysisSettings(
+        classifier_model=str(table.get("classifier_model") or "").strip(),
+        agent_model=str(table.get("agent_model") or "").strip(),
+    )
+
+
+def load_database_settings() -> DatabaseSettings:
+    table = _table("database", required_config=True)
+    relation = _required_string(table, "database", "table")
+    if relation.count(".") != 1:
+        raise ValueError("[database].table must be schema-qualified (for example swegen.pr_tasks)")
+    return DatabaseSettings(
+        host=_required_string(table, "database", "host"),
+        port=int(table.get("port", 5432)),
+        database=_required_string(table, "database", "database"),
+        user=_required_string(table, "database", "user"),
+        password=_required_string(table, "database", "password"),
+        table=relation,
+        max_retries=int(table.get("max-retries", 3)),
+        connect_timeout=int(table.get("connect_timeout", 10)),
+    )
+
+
+def load_timeout_settings() -> TimeoutSettings:
+    table = _table("timeouts")
+    return TimeoutSettings(
+        task_instruction=int(table.get("task_instruction", 90)),
+        docker_build=int(table.get("docker_build", 600)),
+        claude_code=int(table.get("claude_code", 3200)),
+        harbor_nop=int(table.get("harbor_nop", 600)),
+        harbor_oracle=int(table.get("harbor_oracle", 600)),
+        hacking_check=int(table.get("hacking_check", 600)),
+        swr_upload=int(table.get("swr_upload", 1800)),
+        lease_fraction=float(table.get("lease_fraction", 0.1)),
+    )
+
+
+def load_swr_settings() -> SWRSettings:
+    table = _table("swr")
+    enabled = bool(table.get("enabled", False))
+    settings = SWRSettings(
+        enabled=enabled,
+        registry=str(table.get("registry") or "").strip().rstrip("/"),
+        repository=str(table.get("repository") or "").strip().strip("/"),
+        username=str(table.get("username") or "").strip(),
+        password=str(table.get("password") or ""),
+        image_prefix=str(table.get("image_prefix") or "ea_sz_"),
+        retries=max(1, int(table.get("retries", 3))),
+        push_timeout=max(1, int(table.get("push_timeout", 1800))),
+    )
+    if enabled:
+        missing = [
+            name
+            for name in ("registry", "repository", "username", "password")
+            if not getattr(settings, name)
+        ]
+        if missing:
+            raise ValueError(f"[swr] is enabled but these values are missing: {', '.join(missing)}")
+    return settings
 
 
 def load_github_token() -> str | None:
-    """Return the GitHub token from ``[github].token`` in swegen.toml, if set.
-
-    This is only the config-file value; callers are expected to give precedence
-    to an explicit flag or the GITHUB_TOKEN environment variable.
-    """
-    token = _read_table("github").get("token")
-    return token or None
+    tokens = load_github_tokens()
+    return random.choice(tokens) if tokens else None
 
 
 def load_github_tokens() -> list[str]:
-    """Return the pool of GitHub tokens configured in swegen.toml.
-
-    Reads ``[github].gh_tokens`` (a list of strings) and falls back to the
-    single ``[github].token`` when no list is set. Non-string and empty entries
-    are dropped. Returns an empty list when nothing is configured.
-
-    Callers are expected to give precedence to an explicit flag or the
-    GITHUB_TOKEN environment variable over this pool.
-    """
-    table = _read_table("github")
+    table = _table("github")
     raw = table.get("gh_tokens")
     if isinstance(raw, list):
-        tokens = [t.strip() for t in raw if isinstance(t, str) and t.strip()]
+        tokens = [str(token).strip() for token in raw if str(token).strip()]
         if tokens:
             return tokens
-        if raw:
-            logger.warning("Ignoring [github].gh_tokens: no usable string entries")
-    elif raw is not None:
-        logger.warning("Ignoring [github].gh_tokens: expected a list of strings")
-    single = table.get("token")
-    return [single] if isinstance(single, str) and single.strip() else []
+    single = str(table.get("token") or "").strip()
+    return [single] if single else []
+
+
+def session_header_env(instance_id: str, header: str = "X-Session-ID") -> dict[str, str]:
+    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()
+    return {"ANTHROPIC_CUSTOM_HEADERS": f"{header}: {digest}"}
+
+
+def claude_runtime_env(instance_id: str) -> dict[str, str]:
+    """Build the SDK environment exclusively from swegen.toml."""
+    settings = load_model_settings()
+    env = session_header_env(instance_id)
+    if settings.api_key:
+        env["ANTHROPIC_API_KEY"] = settings.api_key
+    if settings.auth_token:
+        env["ANTHROPIC_AUTH_TOKEN"] = settings.auth_token
+    if settings.oauth_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = settings.oauth_token
+    if settings.base_url:
+        env["ANTHROPIC_BASE_URL"] = settings.base_url
+    return env
+
+
+def configured_subprocess_env(instance_id: str = "swegen") -> dict[str, str]:
+    """Return a child environment with managed secrets replaced from TOML."""
+    env = os.environ.copy()
+    for name in MANAGED_RUNTIME_ENV_VARS:
+        env.pop(name, None)
+    env.update(claude_runtime_env(instance_id))
+    github_token = load_github_token()
+    if github_token:
+        env["GITHUB_TOKEN"] = github_token
+    openai = load_openai_settings(require_api_key=False)
+    if openai.api_key:
+        env["OPENAI_API_KEY"] = openai.api_key
+    if openai.base_url:
+        env["OPENAI_BASE_URL"] = openai.base_url
+    return env
+
+
+def configure_current_process(instance_id: str = "swegen") -> None:
+    """Replace any inherited API/model variables with central configuration."""
+    env = configured_subprocess_env(instance_id)
+    for name in MANAGED_RUNTIME_ENV_VARS:
+        os.environ.pop(name, None)
+    for name in MANAGED_RUNTIME_ENV_VARS:
+        if name in env:
+            os.environ[name] = env[name]
