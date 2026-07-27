@@ -46,7 +46,7 @@ from reward_hacking_detector.hacking import (
     write_instance_log,
 )
 from run_dashboard import collect_latest_statuses
-from slurm_collect import job_state, load_plan, redact, run_bytes, safe_extract, srun_base
+from slurm_collect import load_plan, redact
 from swegen.tools.harbor_runner import parse_harbor_outcome, run_harbor_agent
 from swegen.tools.validate_utils import validate_task_structure
 
@@ -859,49 +859,50 @@ class ValidationWorker:
         destination = self.tasks_dir / instance
         if (destination / "tests" / "test.sh").is_file():
             return destination
-        # Prefer a pre-staged task dir published to a shared location (e.g. the
-        # NFS `tasks/` tree used by sharded multi-node validation). This lets
-        # remote workers read task inputs from NFS instead of pulling each task
-        # over Slurm (`srun tar`) from its generating node, keeping the fetch
-        # off the cross-node hot path. Falls back to srun when not staged.
+        # Every task dir lives on the shared `/data` filesystem, so a task is
+        # always reachable by reading it directly — never by submitting a Slurm
+        # `srun tar` job. The old srun fallback flooded the shared `debug`
+        # partition with thousands of pending `tar` jobs, jamming the scheduler
+        # and starving Stage-1's own jobs (an ~18h Stage-1 outage). Resolve the
+        # task from the shared locations in priority order, lazily, and copy
+        # locally only when the match is not already a return-in-place path.
+        #
+        # 1. Pre-staged NFS `tasks/` tree (returned in place).
         staged_dir = getattr(self, "task_source_dir", None)
         if staged_dir is not None:
             staged_task = staged_dir / instance
             if (staged_task / "tests" / "test.sh").is_file():
                 return staged_task
+        # 2. This run dir's local task copy (returned in place).
+        local_task = self.run_dir / "tasks" / instance
+        if (local_task / "tests" / "test.sh").is_file():
+            return local_task
+        # 3. The generating node's run dir — also on the shared /data mount, so
+        #    it is readable directly without any cross-node transport. Only now
+        #    do we consult the plan for the source node.
         node = record.get("source_node")
-        if not isinstance(node, str) or not node:
-            local_task = self.run_dir / "tasks" / instance
-            if (local_task / "tests" / "test.sh").is_file():
-                return local_task
-            raise RuntimeError("successful record has neither a source node nor a local task")
-        node_record = self.node_records().get(node)
-        if node_record is None:
-            raise RuntimeError(f"source node is absent from active plans: {node}")
-        job_id = str(node_record["job_id"]) if node_record.get("job_id") else None
-        state = job_state(job_id)
-        remote_run_dir = str(node_record["remote_run_dir"])
-        command = srun_base(node, job_id, state) + [
-            "--chdir=/data/work/slurm-swegen",
-            "tar",
-            "-C",
-            f"{remote_run_dir}/tasks",
-            "-czf",
-            "-",
-            "--",
-            instance,
-        ]
-        completed = run_bytes(command, timeout=self.args.fetch_timeout)
-        if not completed.stdout:
-            raise RuntimeError(f"empty task archive from {node}")
+        if isinstance(node, str) and node:
+            node_record = self.node_records().get(node)
+            if node_record is None:
+                raise RuntimeError(f"source node is absent from active plans: {node}")
+            remote_run_dir = node_record.get("remote_run_dir")
+            if remote_run_dir:
+                remote_task = Path(str(remote_run_dir)) / "tasks" / instance
+                if (remote_task / "tests" / "test.sh").is_file():
+                    return self._copy_shared_task(instance, remote_task, destination)
+        raise RuntimeError(
+            f"task {instance!r} not found in any shared location "
+            "(NFS staging, local run dir, or source-node run dir)"
+        )
 
+    def _copy_shared_task(self, instance: str, source: Path, destination: Path) -> Path:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=f".{instance}.fetch-", dir=self.tasks_dir))
         try:
-            safe_extract(completed.stdout, staging)
             extracted = staging / instance
+            shutil.copytree(source, extracted, symlinks=True)
             if not (extracted / "tests" / "test.sh").is_file():
-                raise RuntimeError("fetched task is missing tests/test.sh")
+                raise RuntimeError("copied task is missing tests/test.sh")
             if destination.exists():
                 shutil.rmtree(destination)
             os.replace(extracted, destination)

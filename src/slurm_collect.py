@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -330,6 +331,42 @@ def safe_extract(payload: bytes, destination: Path) -> None:
         archive.extractall(destination, filter="data")
 
 
+# Journal/log files worth collecting off a node before its jobs are cancelled.
+# The bulky ``tasks/`` tree is deliberately excluded: on this cluster every node
+# shares one ``/data`` filesystem, so task dirs are already readable by the
+# controller and re-archiving ~180k files over SSH is both redundant and slow
+# enough to wedge the reconcile loop.
+_ARCHIVE_NAME_PATTERNS = (
+    "create.jsonl",
+    "orchestrator-instance-status*.jsonl",
+    "orchestrator-progress*.jsonl",
+    "task_references.json",
+    "slurm-*.out",
+)
+
+
+def _shared_fs_archive(remote_run_dir: str, destination: Path) -> bool:
+    """Fast path when ``remote_run_dir`` is already visible on shared storage.
+
+    Copies only the small journal/log set locally (no tar-over-SSH, no task
+    tree). Returns True when the fast path was taken, False to fall back to the
+    remote transport.
+    """
+    source = Path(remote_run_dir)
+    if not source.is_dir():
+        return False
+    destination.mkdir(parents=True, exist_ok=True)
+    for pattern in _ARCHIVE_NAME_PATTERNS:
+        for match in source.rglob(pattern):
+            if not match.is_file():
+                continue
+            relative = match.relative_to(source)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(match, target)
+    return True
+
+
 def collect_archive(
     node: str,
     job_id: str | None,
@@ -343,17 +380,17 @@ def collect_archive(
 ) -> None:
     if collection_unavailable(state, transport):
         return
-    task_find = ""
-    if include_tasks:
-        task_find = " -o -path './tasks/*' -o -path './tasks_voyager_postprocessed/*'"
+    # ``include_tasks`` is retained for API compatibility but no longer pulls the
+    # tasks tree: those files already live on shared ``/data`` (see
+    # _ARCHIVE_NAME_PATTERNS). When the run dir is locally visible, copy the
+    # journal set directly and skip the SSH transport entirely.
+    if _shared_fs_archive(remote_run_dir, destination):
+        return
+    name_find = " -o ".join(f"-name {shlex.quote(pattern)}" for pattern in _ARCHIVE_NAME_PATTERNS)
     script = (
         "set -euo pipefail; "
         f"cd {shlex.quote(remote_run_dir)}; "
-        "find . -type f \\( "
-        "-name 'create.jsonl' -o -name 'orchestrator-instance-status*.jsonl' "
-        "-o -name 'orchestrator-progress*.jsonl' -o -name 'task_references.json' "
-        "-o -name 'slurm-*.out'"
-        f"{task_find} \\) -print0 | tar --null -czf - --files-from -"
+        f"find . -type f \\( {name_find} \\) -print0 | tar --null -czf - --files-from -"
     )
     proc = run_bytes(
         remote_shell_argv(node, node_ip, job_id, state, script, transport),
