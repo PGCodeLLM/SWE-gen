@@ -317,10 +317,20 @@ class FakeAction:
 
 
 class FakeHeartbeat:
-    def __init__(self, failure: str | None = None) -> None:
+    def __init__(
+        self,
+        failure: str | None = None,
+        *,
+        running_after_exit: bool = False,
+    ) -> None:
         self.entered = False
         self.exited = False
         self.failure = failure
+        self.running_after_exit = running_after_exit
+
+    @property
+    def is_running(self) -> bool:
+        return self.exited and self.running_after_exit
 
     def __enter__(self) -> FakeHeartbeat:
         self.entered = True
@@ -336,14 +346,23 @@ class FakeHeartbeat:
 
 
 class FakeHeartbeatFactory:
-    def __init__(self, failure: str | None = None) -> None:
+    def __init__(
+        self,
+        failure: str | None = None,
+        *,
+        running_after_exit: bool = False,
+    ) -> None:
         self.instances: list[FakeHeartbeat] = []
         self.calls: list[dict[str, Any]] = []
         self.failure = failure
+        self.running_after_exit = running_after_exit
 
     def __call__(self, **kwargs: Any) -> FakeHeartbeat:
         self.calls.append(kwargs)
-        heartbeat = FakeHeartbeat(self.failure)
+        heartbeat = FakeHeartbeat(
+            self.failure,
+            running_after_exit=self.running_after_exit,
+        )
         self.instances.append(heartbeat)
         return heartbeat
 
@@ -608,7 +627,7 @@ def test_claim_heartbeat_exit_is_bounded_when_the_database_call_remains_blocked(
     assert elapsed < 0.5
     assert heartbeat.lease_lost is True
     assert heartbeat.failure is not None
-    assert "stop" in heartbeat.failure
+    assert "bounded cancellation" in heartbeat.failure
 
     release_heartbeat.set()
     assert heartbeat_finished.wait(timeout=1)
@@ -685,6 +704,137 @@ def test_claim_heartbeat_cancels_a_blocked_active_connection_on_exit() -> None:
         force_cleanup.set()
         unblock_heartbeat.set()
         assert heartbeat_finished.wait(timeout=1)
+
+
+def test_claim_heartbeat_does_not_use_unbounded_cancel_after_cancel_safe_failure() -> None:
+    heartbeat_started = Event()
+    unblock_heartbeat = Event()
+    heartbeat_finished = Event()
+    events: list[str] = []
+    claim = reward_claim()
+
+    class FailingSafeCancelConnection(FakeConnection):
+        def __init__(self) -> None:
+            super().__init__("safe-cancel-failure", events)
+            self.cancel_safe_calls: list[float] = []
+            self.cancel_calls = 0
+
+        def cancel_safe(self, *, timeout: float) -> None:
+            self.cancel_safe_calls.append(timeout)
+            raise TimeoutError("bounded cancellation timed out")
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+            unblock_heartbeat.set()
+
+    connection = FailingSafeCancelConnection()
+
+    class ConnectionFactory:
+        def __call__(self) -> FailingSafeCancelConnection:
+            return connection
+
+    class BlockingQueue(FakeQueue):
+        def heartbeat(
+            self,
+            current_connection: FailingSafeCancelConnection,
+            current: ClaimedMessage,
+            *,
+            visibility_timeout_seconds: int,
+        ) -> ClaimedMessage:
+            heartbeat_started.set()
+            unblock_heartbeat.wait(timeout=1)
+            heartbeat_finished.set()
+            return current
+
+    heartbeat = ClaimHeartbeat(
+        connection_factory=ConnectionFactory(),
+        queue=BlockingQueue(),
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+        cancel_timeout_seconds=0.01,
+    )
+
+    try:
+        with heartbeat:
+            assert heartbeat_started.wait(timeout=1)
+
+        assert connection.cancel_safe_calls == [0.01]
+        assert connection.cancel_calls == 0
+        assert heartbeat.failure is not None
+    finally:
+        unblock_heartbeat.set()
+        assert heartbeat_finished.wait(timeout=1)
+
+
+def test_claim_heartbeat_rolls_back_a_query_returning_after_exit() -> None:
+    heartbeat_started = Event()
+    release_query = Event()
+    connection_exited = Event()
+    events: list[str] = []
+    claim = reward_claim()
+
+    class TransactionalConnection(FakeConnection):
+        def __init__(self) -> None:
+            super().__init__("transactional-heartbeat", events)
+            self.pending_visibility = False
+            self.committed_visibility = 0
+            self.rollbacks = 0
+
+        def cancel_safe(self, *, timeout: float) -> None:
+            raise TimeoutError("query did not cancel before timeout")
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object | None,
+        ) -> None:
+            if exc_type is None and self.pending_visibility:
+                self.committed_visibility += 1
+            elif exc_type is not None:
+                self.rollbacks += 1
+            self.pending_visibility = False
+            super().__exit__(exc_type, exc, traceback)
+            connection_exited.set()
+
+    connection = TransactionalConnection()
+
+    class ConnectionFactory:
+        def __call__(self) -> TransactionalConnection:
+            return connection
+
+    class LateReturningQueue(FakeQueue):
+        def heartbeat(
+            self,
+            current_connection: TransactionalConnection,
+            current: ClaimedMessage,
+            *,
+            visibility_timeout_seconds: int,
+        ) -> ClaimedMessage:
+            heartbeat_started.set()
+            assert release_query.wait(timeout=1)
+            current_connection.pending_visibility = True
+            return current
+
+    heartbeat = ClaimHeartbeat(
+        connection_factory=ConnectionFactory(),
+        queue=LateReturningQueue(),
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+        cancel_timeout_seconds=0.01,
+    )
+
+    with heartbeat:
+        assert heartbeat_started.wait(timeout=1)
+
+    release_query.set()
+    assert connection_exited.wait(timeout=1)
+    assert connection.committed_visibility == 0
+    assert connection.rollbacks == 1
 
 
 def test_claim_heartbeat_does_not_run_after_a_late_connection_acquisition() -> None:
@@ -800,6 +950,32 @@ def test_worker_leaves_a_failed_heartbeat_for_pgmq_recovery_without_stale_mutati
     assert worker.queue.dead_letters == []
     assert worker.store.stage_results == []
     assert worker.store.terminal_failures == []
+
+
+def test_worker_quarantines_after_a_heartbeat_thread_outlives_join(
+    tmp_path: Path,
+) -> None:
+    first_claim = reward_claim()
+    second_claim = pipeline_claim(PipelineStage.REWARD, msg_id=72)
+    action = FakeAction(StageExecution.succeeded({"score": 1}))
+    worker = make_worker(
+        tmp_path,
+        claims=[first_claim, second_claim],
+        action=action,
+        heartbeat_factory=FakeHeartbeatFactory(
+            "visibility heartbeat did not stop before the join timeout",
+            running_after_exit=True,
+        ),
+    )
+
+    assert worker.run_once() is True
+    assert worker.run_once() is False
+
+    assert worker.stop_event.is_set() is True
+    assert len(worker.queue.claim_calls) == 1
+    assert len(action.calls) == 1
+    assert worker.queue.handoffs == []
+    assert worker.queue.retries == []
 
 
 def test_success_records_result_and_constructs_the_exact_sole_successor(

@@ -82,6 +82,9 @@ class HeartbeatContext(Protocol):
     @property
     def failure(self) -> str | None: ...
 
+    @property
+    def is_running(self) -> bool: ...
+
     def __enter__(self) -> HeartbeatContext: ...
 
     def __exit__(
@@ -335,6 +338,8 @@ class ClaimHeartbeat:
                             current,
                             visibility_timeout_seconds=self._visibility_timeout_seconds,
                         )
+                        if self._stopped.is_set():
+                            raise LeaseOwnershipError("heartbeat completed after its stop request")
                         self._validate_heartbeat_claim(current, updated)
                         current = updated
                     finally:
@@ -356,16 +361,11 @@ class ClaimHeartbeat:
         if callable(cancel_safe):
             try:
                 cancel_safe(timeout=self._cancel_timeout_seconds)
-                return
             except Exception as error:
                 self._record_failure(error)
+            return
 
-        cancel = getattr(connection, "cancel", None)
-        if callable(cancel):
-            try:
-                cancel()
-            except Exception as error:
-                self._record_failure(error)
+        self._record_failure("active heartbeat connection has no bounded cancellation method")
 
     def _record_failure(self, error: BaseException | str) -> str:
         safe_error = (
@@ -526,6 +526,13 @@ class PipelineWorker:
                             raise TypeError("stage action must return a StageExecution")
                     except Exception as error:
                         action_error = error
+                if heartbeat.is_running:
+                    self.stop_event.set()
+                    stale_claim = True
+                    raise LeaseOwnershipError(
+                        heartbeat.failure
+                        or "visibility heartbeat thread remained active after shutdown"
+                    )
                 if heartbeat.failure is not None:
                     stale_claim = True
                     raise LeaseOwnershipError(heartbeat.failure)
