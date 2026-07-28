@@ -74,6 +74,28 @@ class FakeSlurmClient:
             self.states[job_id] = "CANCELLED"
 
 
+class FakeServiceManager(control.ServiceManager):
+    def __init__(self):
+        self.stopped: list[str] = []
+        self.started: list[str] = []
+        self._active: set[str] = set(control.STAGE_WORKER_SERVICES)
+
+    def stop(self, services):
+        stopped = [service for service in services if service in self._active]
+        self.stopped.extend(stopped)
+        self._active -= set(stopped)
+        return stopped
+
+    def start(self, services):
+        started = [service for service in services if service not in self._active]
+        self.started.extend(started)
+        self._active |= set(started)
+        return started
+
+    def is_active(self, service):
+        return service in self._active
+
+
 def write_plan(
     path: Path,
     routes=None,
@@ -253,6 +275,7 @@ def reconciler(config_path, workspace, client, now, **kwargs):
         health_action=kwargs.get("health_action", default_health),
         launch_action=kwargs.get("launch_action"),
         sleep_fn=lambda _seconds: None,
+        service_manager=kwargs.get("service_manager"),
     )
 
 
@@ -1187,3 +1210,167 @@ def test_controller_yaml_writes_use_shared_lock_and_mode_0600(tmp_path, monkeypa
     assert path.with_name(path.name + ".lock").is_file()
     assert control.fcntl.LOCK_EX in calls
     assert control.fcntl.LOCK_UN in calls
+
+
+def test_circuit_breaker_trip_stops_stage_workers(tmp_path) -> None:
+    now = datetime(2026, 7, 22, 6, 30, tzinfo=UTC)
+    config_path, workspace, run_dir, _plan = write_config(tmp_path, threshold=2)
+    status_path = (
+        run_dir / "slurm-nodes" / NODES[0] / "orchestrator-instance-status-sg-n1-a-r9.jsonl"
+    )
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "timestamp": control.now_iso(now - timedelta(seconds=index)),
+                    "status": "failure",
+                    "failure_reason": "Transient network/API error",
+                    "instance": f"task-{index}",
+                }
+            )
+            + "\n"
+            for index in (1, 2)
+        )
+    )
+    client = FakeSlurmClient({str(101 + index): "RUNNING" for index in range(4)})
+    services = FakeServiceManager()
+
+    result = reconciler(
+        config_path, workspace, client, now, service_manager=services
+    ).reconcile_once()
+
+    assert result["controller"]["last_action"] == "circuit_breaker_tripped"
+    assert result["controller"]["stage_workers_action"] == "stopped"
+    assert services.stopped == list(control.STAGE_WORKER_SERVICES)
+
+
+def test_explicit_breaker_reset_starts_stage_workers(tmp_path) -> None:
+    now = datetime(2026, 7, 22, 6, 30, tzinfo=UTC)
+    config_path, workspace, run_dir, _plan = write_config(tmp_path, threshold=2)
+    status_path = (
+        run_dir / "slurm-nodes" / NODES[0] / "orchestrator-instance-status-sg-n1-a-r9.jsonl"
+    )
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "timestamp": control.now_iso(now - timedelta(seconds=index)),
+                    "status": "failure",
+                    "failure_reason": "Transient network/API error",
+                    "instance": f"task-{index}",
+                }
+            )
+            + "\n"
+            for index in (1, 2)
+        )
+    )
+    client = FakeSlurmClient({str(101 + index): "RUNNING" for index in range(4)})
+    services = FakeServiceManager()
+
+    reconciler(config_path, workspace, client, now, service_manager=services).reconcile_once()
+    assert services.stopped == list(control.STAGE_WORKER_SERVICES)
+
+    config = yaml.safe_load(config_path.read_text())
+    config["desired_state"] = "running"
+    config["metadata"]["circuit_breaker_reset_requested_at"] = control.now_iso(
+        now + timedelta(seconds=3)
+    )
+    control.atomic_yaml(config_path, config)
+
+    result = reconciler(
+        config_path,
+        workspace,
+        client,
+        now + timedelta(seconds=4),
+        service_manager=services,
+    ).reconcile_once()
+
+    assert result["controller"]["stage_workers_action"] == "started"
+    assert services.started == list(control.STAGE_WORKER_SERVICES)
+
+
+def test_desired_state_paused_stops_stage_workers(tmp_path) -> None:
+    now = datetime(2026, 7, 22, 6, 30, tzinfo=UTC)
+    config_path, workspace, _run_dir, _plan = write_config(tmp_path, desired="paused")
+    client = FakeSlurmClient({str(101 + index): "RUNNING" for index in range(4)})
+    services = FakeServiceManager()
+
+    result = reconciler(
+        config_path, workspace, client, now, service_manager=services
+    ).reconcile_once()
+
+    assert result["controller"]["last_action"] == "paused"
+    assert result["controller"]["stage_workers_action"] == "stopped"
+    assert services.stopped == list(control.STAGE_WORKER_SERVICES)
+
+
+def test_resume_starts_stage_workers(tmp_path) -> None:
+    now = datetime(2026, 7, 22, 6, 30, tzinfo=UTC)
+    config_path, workspace, _run_dir, _plan = write_config(tmp_path, desired="paused")
+    client = FakeSlurmClient({str(101 + index): "SUSPENDED" for index in range(4)})
+    services = FakeServiceManager()
+
+    result = reconciler(
+        config_path, workspace, client, now, service_manager=services
+    ).reconcile_once()
+    assert result["controller"]["stage_workers_action"] == "none"
+
+    config = yaml.safe_load(config_path.read_text())
+    config["desired_state"] = "running"
+    control.atomic_yaml(config_path, config)
+
+    result = reconciler(
+        config_path,
+        workspace,
+        client,
+        now + timedelta(seconds=1),
+        service_manager=services,
+    ).reconcile_once()
+
+    assert result["controller"]["last_action"] == "resumed"
+    assert result["controller"]["stage_workers_action"] == "started"
+
+
+def test_enforce_breaker_pause_stops_stage_workers(tmp_path) -> None:
+    now = datetime(2026, 7, 22, 6, 30, tzinfo=UTC)
+    config_path, workspace, run_dir, _plan = write_config(tmp_path, threshold=2)
+    status_path = (
+        run_dir / "slurm-nodes" / NODES[0] / "orchestrator-instance-status-sg-n1-a-r9.jsonl"
+    )
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "timestamp": control.now_iso(now - timedelta(seconds=index)),
+                    "status": "failure",
+                    "failure_reason": "Transient network/API error",
+                    "instance": f"task-{index}",
+                }
+            )
+            + "\n"
+            for index in (1, 2)
+        )
+    )
+    client = FakeSlurmClient({str(101 + index): "RUNNING" for index in range(4)})
+    services = FakeServiceManager()
+
+    reconciler(config_path, workspace, client, now, service_manager=services).reconcile_once()
+
+    client.states["101"] = "RUNNING"
+    services._active = set(control.STAGE_WORKER_SERVICES)
+    services.stopped.clear()
+
+    result = reconciler(
+        config_path,
+        workspace,
+        client,
+        now + timedelta(seconds=5),
+        service_manager=services,
+    ).reconcile_once()
+
+    assert result["controller"]["last_action"] == "enforce_breaker_pause"
+    assert result["controller"]["stage_workers_action"] == "stopped"
+    assert services.stopped == list(control.STAGE_WORKER_SERVICES)

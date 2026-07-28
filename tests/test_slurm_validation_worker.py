@@ -1212,6 +1212,10 @@ def test_worker_loads_only_its_shard_from_shared_ledger(tmp_path, monkeypatch) -
     # load only instances it owns, so it never resumes another shard's in-flight
     # work (which would double-process across nodes).
     instances = [f"owner__repo-{i}" for i in range(120)]
+    proxy_env = tmp_path / "proxy.env"
+    proxy_env.write_text("")
+    ca_bundle = tmp_path / "combined-ca.crt"
+    ca_bundle.write_text("test ca\n")
     ledger = tmp_path / "postcheck-status.jsonl"
     with ledger.open("w") as fh:
         for inst in instances:
@@ -1235,6 +1239,8 @@ def test_worker_loads_only_its_shard_from_shared_ledger(tmp_path, monkeypatch) -
             "--worker-dir", str(tmp_path / "wd"),
             "--shard-index", "1",
             "--shard-count", "3",
+            "--proxy-env", str(proxy_env),
+            "--ca-bundle", str(ca_bundle),
             "--once",
         ]
     )

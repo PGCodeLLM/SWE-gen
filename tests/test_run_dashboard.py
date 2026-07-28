@@ -275,6 +275,44 @@ def test_unprocessed_tombstone_hides_failure_until_a_later_retry(tmp_path) -> No
     assert order == ["owner__repo-1"]
 
 
+def test_unprocessed_tombstone_resets_failure_and_beats_older_ledger(
+    tmp_path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_jsonl = tmp_path / "input.jsonl"
+    input_jsonl.write_text("{}\n" * 3)
+    write_jsonl(
+        run_dir / "orchestrator-instance-status.jsonl",
+        [
+            {"instance": "retry", "status": "failure", "timestamp": "1"},
+            {"instance": "done", "status": "failure", "timestamp": "1"},
+        ],
+    )
+    write_jsonl(
+        run_dir / "orchestrator-instance-status-reset-r9.jsonl",
+        [{"instance": "retry", "status": "unprocessed", "timestamp": "3"}],
+    )
+    write_jsonl(
+        run_dir / "create.jsonl",
+        [
+            {"task_id": "retry", "ts": "2", "harbor": "/tasks/retry"},
+            {"task_id": "done", "ts": "2", "harbor": "/tasks/done"},
+        ],
+    )
+    monkeypatch.setattr("run_dashboard.active_instances", lambda _run_dir: [])
+
+    status = calculate_status(run_dir, input_jsonl)
+
+    assert status["success"] == 1
+    assert status["failure"] == 0
+    assert status["processed"] == 1
+    assert status["remaining"] == 2
+    assert status["completion_percent"] == 33.33
+    assert status["recent"][0]["instance"] == "retry"
+    assert status["recent"][0]["status"] == "unprocessed"
+
+
 def test_calculate_status_merges_journals_and_success_ledger(tmp_path, monkeypatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -558,29 +596,31 @@ def test_dashboard_renders_slurm_nodes_with_text_content() -> None:
     assert 'id="controlToken" type="password"' in DASHBOARD_HTML
     assert "sessionStorage" in DASHBOARD_HTML
     assert "X-SWEGEN-Control-Token" in DASHBOARD_HTML
-    assert "Stage I" in DASHBOARD_HTML
-    assert "Stage II" in DASHBOARD_HTML
-    assert "Reward-hack filter" in DASHBOARD_HTML
+    assert "Stage 1" in DASHBOARD_HTML
+    assert "Stage 2" in DASHBOARD_HTML
+    assert "Stage 3" in DASHBOARD_HTML
+    assert "Reward Hack Filter" in DASHBOARD_HTML
     assert "NOP=0 and Oracle=1" in DASHBOARD_HTML
-    assert "Explicit Oracle=0 only" in DASHBOARD_HTML
-    assert "Runs only on Stage I green tasks" in DASHBOARD_HTML
-    assert 'id="stageOneGreenBar"' in DASHBOARD_HTML
-    assert 'id="stageOneRedBar"' in DASHBOARD_HTML
-    assert 'id="stageOneGrayBar"' in DASHBOARD_HTML
+    assert "Runs only on Stage 2 green" in DASHBOARD_HTML
+    assert 'id="stageSwegenGreenBar"' in DASHBOARD_HTML
+    assert 'id="stageSwegenRedBar"' in DASHBOARD_HTML
+    assert 'id="stageSwegenGrayBar"' in DASHBOARD_HTML
     assert 'id="stageOneThroughput"' in DASHBOARD_HTML
     assert "Processed per 15 minutes" in DASHBOARD_HTML
     assert "throughput-segment" in DASHBOARD_HTML
-    assert "Oracle rejected" in DASHBOARD_HTML
-    assert "successful" in DASHBOARD_HTML
-    assert "unprocessed" in DASHBOARD_HTML
-    assert 'id="stageTwoGreenBar"' in DASHBOARD_HTML
-    assert 'id="stageTwoRedBar"' in DASHBOARD_HTML
-    assert 'id="stageTwoGrayBar"' in DASHBOARD_HTML
-    assert 'id="stageOneHealth"' in DASHBOARD_HTML
-    assert 'id="stageTwoHealth"' in DASHBOARD_HTML
-    assert "baseline.baseline_active_count" in DASHBOARD_HTML
-    assert "baseline.baseline_concurrency" in DASHBOARD_HTML
-    assert "NOP/Oracle ${fmt(baselineActive)}/${fmt(baselineCapacity)} active" in DASHBOARD_HTML
+    assert "Oracle passed" in DASHBOARD_HTML
+    assert "Oracle failed" in DASHBOARD_HTML
+    assert 'id="stageNopOracleGreenBar"' in DASHBOARD_HTML
+    assert 'id="stageNopOracleRedBar"' in DASHBOARD_HTML
+    assert 'id="stageNopOracleGrayBar"' in DASHBOARD_HTML
+    assert 'id="stageRewardGreenBar"' in DASHBOARD_HTML
+    assert 'id="stageRewardRedBar"' in DASHBOARD_HTML
+    assert 'id="stageRewardGrayBar"' in DASHBOARD_HTML
+    assert "Accepted" in DASHBOARD_HTML
+    assert "Filtered" in DASHBOARD_HTML
+    assert "renderWorkerRow('stageSwegenWorker'" in DASHBOARD_HTML
+    assert "renderWorkerRow('stageNopOracleWorker'" in DASHBOARD_HTML
+    assert "renderWorkerRow('stageRewardWorker'" in DASHBOARD_HTML
     assert "NOP and Oracle remain sequential" not in LEGACY_DASHBOARD_HTML
     assert "worker.baseline_active_count" in LEGACY_DASHBOARD_HTML
     assert "worker.baseline_concurrency" in LEGACY_DASHBOARD_HTML

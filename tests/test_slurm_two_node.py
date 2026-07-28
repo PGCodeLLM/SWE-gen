@@ -88,7 +88,7 @@ def test_four_node_route_workers_set_total_concurrency(value, expected_total) ->
 
 @pytest.mark.parametrize(
     "value",
-    ["4,4", "4,4,4,4", "4,invalid,4", "0,0,0", "12,4,4", "-1,4,4"],
+    ["4,4", "4,4,4,4", "4,invalid,4", "0,0,0", "13,4,4", "-1,4,4"],
 )
 def test_four_node_route_workers_reject_invalid_vectors(value) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
@@ -839,7 +839,7 @@ def test_slurm_worker_uses_authenticated_quota_and_isolated_docker_configs() -> 
     assert "env.HTTP_PROXY" in launcher
     assert 'export DOCKER_CONFIG="$SWEGEN_DOCKER_CONFIG_DIR"' in launcher
     assert "umask 0077" in worker
-    assert "groups_per_route=2" in worker
+    assert "groups_per_route=3" in worker
     assert "group_index < groups_per_route" in worker
     assert "--skip-preflight) skip_preflight=1" in worker
     assert "preflight skipped by explicit operator request" in worker

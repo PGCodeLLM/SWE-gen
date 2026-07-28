@@ -1009,7 +1009,7 @@ def collect_latest_statuses(
     latest, _order = load_latest_statuses(
         status_journal_paths(run_dir),
         run_dir=run_dir,
-        include_unprocessed=include_unprocessed,
+        include_unprocessed=True,
     )
     for ledger_path in success_ledger_paths(run_dir):
         for instance, success_record in load_success_ledger(ledger_path, run_dir=run_dir).items():
@@ -1027,6 +1027,13 @@ def collect_latest_statuses(
                 _copy_node_identity(success_record, current)
                 _copy_validation_evidence(success_record, current)
                 latest[instance] = success_record
+
+    if not include_unprocessed:
+        latest = {
+            instance: record
+            for instance, record in latest.items()
+            if record.get("status") != "unprocessed"
+        }
 
     order = sorted(
         latest,
@@ -1753,7 +1760,7 @@ def _stage_worker_block(spec: dict[str, Any]) -> dict[str, Any]:
 def calculate_status(
     run_dir: Path, input_jsonl: Path, total_entries: int | None = None
 ) -> dict[str, Any]:
-    latest, order = collect_latest_statuses(run_dir)
+    latest, _order = collect_latest_statuses(run_dir)
     throughput_latest, _throughput_order = collect_latest_statuses(
         run_dir,
         include_unprocessed=True,
@@ -1913,8 +1920,8 @@ def calculate_status(
     }
 
     recent = []
-    for instance in order[:25]:
-        record = latest[instance]
+    for instance in _throughput_order[:25]:
+        record = throughput_latest[instance]
         recent.append(
             {
                 "instance": instance,

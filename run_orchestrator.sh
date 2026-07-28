@@ -85,8 +85,10 @@ fi
 # `docker-container` driver, which spawns a separate `buildx_buildkit_*`
 # container (a full buildkitd, ~60-75 threads) PER concurrent build. At
 # validation/generation concurrency, dozens of those buildkitd instances
-# collectively deadlock the shared host dockerd/containerd on futexes,
-# stalling all builds. One shared daemon BuildKit removes the multiplication.
+# collectively deadlock the shared host dockerd/containerd on futexes
+# (dockerd ~190/199 threads futex-blocked), stalling all builds. One shared
+# daemon BuildKit removes the multiplication. COMPOSE_BAKE=false keeps compose
+# from delegating to a bake/container builder.
 export DOCKER_BUILDKIT=1
 export BUILDX_BUILDER=default
 export COMPOSE_BAKE=false
