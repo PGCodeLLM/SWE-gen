@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from swegen.create.claude_code_utils import redact_sensitive_text
 from swegen.pipeline.models import (
@@ -29,6 +29,7 @@ MAX_STORED_ERROR_CHARS = 4_000
 
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_STAGING_DIRECTORY_PREFIX = ".swegen-task-"
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -379,67 +380,204 @@ def _validate_task_files(
     return tuple(sorted(task_files, key=lambda task_file: task_file.path))
 
 
-def _reject_symlinked_destination_components(destination: Path) -> Path:
-    absolute = Path(os.path.abspath(destination))
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current /= part
-        try:
-            current_stat = os.lstat(current)
-        except FileNotFoundError:
-            break
-        except OSError as error:
-            raise TaskFileError(f"cannot inspect destination path {current}: {error}") from error
-        if stat.S_ISLNK(current_stat.st_mode):
-            raise TaskFileError(f"destination path must not contain a symlink: {current}")
-    return absolute
-
-
-def _prepare_destination(destination: Path) -> int:
-    destination = _reject_symlinked_destination_components(destination)
+def _open_destination_parent(destination: Path) -> tuple[int, str, Path]:
     try:
-        destination_stat = os.lstat(destination)
-    except FileNotFoundError:
-        try:
-            os.mkdir(destination, 0o755)
-        except OSError as error:
-            raise TaskFileError(
-                f"cannot create destination directory {destination}: {error}"
-            ) from error
+        absolute = Path(os.path.abspath(destination))
+    except (OSError, TypeError, ValueError) as error:
+        raise TaskFileError(f"invalid destination path {destination!r}: {error}") from error
+    if len(absolute.parts) < 2:
+        raise TaskFileError("destination must name a directory below the filesystem root")
+
+    final_name = absolute.parts[-1]
+    if final_name in {"", ".", ".."} or "\x00" in final_name:
+        raise TaskFileError("destination must have a safe final path component")
+    try:
+        parent_fd = os.open(absolute.anchor, _DIRECTORY_OPEN_FLAGS)
+    except (OSError, ValueError) as error:
+        raise TaskFileError(
+            f"cannot safely open destination root {absolute.anchor!r}: {error}"
+        ) from error
+
+    traversed = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:-1]:
+            traversed /= part
+            try:
+                child_fd = os.open(part, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+            except (OSError, ValueError) as error:
+                try:
+                    observed = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+                except (OSError, ValueError):
+                    observed = None
+                if observed is not None and stat.S_ISLNK(observed.st_mode):
+                    raise TaskFileError(
+                        f"destination path must not contain a symlink: {traversed}"
+                    ) from error
+                raise TaskFileError(
+                    f"cannot safely open destination ancestor {traversed}: {error}"
+                ) from error
+            os.close(parent_fd)
+            parent_fd = child_fd
+        return parent_fd, final_name, absolute
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _directory_is_empty(directory_fd: int, destination: Path) -> None:
+    try:
+        with os.scandir(directory_fd) as entries:
+            if next(entries, None) is not None:
+                raise TaskFileError(f"destination directory must be empty: {destination}")
+    except TaskFileError:
+        raise
     except OSError as error:
+        raise TaskFileError(f"cannot scan destination directory {destination}: {error}") from error
+
+
+def _inspect_destination(
+    parent_fd: int,
+    final_name: str,
+    destination: Path,
+) -> tuple[int | None, os.stat_result | None]:
+    try:
+        observed = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as error:
         raise TaskFileError(
             f"cannot inspect destination directory {destination}: {error}"
         ) from error
-    else:
-        if stat.S_ISLNK(destination_stat.st_mode):
-            raise TaskFileError(f"destination must not be a symlink: {destination}")
-        if not stat.S_ISDIR(destination_stat.st_mode):
-            raise TaskFileError(f"destination is not a directory: {destination}")
-        try:
-            with os.scandir(destination) as entries:
-                if next(entries, None) is not None:
-                    raise TaskFileError(f"destination directory must be empty: {destination}")
-        except TaskFileError:
-            raise
-        except OSError as error:
-            raise TaskFileError(
-                f"cannot scan destination directory {destination}: {error}"
-            ) from error
 
+    if stat.S_ISLNK(observed.st_mode):
+        raise TaskFileError(f"destination must not be a symlink: {destination}")
+    if not stat.S_ISDIR(observed.st_mode):
+        raise TaskFileError(f"destination is not a directory: {destination}")
     try:
-        destination_fd = os.open(destination, _DIRECTORY_OPEN_FLAGS)
-    except OSError as error:
+        destination_fd = os.open(final_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    except (OSError, ValueError) as error:
         raise TaskFileError(
             f"cannot safely open destination directory {destination}: {error}"
         ) from error
     try:
-        with os.scandir(destination_fd) as entries:
-            if next(entries, None) is not None:
-                raise TaskFileError(f"destination directory must be empty: {destination}")
+        opened = os.fstat(destination_fd)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_entry(observed, opened):
+            raise TaskFileError(
+                f"destination directory changed while being inspected: {destination}"
+            )
+        _directory_is_empty(destination_fd, destination)
+        return destination_fd, opened
     except BaseException:
         os.close(destination_fd)
         raise
-    return destination_fd
+
+
+def _create_staging_directory(parent_fd: int) -> tuple[str, int]:
+    for _ in range(16):
+        staging_name = f"{_STAGING_DIRECTORY_PREFIX}{uuid4().hex}"
+        try:
+            os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        except (OSError, ValueError) as error:
+            raise TaskFileError(f"cannot create task staging directory: {error}") from error
+        try:
+            observed = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+            staging_fd = os.open(staging_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(staging_fd)
+            if not stat.S_ISDIR(opened.st_mode) or not _same_entry(observed, opened):
+                raise TaskFileError("task staging directory changed while being opened")
+            return staging_name, staging_fd
+        except BaseException:
+            try:
+                os.rmdir(staging_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
+    raise TaskFileError("could not allocate a unique task staging directory")
+
+
+def _clear_directory(directory_fd: int) -> None:
+    try:
+        with os.scandir(directory_fd) as entries:
+            ordered_entries = sorted(entries, key=lambda entry: entry.name)
+    except OSError as error:
+        raise TaskFileError(
+            f"cannot scan task staging directory during cleanup: {error}"
+        ) from error
+
+    for entry in ordered_entries:
+        try:
+            observed = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                child_fd = os.open(entry.name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if not stat.S_ISDIR(opened.st_mode) or not _same_entry(observed, opened):
+                        raise TaskFileError("task staging directory changed while being cleaned")
+                    _clear_directory(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(entry.name, dir_fd=directory_fd)
+            else:
+                os.unlink(entry.name, dir_fd=directory_fd)
+        except TaskFileError:
+            raise
+        except (OSError, ValueError) as error:
+            raise TaskFileError(
+                f"cannot clean task staging entry {entry.name!r}: {error}"
+            ) from error
+
+
+def _cleanup_staging_directory(parent_fd: int, staging_name: str, staging_fd: int) -> None:
+    try:
+        _clear_directory(staging_fd)
+    finally:
+        os.close(staging_fd)
+    try:
+        os.rmdir(staging_name, dir_fd=parent_fd)
+    except (OSError, ValueError) as error:
+        raise TaskFileError(f"cannot remove task staging directory: {error}") from error
+
+
+def _require_destination_unchanged(
+    parent_fd: int,
+    final_name: str,
+    destination: Path,
+    existing_fd: int | None,
+    existing_stat: os.stat_result | None,
+) -> None:
+    if existing_fd is None:
+        try:
+            os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            raise TaskFileError(
+                f"cannot recheck destination directory {destination}: {error}"
+            ) from error
+        raise TaskFileError(
+            f"destination appeared while task files were being written: {destination}"
+        )
+
+    try:
+        current = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        opened = os.fstat(existing_fd)
+    except (OSError, ValueError) as error:
+        raise TaskFileError(
+            f"destination changed while task files were being written: {error}"
+        ) from error
+    if (
+        existing_stat is None
+        or stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or not _same_entry(existing_stat, current)
+        or not _same_entry(opened, current)
+    ):
+        raise TaskFileError(
+            f"destination changed while task files were being written: {destination}"
+        )
+    _directory_is_empty(existing_fd, destination)
 
 
 def _write_all(file_fd: int, content: bytes) -> None:
@@ -471,7 +609,7 @@ def _materialize_one(destination_fd: int, task_file: TaskFile) -> None:
             os.fchmod(file_fd, task_file.mode)
         finally:
             os.close(file_fd)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise TaskFileError(
             f"cannot safely materialize task file {task_file.path!r}: {error}"
         ) from error
@@ -480,19 +618,67 @@ def _materialize_one(destination_fd: int, task_file: TaskFile) -> None:
 
 
 def materialize_task_files(files: Iterable[TaskFile], destination: Path) -> None:
-    """Write verified task records into a new or empty disposable directory."""
+    """Atomically publish verified task records into a new or empty directory."""
 
     task_files = _validate_task_files(files, verify_integrity=True)
     try:
         destination = Path(destination)
     except TypeError as error:
         raise TaskFileError("destination must be a filesystem path") from error
-    destination_fd = _prepare_destination(destination)
+
+    parent_fd, final_name, absolute_destination = _open_destination_parent(destination)
+    existing_fd: int | None = None
+    existing_stat: os.stat_result | None = None
+    staging_name: str | None = None
+    staging_fd: int | None = None
     try:
+        existing_fd, existing_stat = _inspect_destination(
+            parent_fd,
+            final_name,
+            absolute_destination,
+        )
+        staging_name, staging_fd = _create_staging_directory(parent_fd)
         for task_file in task_files:
-            _materialize_one(destination_fd, task_file)
+            _materialize_one(staging_fd, task_file)
+        os.fchmod(staging_fd, 0o755)
+        _require_destination_unchanged(
+            parent_fd,
+            final_name,
+            absolute_destination,
+            existing_fd,
+            existing_stat,
+        )
+        try:
+            os.rename(
+                staging_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        except (OSError, ValueError) as error:
+            raise TaskFileError(
+                f"cannot publish task files to destination {absolute_destination}: {error}"
+            ) from error
+        os.close(staging_fd)
+        staging_fd = None
+        staging_name = None
+    except BaseException as error:
+        if staging_name is not None and staging_fd is not None:
+            try:
+                _cleanup_staging_directory(parent_fd, staging_name, staging_fd)
+            except TaskFileError as cleanup_error:
+                raise TaskFileError(
+                    f"task materialization failed and staging cleanup also failed: {cleanup_error}"
+                ) from error
+            staging_fd = None
+            staging_name = None
+        raise
     finally:
-        os.close(destination_fd)
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if existing_fd is not None:
+            os.close(existing_fd)
+        os.close(parent_fd)
 
 
 def _require_task_identity(task_id: object, task_version: object) -> tuple[str, int]:
@@ -560,6 +746,29 @@ def _decode_task_file(row: object) -> TaskFile:
 
 def _json_payload(value: dict[str, object]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _redact_json_value(value: object) -> object:
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, dict):
+        redacted: dict[str, object] = {}
+        for key, item in value.items():
+            redacted_key = redact_sensitive_text(key)
+            if redacted_key in redacted:
+                raise TaskStoreError("result redaction produced duplicate JSON object keys")
+            redacted[redacted_key] = _redact_json_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    return value
+
+
+def _redact_json_object(value: dict[str, object]) -> dict[str, object]:
+    redacted = _redact_json_value(value)
+    if not isinstance(redacted, dict):
+        raise TaskStoreError("stage result must remain a JSON object after redaction")
+    return redacted
 
 
 def _require_aware_datetime(name: str, value: object) -> datetime:
@@ -679,7 +888,7 @@ class TaskStore:
 
         if not isinstance(task, PipelineTask):
             raise TypeError("task must be a PipelineTask")
-        task_files = _validate_task_files(files, verify_integrity=False)
+        task_files = _validate_task_files(files, verify_integrity=True)
         self._replace_files_by_identity(
             connection,
             task.task_id,
@@ -732,7 +941,7 @@ class TaskStore:
             raise ValueError("started_at must not be after the completion clock")
 
         message = claim.message
-        task_files = _validate_task_files(execution.files, verify_integrity=False)
+        task_files = _validate_task_files(execution.files, verify_integrity=True)
         generate_success = (
             message.stage is PipelineStage.GENERATE
             and execution.status is StageResultStatus.SUCCEEDED
@@ -742,7 +951,7 @@ class TaskStore:
         if task_files and not generate_success:
             raise TaskFileError("only successful generate results may contain task files")
 
-        result = execution.result_json()
+        result = _redact_json_object(execution.result_json())
         push_fields: tuple[str, str | None, str] | None = None
         if message.stage is PipelineStage.PUSH and execution.status is StageResultStatus.SUCCEEDED:
             push_fields = _push_inventory_fields(result)

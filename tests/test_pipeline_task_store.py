@@ -26,6 +26,7 @@ from swegen.queueing.models import (
 
 EVENT_ID = UUID("11111111-1111-4111-8111-111111111111")
 TRACE_ID = UUID("22222222-2222-4222-8222-222222222222")
+SECRET_TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz"
 STARTED_AT = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 FINISHED_AT = datetime(2026, 7, 28, 12, 5, tzinfo=UTC)
 ENQUEUED_AT = datetime(2026, 7, 28, 11, 59, tzinfo=UTC)
@@ -520,6 +521,99 @@ def test_materialize_task_files_rejects_symlinked_destination_parents(tmp_path: 
     assert not (outside / "out").exists()
 
 
+def test_materialize_task_files_rejects_an_ancestor_swap_without_writing_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swegen.pipeline import task_store
+
+    ancestor = tmp_path / "ancestor"
+    ancestor.mkdir()
+    original_ancestor = tmp_path / "ancestor-original"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = ancestor / "out"
+    real_open = task_store.os.open
+    real_mkdir = task_store.os.mkdir
+    swapped = False
+
+    def swap_ancestor() -> None:
+        nonlocal swapped
+        ancestor.rename(original_ancestor)
+        ancestor.symlink_to(outside, target_is_directory=True)
+        swapped = True
+
+    def racing_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if not swapped and dir_fd is not None and os.fspath(path) == ancestor.name:
+            swap_ancestor()
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def racing_mkdir(
+        path: os.PathLike[str] | str,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if not swapped and dir_fd is None and os.fspath(path) == str(destination):
+            swap_ancestor()
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(task_store.os, "open", racing_open)
+    monkeypatch.setattr(task_store.os, "mkdir", racing_mkdir)
+
+    with pytest.raises(task_store.TaskFileError, match="destination|symlink|open"):
+        task_store.materialize_task_files((make_task_file(),), destination)
+
+    assert swapped is True
+    assert not (outside / "out" / "instruction.md").exists()
+
+
+@pytest.mark.parametrize("preexisting_destination", [False, True])
+def test_materialize_task_files_cleans_staging_after_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting_destination: bool,
+) -> None:
+    from swegen.pipeline import task_store
+
+    destination = tmp_path / "out"
+    if preexisting_destination:
+        destination.mkdir()
+    files = (
+        make_task_file("a.txt", b"first"),
+        make_task_file("b.txt", b"second"),
+    )
+    real_write_all = task_store._write_all
+    real_write = task_store.os.write
+    write_count = 0
+
+    def fail_during_second_write(file_descriptor: int, content: bytes) -> None:
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            real_write(file_descriptor, content[:1])
+            raise OSError("injected mid-write failure")
+        real_write_all(file_descriptor, content)
+
+    monkeypatch.setattr(task_store, "_write_all", fail_during_second_write)
+
+    with pytest.raises(task_store.TaskFileError, match="injected mid-write failure"):
+        task_store.materialize_task_files(files, destination)
+
+    if preexisting_destination:
+        assert destination.is_dir()
+        assert list(destination.iterdir()) == []
+    else:
+        assert not destination.exists()
+    assert not any(path.name.startswith(".swegen-task-") for path in tmp_path.iterdir())
+
+
 @pytest.mark.parametrize(
     "row",
     [
@@ -639,6 +733,18 @@ def test_replace_files_rejects_duplicate_paths_before_sql() -> None:
     assert connection.calls == []
 
 
+def test_replace_files_rejects_digest_mismatch_before_sql() -> None:
+    from swegen.pipeline.task_store import TaskFileError, TaskStore
+
+    connection = RecordingConnection()
+    task_file = forge_task_file(digest="0" * 64)
+
+    with pytest.raises(TaskFileError, match="digest"):
+        TaskStore().replace_files(connection, make_task(), (task_file,))
+
+    assert connection.calls == []
+
+
 def test_record_generate_success_replaces_files_and_queues_validate_state() -> None:
     from swegen.pipeline.task_store import TaskStore
 
@@ -693,6 +799,27 @@ def test_record_generate_success_replaces_files_and_queues_validate_state() -> N
             ),
         ),
     ]
+
+
+def test_record_generate_success_rejects_digest_mismatch_before_sql() -> None:
+    from swegen.pipeline.task_store import TaskFileError, TaskStore
+
+    claim = make_claim(PipelineStage.GENERATE)
+    task_file = forge_task_file(digest="0" * 64)
+    execution = StageExecution.succeeded({"task_path": "generated"}, (task_file,))
+    connection = RecordingConnection()
+
+    with pytest.raises(TaskFileError, match="digest"):
+        TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+            connection,
+            claim,
+            execution,
+            started_at=STARTED_AT,
+            worker_id="worker-1",
+            node_name="node-a",
+        )
+
+    assert connection.calls == []
 
 
 def test_duplicate_stage_result_has_no_task_file_or_inventory_mutations() -> None:
@@ -853,6 +980,91 @@ def test_expected_rejection_marks_the_task_rejected_without_files() -> None:
             ),
         ),
     ]
+
+
+@pytest.mark.parametrize("status", ["succeeded", "rejected", "failed"])
+def test_record_stage_result_redacts_nested_json_without_mutating_execution(status: str) -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    result: dict[str, object] = {
+        "message": f"token {SECRET_TOKEN}",
+        "nested": {
+            f"secret-{SECRET_TOKEN}": [
+                SECRET_TOKEN,
+                {"authorization": f"Bearer {SECRET_TOKEN}"},
+                7,
+                True,
+                None,
+            ]
+        },
+    }
+    if status == "rejected":
+        result["reason"] = f"rejected {SECRET_TOKEN}"
+        execution = StageExecution.rejected(result)
+    elif status == "failed":
+        result["error"] = f"failed {SECRET_TOKEN}"
+        execution = StageExecution.failed(result)
+    else:
+        execution = StageExecution.succeeded(result)
+    original_result = execution.result_json()
+    claim = make_claim(PipelineStage.VALIDATE)
+    connection = RecordingConnection(inserted_stage_result(claim), CursorResult(rowcount=1))
+
+    assert TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+        connection,
+        claim,
+        execution,
+        started_at=STARTED_AT,
+        worker_id="worker-1",
+        node_name="node-a",
+    )
+
+    stored_payload = json.loads(connection.calls[0][1][-2])
+    rendered_payload = json.dumps(stored_payload)
+    assert SECRET_TOKEN not in rendered_payload
+    assert "<REDACTED>" in rendered_payload
+    redacted_items = stored_payload["nested"]["secret-<REDACTED>"]
+    assert redacted_items[2:] == [7, True, None]
+    assert original_result == execution.result_json()
+    assert SECRET_TOKEN in json.dumps(original_result)
+    stored_error = connection.calls[0][1][-1]
+    if status == "succeeded":
+        assert stored_error is None
+    else:
+        assert SECRET_TOKEN not in stored_error
+        assert "<REDACTED>" in stored_error
+
+
+def test_successful_push_redacts_stage_and_inventory_payloads() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.PUSH)
+    execution = StageExecution.succeeded(
+        {
+            "remote_tag": "swr.example/swegen/owner__repo-123:v1",
+            "details": {"tokens": [SECRET_TOKEN, 3]},
+        }
+    )
+    connection = RecordingConnection(
+        inserted_stage_result(claim),
+        CursorResult(rowcount=1),
+        CursorResult(),
+    )
+
+    assert TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+        connection,
+        claim,
+        execution,
+        started_at=STARTED_AT,
+        worker_id="worker-1",
+        node_name="node-a",
+    )
+
+    stage_payload = connection.calls[0][1][-2]
+    inventory_payload = connection.calls[2][1][-1]
+    assert stage_payload == inventory_payload
+    assert SECRET_TOKEN not in stage_payload
+    assert json.loads(stage_payload)["details"] == {"tokens": ["<REDACTED>", 3]}
 
 
 def test_record_terminal_failure_redacts_bounds_and_marks_the_task_failed() -> None:
