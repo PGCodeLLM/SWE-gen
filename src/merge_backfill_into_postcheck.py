@@ -37,12 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from slurm_validation_worker import (  # noqa: E402
     BACKFILL_TERMINAL_STATES,
     TERMINAL_STATUSES,
-    append_private_jsonl,
-    load_latest_postchecks,
     overlay_backfill_reward,
     reward_matches,
 )
 from slurm_reward_backfill_worker import baseline_is_valid  # noqa: E402
+from swegen.ledger_repo import LedgerRepo  # noqa: E402
 
 
 def _now_iso() -> str:
@@ -82,11 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     print(f"loading shared postcheck ledger: {args.postcheck_ledger}", flush=True)
-    shared = load_latest_postchecks(args.postcheck_ledger)
+    shared = LedgerRepo(args.postcheck_ledger).load_latest()
     print(f"  {len(shared)} distinct instances in shared ledger", flush=True)
 
     print(f"loading reward-backfill ledger: {args.reward_backfill_ledger}", flush=True)
-    backfill = load_latest_postchecks(args.reward_backfill_ledger)
+    backfill = LedgerRepo(args.reward_backfill_ledger).load_latest()
     print(f"  {len(backfill)} distinct instances in backfill ledger", flush=True)
 
     merged = 0
@@ -133,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         merged += 1
 
         if not args.dry_run:
-            append_private_jsonl(args.postcheck_ledger, record)
+            LedgerRepo(args.postcheck_ledger).append(record)
 
         if args.limit and merged >= args.limit:
             break
