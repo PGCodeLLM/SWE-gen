@@ -34,6 +34,7 @@ dependencies = [
     "harbor>=0.1.41",
     "httpx[socks]",
     "pysocks",
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 
 [project.urls]
