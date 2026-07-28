@@ -191,3 +191,98 @@ CREATE INDEX IF NOT EXISTS idx_pushed_images_lookup
 CREATE UNIQUE INDEX IF NOT EXISTS uq_pushed_images_backfill
     ON pushed_images (source_file, source_line)
     WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Distributed PGMQ pipeline state
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pipeline_tasks (
+    task_id         TEXT        NOT NULL,
+    task_version    INTEGER     NOT NULL,
+    repo            TEXT        NOT NULL,
+    pr              INTEGER     NOT NULL,
+    trace_id        UUID        NOT NULL,
+    state           TEXT        NOT NULL DEFAULT 'queued',
+    current_stage   TEXT        NOT NULL DEFAULT 'generate',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at     TIMESTAMPTZ,
+    last_error      TEXT,
+    last_reason     TEXT,
+    CONSTRAINT pk_pipeline_tasks PRIMARY KEY (task_id, task_version),
+    CONSTRAINT uq_pipeline_tasks_repo_pr_version UNIQUE (repo, pr, task_version),
+    CONSTRAINT ck_pipeline_tasks_task_id_safe CHECK (
+        task_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+    ),
+    CONSTRAINT ck_pipeline_tasks_task_version_positive CHECK (task_version > 0),
+    CONSTRAINT ck_pipeline_tasks_repo_safe CHECK (
+        repo ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+        AND repo !~ '(^|/)\.{1,2}($|/)'
+    ),
+    CONSTRAINT ck_pipeline_tasks_pr_positive CHECK (pr > 0),
+    CONSTRAINT ck_pipeline_tasks_state CHECK (
+        state IN ('queued', 'running', 'rejected', 'failed', 'completed')
+    ),
+    CONSTRAINT ck_pipeline_tasks_current_stage CHECK (
+        current_stage IN ('generate', 'validate', 'reward', 'push')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_tasks_state_stage
+    ON pipeline_tasks (state, current_stage, updated_at);
+
+CREATE TABLE IF NOT EXISTS pipeline_task_files (
+    task_id         TEXT    NOT NULL,
+    task_version    INTEGER NOT NULL,
+    path            TEXT    NOT NULL,
+    content         BYTEA   NOT NULL,
+    mode            INTEGER NOT NULL,
+    size_bytes      BIGINT  NOT NULL,
+    sha256          TEXT    NOT NULL,
+    CONSTRAINT pk_pipeline_task_files PRIMARY KEY (task_id, task_version, path),
+    CONSTRAINT fk_pipeline_task_files_task FOREIGN KEY (task_id, task_version)
+        REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
+    CONSTRAINT ck_pipeline_task_files_path_safe CHECK (
+        path <> ''
+        AND path NOT LIKE '/%'
+        AND path NOT LIKE '%//%'
+        AND path !~ '(^|/)\.{1,2}($|/)'
+        AND strpos(path, chr(92)) = 0
+    ),
+    CONSTRAINT ck_pipeline_task_files_size_nonnegative CHECK (size_bytes >= 0),
+    CONSTRAINT ck_pipeline_task_files_size_matches_content CHECK (
+        size_bytes = octet_length(content)
+    ),
+    CONSTRAINT ck_pipeline_task_files_mode CHECK (mode BETWEEN 0 AND 511),
+    CONSTRAINT ck_pipeline_task_files_sha256 CHECK (sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_stage_results (
+    task_id          TEXT        NOT NULL,
+    task_version     INTEGER     NOT NULL,
+    stage            TEXT        NOT NULL,
+    attempt          INTEGER     NOT NULL,
+    status           TEXT        NOT NULL,
+    pgmq_msg_id      BIGINT      NOT NULL,
+    pgmq_read_count  INTEGER     NOT NULL,
+    worker_id        TEXT        NOT NULL,
+    node_name        TEXT        NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL,
+    finished_at      TIMESTAMPTZ NOT NULL,
+    result           JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    error            TEXT,
+    CONSTRAINT pk_pipeline_stage_results
+        PRIMARY KEY (task_id, task_version, stage, attempt),
+    CONSTRAINT fk_pipeline_stage_results_task FOREIGN KEY (task_id, task_version)
+        REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
+    CONSTRAINT ck_pipeline_stage_results_stage CHECK (
+        stage IN ('generate', 'validate', 'reward', 'push')
+    ),
+    CONSTRAINT ck_pipeline_stage_results_attempt_positive CHECK (attempt > 0),
+    CONSTRAINT ck_pipeline_stage_results_status CHECK (
+        status IN ('succeeded', 'rejected', 'failed')
+    ),
+    CONSTRAINT ck_pipeline_stage_results_pgmq_msg_id_positive CHECK (pgmq_msg_id > 0),
+    CONSTRAINT ck_pipeline_stage_results_pgmq_read_count_positive CHECK (pgmq_read_count > 0),
+    CONSTRAINT ck_pipeline_stage_results_timestamps CHECK (finished_at >= started_at)
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_stage_results_status
+    ON pipeline_stage_results (status, finished_at DESC);
