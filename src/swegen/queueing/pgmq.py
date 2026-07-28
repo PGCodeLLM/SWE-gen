@@ -303,6 +303,21 @@ class PgmqQueue:
             self.archive(connection, current)
             return next_msg_id
 
+    def complete_terminal(
+        self,
+        connection: ConnectionLike,
+        current: ClaimedMessage,
+        *,
+        complete_stage: StageCompletion,
+    ) -> bool:
+        self._validate_current_claim(current)
+        with connection.transaction():
+            newly_completed = _require_boolean_callback_result(
+                "Terminal completion", complete_stage(connection, current)
+            )
+            self.archive(connection, current)
+            return newly_completed
+
     def retry_or_dead_letter(
         self,
         connection: ConnectionLike,

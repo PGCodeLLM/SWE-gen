@@ -585,6 +585,77 @@ def test_complete_and_handoff_rolls_back_when_archive_fails() -> None:
     ]
 
 
+def test_complete_terminal_records_and_archives_without_successor() -> None:
+    current = claimed_message(PipelineStage.REWARD)
+    connection = RecordingConnection([(True,)])
+
+    def complete_stage(conn: RecordingConnection, claim: ClaimedMessage) -> bool:
+        assert conn is connection
+        assert claim is current
+        conn.events.append("callback")
+        return True
+
+    newly_completed = PgmqQueue().complete_terminal(
+        connection,
+        current,
+        complete_stage=complete_stage,
+    )
+
+    assert newly_completed is True
+    assert connection.events == [
+        "transaction-enter",
+        "callback",
+        "archive",
+        "transaction-exit",
+    ]
+    assert all("pgmq.send" not in query for query, _ in connection.calls)
+
+
+def test_complete_terminal_archives_a_duplicate_without_successor() -> None:
+    current = claimed_message(PipelineStage.VALIDATE)
+    connection = RecordingConnection([(True,)])
+
+    def complete_stage(conn: RecordingConnection, claim: ClaimedMessage) -> bool:
+        conn.events.append("callback-duplicate")
+        return False
+
+    newly_completed = PgmqQueue().complete_terminal(
+        connection,
+        current,
+        complete_stage=complete_stage,
+    )
+
+    assert newly_completed is False
+    assert connection.events == [
+        "transaction-enter",
+        "callback-duplicate",
+        "archive",
+        "transaction-exit",
+    ]
+    assert all("pgmq.send" not in query for query, _ in connection.calls)
+
+
+def test_complete_terminal_rejects_a_non_boolean_callback_result() -> None:
+    current = claimed_message(PipelineStage.REWARD)
+    connection = RecordingConnection()
+
+    def invalid_completion_result(conn: RecordingConnection, claim: ClaimedMessage) -> bool:
+        conn.events.append("callback")
+        return None  # type: ignore[return-value]
+
+    with pytest.raises(
+        QueueOperationError, match="Terminal completion callback must return a boolean"
+    ):
+        PgmqQueue().complete_terminal(
+            connection,
+            current,
+            complete_stage=invalid_completion_result,
+        )
+
+    assert connection.events == ["transaction-enter", "callback", "transaction-rollback"]
+    assert connection.calls == []
+
+
 def test_retry_before_the_delivery_limit_only_changes_visibility() -> None:
     current = claimed_message(PipelineStage.VALIDATE, read_count=2)
     retry_visible_at = datetime(2026, 7, 28, 12, 6, tzinfo=UTC)
