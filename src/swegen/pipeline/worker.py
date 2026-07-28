@@ -33,6 +33,9 @@ from swegen.queueing.pgmq import (
 
 LOGGER = logging.getLogger(__name__)
 MAX_WORKER_ERROR_CHARS = 4_000
+POOL_ACQUIRE_TIMEOUT_SECONDS = 2.0
+HEARTBEAT_CANCEL_TIMEOUT_SECONDS = 5.0
+HEARTBEAT_JOIN_TIMEOUT_SECONDS = 5.0
 
 _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -249,7 +252,8 @@ class ClaimHeartbeat:
         claim: ClaimedMessage,
         visibility_timeout_seconds: int,
         interval_seconds: float,
-        join_timeout_seconds: float = 1.0,
+        join_timeout_seconds: float = HEARTBEAT_JOIN_TIMEOUT_SECONDS,
+        cancel_timeout_seconds: float = HEARTBEAT_CANCEL_TIMEOUT_SECONDS,
     ) -> None:
         self._connection_factory = connection_factory
         self._queue = queue
@@ -261,9 +265,13 @@ class ClaimHeartbeat:
         self._join_timeout_seconds = _positive_interval(
             "join_timeout_seconds", join_timeout_seconds
         )
+        self._cancel_timeout_seconds = _positive_interval(
+            "cancel_timeout_seconds", cancel_timeout_seconds
+        )
         self._stopped = Event()
         self._state_lock = Lock()
         self._failure: str | None = None
+        self._active_connection: Any | None = None
         self._thread: Thread | None = None
 
     @property
@@ -303,6 +311,10 @@ class ClaimHeartbeat:
         traceback: object | None,
     ) -> None:
         self._stopped.set()
+        with self._state_lock:
+            active_connection = self._active_connection
+        if active_connection is not None:
+            self._cancel_connection(active_connection)
         if self._thread is not None:
             self._thread.join(self._join_timeout_seconds)
             if self._thread.is_alive():
@@ -313,13 +325,22 @@ class ClaimHeartbeat:
         while not self._stopped.wait(self._interval_seconds):
             try:
                 with self._connection_factory() as connection:
-                    updated = self._queue.heartbeat(
-                        connection,
-                        current,
-                        visibility_timeout_seconds=self._visibility_timeout_seconds,
-                    )
-                    self._validate_heartbeat_claim(current, updated)
-                    current = updated
+                    with self._state_lock:
+                        self._active_connection = connection
+                    try:
+                        if self._stopped.is_set():
+                            return
+                        updated = self._queue.heartbeat(
+                            connection,
+                            current,
+                            visibility_timeout_seconds=self._visibility_timeout_seconds,
+                        )
+                        self._validate_heartbeat_claim(current, updated)
+                        current = updated
+                    finally:
+                        with self._state_lock:
+                            if self._active_connection is connection:
+                                self._active_connection = None
             except Exception as error:  # keep stage work alive; PGMQ remains crash recovery
                 safe_error = self._record_failure(error)
                 LOGGER.error(
@@ -329,6 +350,22 @@ class ClaimHeartbeat:
                     safe_error,
                 )
                 return
+
+    def _cancel_connection(self, connection: Any) -> None:
+        cancel_safe = getattr(connection, "cancel_safe", None)
+        if callable(cancel_safe):
+            try:
+                cancel_safe(timeout=self._cancel_timeout_seconds)
+                return
+            except Exception as error:
+                self._record_failure(error)
+
+        cancel = getattr(connection, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception as error:
+                self._record_failure(error)
 
     def _record_failure(self, error: BaseException | str) -> str:
         safe_error = (
@@ -651,11 +688,16 @@ def _load_stage_action(stage: PipelineStage) -> StageAction:
 
 
 def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
-    from swegen.db import connection
+    from swegen.db import get_pool
+
+    pool = get_pool()
+
+    def connection_factory():
+        return pool.connection(timeout=POOL_ACQUIRE_TIMEOUT_SECONDS)
 
     return PipelineWorker(
         stage=stage,
-        connection_factory=connection,
+        connection_factory=connection_factory,
         queue=PgmqQueue(),
         store=TaskStore(),
         action=_load_stage_action(stage),

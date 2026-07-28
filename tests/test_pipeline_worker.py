@@ -14,6 +14,8 @@ from uuid import UUID
 
 import pytest
 
+from swegen import db as db_module
+from swegen.pipeline import worker as worker_module
 from swegen.pipeline.models import PipelineTask, StageExecution, TaskFile
 from swegen.pipeline.worker import (
     ClaimHeartbeat,
@@ -612,6 +614,136 @@ def test_claim_heartbeat_exit_is_bounded_when_the_database_call_remains_blocked(
     assert heartbeat_finished.wait(timeout=1)
 
 
+def test_claim_heartbeat_cancels_a_blocked_active_connection_on_exit() -> None:
+    heartbeat_started = Event()
+    unblock_heartbeat = Event()
+    force_cleanup = Event()
+    heartbeat_finished = Event()
+    events: list[str] = []
+    claim = reward_claim()
+
+    class CancellableConnection(FakeConnection):
+        def __init__(self) -> None:
+            super().__init__("heartbeat-connection", events)
+            self.cancel_timeouts: list[float] = []
+            self.cancelled = False
+
+        def cancel_safe(self, *, timeout: float) -> None:
+            self.cancel_timeouts.append(timeout)
+            self.cancelled = True
+            unblock_heartbeat.set()
+
+    connection = CancellableConnection()
+
+    class CancellableConnectionFactory:
+        def __call__(self) -> CancellableConnection:
+            return connection
+
+    class BlockingHeartbeatQueue(FakeQueue):
+        def __init__(self) -> None:
+            super().__init__()
+            self.visibility_mutations = 0
+
+        def heartbeat(
+            self,
+            current_connection: CancellableConnection,
+            current: ClaimedMessage,
+            *,
+            visibility_timeout_seconds: int,
+        ) -> ClaimedMessage:
+            heartbeat_started.set()
+            unblock_heartbeat.wait(timeout=1)
+            try:
+                if current_connection.cancelled:
+                    raise RuntimeError("heartbeat query cancelled")
+                if not force_cleanup.is_set():
+                    self.visibility_mutations += 1
+                return current
+            finally:
+                heartbeat_finished.set()
+
+    queue = BlockingHeartbeatQueue()
+    heartbeat = ClaimHeartbeat(
+        connection_factory=CancellableConnectionFactory(),
+        queue=queue,
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+        join_timeout_seconds=0.1,
+        cancel_timeout_seconds=0.05,
+    )
+
+    try:
+        with heartbeat:
+            assert heartbeat_started.wait(timeout=1)
+
+        assert connection.cancel_timeouts == [0.05]
+        assert heartbeat.is_running is False
+        assert connection.exited is True
+        assert queue.visibility_mutations == 0
+    finally:
+        force_cleanup.set()
+        unblock_heartbeat.set()
+        assert heartbeat_finished.wait(timeout=1)
+
+
+def test_claim_heartbeat_does_not_run_after_a_late_connection_acquisition() -> None:
+    acquisition_started = Event()
+    release_acquisition = Event()
+    connection_exited = Event()
+    heartbeat_called = Event()
+    events: list[str] = []
+    claim = reward_claim()
+
+    class LateConnection(FakeConnection):
+        def __enter__(self) -> LateConnection:
+            acquisition_started.set()
+            assert release_acquisition.wait(timeout=1)
+            return super().__enter__()
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object | None,
+        ) -> None:
+            super().__exit__(exc_type, exc, traceback)
+            connection_exited.set()
+
+    connection = LateConnection("late-connection", events)
+
+    class LateConnectionFactory:
+        def __call__(self) -> LateConnection:
+            return connection
+
+    class RecordingHeartbeatQueue(FakeQueue):
+        def heartbeat(
+            self,
+            current_connection: LateConnection,
+            current: ClaimedMessage,
+            *,
+            visibility_timeout_seconds: int,
+        ) -> ClaimedMessage:
+            heartbeat_called.set()
+            return current
+
+    heartbeat = ClaimHeartbeat(
+        connection_factory=LateConnectionFactory(),
+        queue=RecordingHeartbeatQueue(),
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+    )
+
+    with heartbeat:
+        assert acquisition_started.wait(timeout=1)
+
+    release_acquisition.set()
+    assert connection_exited.wait(timeout=1)
+    assert heartbeat_called.is_set() is False
+
+
 def test_claim_heartbeat_detects_changed_delivery_ownership() -> None:
     heartbeat_seen = Event()
     claim = reward_claim(read_count=1)
@@ -900,6 +1032,34 @@ def test_generate_starts_without_loading_or_materializing_stored_files(
     assert worker.run_once() is True
 
     assert worker.store.load_files_calls == []
+
+
+def test_runtime_worker_uses_one_explicitly_bounded_pool_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_timeouts: list[float | None] = []
+    generic_connection_calls: list[None] = []
+
+    class FakePool:
+        def connection(self, timeout: float | None = None) -> FakeConnection:
+            pool_timeouts.append(timeout)
+            return FakeConnection(f"pool-{len(pool_timeouts)}", [])
+
+    def generic_connection() -> FakeConnection:
+        generic_connection_calls.append(None)
+        return FakeConnection("generic", [])
+
+    monkeypatch.setattr(db_module, "get_pool", lambda: FakePool())
+    monkeypatch.setattr(db_module, "connection", generic_connection)
+    monkeypatch.setattr(worker_module, "_load_stage_action", lambda stage: FakeAction())
+
+    worker = worker_module._build_runtime_worker(PipelineStage.REWARD)
+    first_context = worker.connection_factory()
+    second_context = worker.connection_factory()
+
+    assert first_context is not second_context
+    assert pool_timeouts == [2.0, 2.0]
+    assert generic_connection_calls == []
 
 
 def test_cleanup_failure_after_durable_completion_does_not_retry_or_dead_letter(
