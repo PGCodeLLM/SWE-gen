@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from hashlib import sha256
 from pathlib import Path
@@ -65,6 +66,81 @@ def test_only_successful_stage_execution_hands_off_files() -> None:
     assert succeeded.files == (task_file,)
     assert failed.status is StageResultStatus.FAILED
     assert failed.should_handoff is False
+
+
+def test_stage_execution_snapshots_and_recursively_freezes_results() -> None:
+    from swegen.pipeline.models import StageExecution
+
+    details = {"nop": 0, "oracle": 1}
+    labels = ["validated", "clean"]
+    source: dict[str, object] = {
+        "reward": 1,
+        "details": details,
+        "labels": labels,
+    }
+
+    execution = StageExecution.succeeded(source)
+    source["reward"] = 0
+    details["nop"] = 1
+    labels.append("mutated")
+
+    assert execution.result["reward"] == 1
+    assert execution.result["labels"] == ("validated", "clean")
+    stored_details = execution.result["details"]
+    assert isinstance(stored_details, Mapping)
+    assert stored_details["nop"] == 0
+
+    with pytest.raises(TypeError):
+        execution.result["reward"] = 0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        stored_details["nop"] = 1  # type: ignore[index]
+
+    plain_result = execution.result_json()
+    assert plain_result == {
+        "reward": 1,
+        "details": {"nop": 0, "oracle": 1},
+        "labels": ["validated", "clean"],
+    }
+    plain_result["reward"] = 0
+    assert execution.result["reward"] == 1
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"value": object()},
+        {"value": b"not-json"},
+        {"value": {"not", "json"}},
+        {"value": float("nan")},
+        {1: "keys must be strings"},
+    ],
+)
+def test_stage_execution_rejects_non_json_safe_results(result: dict[object, object]) -> None:
+    from swegen.pipeline.models import StageExecution
+
+    with pytest.raises(ValueError, match="JSON-safe"):
+        StageExecution.succeeded(result)  # type: ignore[arg-type]
+
+
+def test_stage_execution_preserves_files_from_a_one_shot_iterable() -> None:
+    from swegen.pipeline.models import StageExecution, StageResultStatus, TaskFile
+
+    content = b"test"
+    task_file = TaskFile(
+        path="tests/test.txt",
+        content=content,
+        mode=0o644,
+        sha256=sha256(content).hexdigest(),
+    )
+    files = (item for item in (task_file,))
+
+    execution = StageExecution(
+        status=StageResultStatus.SUCCEEDED,
+        result={},
+        files=files,  # type: ignore[arg-type]
+    )
+
+    assert execution.files == (task_file,)
 
 
 def test_pipeline_records_are_immutable() -> None:
@@ -203,6 +279,12 @@ def test_pipeline_schema_has_named_identity_and_file_constraints() -> None:
     sql = schema_sql()
 
     assert ("CONSTRAINT uq_pipeline_tasks_repo_pr_version UNIQUE (repo, pr, task_version)") in sql
+    assert "trace_id UUID NOT NULL" in sql
+    assert "created_at TIMESTAMPTZ NOT NULL DEFAULT now()" in sql
+    assert "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()" in sql
+    assert "finished_at TIMESTAMPTZ" in sql
+    assert "last_error TEXT" in sql
+    assert "last_reason TEXT" in sql
     assert "CONSTRAINT ck_pipeline_tasks_task_version_positive" in sql
     assert "CONSTRAINT ck_pipeline_tasks_pr_positive" in sql
     assert "CONSTRAINT ck_pipeline_tasks_state" in sql
@@ -210,6 +292,10 @@ def test_pipeline_schema_has_named_identity_and_file_constraints() -> None:
     assert "CONSTRAINT pk_pipeline_task_files PRIMARY KEY (task_id, task_version, path)" in sql
     assert "CONSTRAINT fk_pipeline_task_files_task" in sql
     assert "REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE" in sql
+    assert "path TEXT NOT NULL" in sql
+    assert "size_bytes BIGINT NOT NULL" in sql
+    assert "CONSTRAINT ck_pipeline_task_files_path_safe" in sql
+    assert "CONSTRAINT ck_pipeline_task_files_size_nonnegative" in sql
     assert "CONSTRAINT ck_pipeline_task_files_size_matches_content" in sql
     assert "CONSTRAINT ck_pipeline_task_files_mode" in sql
     assert "CONSTRAINT ck_pipeline_task_files_sha256" in sql
@@ -224,6 +310,11 @@ def test_pipeline_schema_has_named_stage_result_constraints_and_indexes() -> Non
     assert "CONSTRAINT ck_pipeline_stage_results_status" in sql
     assert "CONSTRAINT ck_pipeline_stage_results_pgmq_msg_id_positive" in sql
     assert "CONSTRAINT ck_pipeline_stage_results_pgmq_read_count_positive" in sql
+    assert "pgmq_msg_id BIGINT NOT NULL" in sql
+    assert "pgmq_read_count INTEGER NOT NULL" in sql
+    assert "worker_id TEXT NOT NULL" in sql
+    assert "node_name TEXT NOT NULL" in sql
+    assert "error TEXT" in sql
     assert "CREATE INDEX IF NOT EXISTS idx_pipeline_tasks_state_stage" in sql
     assert "CREATE INDEX IF NOT EXISTS idx_pipeline_stage_results_status" in sql
 
