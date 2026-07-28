@@ -14,7 +14,13 @@ from harbor.models.trial.result import TrialResult
 from openai import OpenAI
 from rich.console import Console
 
-from swegen.create.claude_code_utils import Colors, print_sdk_message
+from swegen.create.claude_code_utils import (
+    CLASSIFIER_TOOLS,
+    DISALLOWED_AUTOMATION_TOOLS,
+    Colors,
+    claude_permission_mode,
+    print_sdk_message,
+)
 from swegen.model_settings import (
     claude_runtime_env,
     load_analysis_settings,
@@ -211,8 +217,10 @@ class TrialClassifier:
 
         # Run Claude Code with file access
         options = ClaudeAgentOptions(
-            permission_mode="bypassPermissions",
-            allowed_tools=["Read", "Glob"],
+            permission_mode=claude_permission_mode(),
+            tools=list(CLASSIFIER_TOOLS),
+            allowed_tools=list(CLASSIFIER_TOOLS),
+            disallowed_tools=list(DISALLOWED_AUTOMATION_TOOLS),
             cwd=str(trial_dir),
             add_dirs=[str(task_dir)],
             model=self._model,

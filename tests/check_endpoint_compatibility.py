@@ -22,9 +22,9 @@ import requests
 # ---------------------------------------------------------------------------
 # Edit these values before running the script.
 # ---------------------------------------------------------------------------
-ENDPOINT = "http://1.95.77.23:3000"
-API_KEY = "sk-GlQn5Ov7O1qK1nKfrEpMqgpLek0vxygRvSLdPp5BTLc39aqv"
-MODEL = "qwen3.5-397b-a17b"
+ENDPOINT = "http://7.244.3.251:8088"
+API_KEY = "sk-BTBtAIVVpHgPVg9uQ6W6aw"
+MODEL = "glm-5.2-moedsa"
 
 # Select any subset of: "model", "openai", "hacking".
 FORMATS_TO_TEST = ("model", "openai", "hacking")

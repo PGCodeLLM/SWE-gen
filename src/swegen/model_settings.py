@@ -131,7 +131,7 @@ class SWRSettings:
     repository: str
     username: str
     password: str
-    image_prefix: str = "ea_sz_"
+    tag_prefix: str = ""
     retries: int = 3
     push_timeout: int = 1800
 
@@ -292,7 +292,7 @@ def load_swr_settings() -> SWRSettings:
         repository=str(table.get("repository") or "").strip().strip("/"),
         username=str(table.get("username") or "").strip(),
         password=str(table.get("password") or ""),
-        image_prefix=str(table.get("image_prefix") or "ea_sz_"),
+        tag_prefix=str(table.get("tag_prefix") or ""),
         retries=max(1, int(table.get("retries", 3))),
         push_timeout=max(1, int(table.get("push_timeout", 1800))),
     )

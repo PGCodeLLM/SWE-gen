@@ -17,13 +17,14 @@ listed in ``exclude_languages`` are omitted, and only configured ``pr_category``
 values are eligible. When ``[orchestrator].produce_count`` is set, workers share
 a run-level quota and stop after exactly that many fully successful instances.
 
-Each run contains ``tasks/``, ``tasks_bz/``,
+Each run contains ``tasks/``, ``tasks_bz/``, ``tasks_postprocessed/``,
 ``orchestrator-logs/``, ``logs/``, ``harbor-jobs/``, and an
 ``orchestrator-progress.jsonl`` completion log. As soon as a PR's
 ``swegen create`` reaches NOP=0/Oracle=1, the single task is checked for reward
-hacking. Only non-hacking tasks are copied to ``tasks_bz/``, postprocessed for
-the restricted Huawei environment, uploaded to SWR, and marked passed in the
-database. Local images are deleted only after a successful upload.
+hacking. Only non-hacking tasks are copied unchanged to ``tasks_bz/``. A
+separate copy is postprocessed for the restricted Huawei environment under
+``tasks_postprocessed/``, then the image is uploaded to SWR and the database is
+marked passed. Local images are deleted only after a successful upload.
 
 Within a package, each PR is processed sequentially by shelling out to:
 
@@ -73,8 +74,9 @@ from swegen.production_quota import ProductionQuota
 from swegen.proxy import add_proxy_setup, copy_proxy_certificate
 from swegen.swr import upload_image_to_swr
 
-# Run-local directory name for post-processed copies of successful tasks.
-POSTPROCESSED_OUTPUT_NAME = "tasks_bz"
+# Run-local directory names for successful originals and postprocessed copies.
+SUCCESSFUL_OUTPUT_NAME = "tasks_bz"
+POSTPROCESSED_OUTPUT_NAME = "tasks_postprocessed"
 PROGRESS_JSONL_NAME = "orchestrator-progress.jsonl"
 INSTANCE_STATUS_JSONL_NAME = "orchestrator-instance-status.jsonl"
 PRODUCTION_QUOTA_NAME = "production-quota.json"
@@ -131,11 +133,12 @@ GITHUB_RATE_LIMIT_SIGNATURES = (
 # Base seconds to back off between retries (scaled by attempt number).
 RETRY_BACKOFF_SEC = 5
 
-# Post-processing: the skeleton Dockerfile's base image is rewritten to the
-# internal mirror so generated tasks build against it.
+# Post-processing: retain the repository-specific suffix from the database
+# image reference while switching its registry/repository prefix to wce1sr.
 DOCKERFILE_BASE_REPLACEMENT = (
     "FROM swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox"
 )
+DATABASE_IMAGE_REPOSITORY_RE = re.compile(r"/swesandbox(?=$|[/:@])", re.IGNORECASE)
 
 LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00\s+")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -150,6 +153,7 @@ class Entry:
     base_commit: str = ""
     instance_id: str = ""
     swegen_retries: int = 0
+    image_ref: str = ""
 
 
 @dataclass
@@ -160,6 +164,7 @@ class Outcome:
     entry: Entry
     returncode: int
     failure_reason: str = ""
+    successful_copy_status: str = ""
     postprocess_status: str = ""
     hacking_status: str = ""
     swr_upload_status: str = ""
@@ -274,6 +279,8 @@ def resolve_run_layout(args: argparse.Namespace) -> None:
 
     if args.tasks_dir is None:
         args.tasks_dir = args.run_dir / "tasks"
+    if args.successful_dir is None:
+        args.successful_dir = args.run_dir / SUCCESSFUL_OUTPUT_NAME
     if args.postprocessed_dir is None:
         args.postprocessed_dir = args.run_dir / POSTPROCESSED_OUTPUT_NAME
     if args.log_dir is None:
@@ -294,6 +301,7 @@ def create_run_dirs(args: argparse.Namespace) -> None:
         args.run_dir / "logs",
         args.log_dir,
         args.tasks_dir,
+        args.successful_dir,
         args.postprocessed_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
@@ -328,7 +336,10 @@ def build_child_command(args: argparse.Namespace, node_log_dir: Path) -> list[st
         # Shared, flat output dir — outputs are NOT subfoldered per node.
         "--output",
         str(args.tasks_dir),
-        # Shared postprocessed-output tree for the post-processed copies.
+        # Shared successful-output tree for untouched successful copies.
+        "--successful-output",
+        str(args.successful_dir),
+        # Shared postprocessed-output tree for rewritten successful copies.
         "--postprocessed-output",
         str(args.postprocessed_dir),
         "--swegen-bin",
@@ -862,6 +873,7 @@ def write_progress_jsonl(
                     "pull_number": outcome.entry.pull_number,
                     "worker_id": outcome.worker_id,
                     "returncode": outcome.returncode,
+                    "successful_copy_status": outcome.successful_copy_status,
                     "hacking_status": outcome.hacking_status,
                     "swr_upload_status": outcome.swr_upload_status,
                     "swr_remote_ref": outcome.swr_remote_ref,
@@ -880,6 +892,7 @@ def write_progress_jsonl(
                     "pull_number": outcome.entry.pull_number,
                     "worker_id": outcome.worker_id,
                     "returncode": outcome.returncode,
+                    "successful_copy_status": outcome.successful_copy_status,
                     "postprocess_status": outcome.postprocess_status,
                     "hacking_status": outcome.hacking_status,
                     "swr_upload_status": outcome.swr_upload_status,
@@ -971,6 +984,20 @@ def _dockerfile_path(task_dir: Path) -> Path:
     return task_dir / "environment" / "Dockerfile"
 
 
+def postprocessed_from_instruction(image_ref: str) -> str:
+    """Swap the database image prefix while preserving its repository suffix."""
+    normalized = image_ref.strip()
+    if not normalized:
+        raise ValueError("database image reference is missing")
+    marker = DATABASE_IMAGE_REPOSITORY_RE.search(normalized)
+    if marker is None:
+        raise ValueError(
+            "database image reference does not contain a /swesandbox repository: "
+            f"{normalized}"
+        )
+    return DOCKERFILE_BASE_REPLACEMENT + normalized[marker.end() :]
+
+
 def rewrite_dockerfile_for_bz(task_dir: Path, entry: Entry) -> list[str]:
     """Apply the wce1sr base, proxy, fetch, and dirty-checkout fixes."""
     dockerfile = _dockerfile_path(task_dir)
@@ -984,10 +1011,10 @@ def rewrite_dockerfile_for_bz(task_dir: Path, entry: Entry) -> list[str]:
     for index, line in enumerate(lines):
         if line.lstrip().upper().startswith("FROM "):
             newline = "\r\n" if line.endswith("\r\n") else "\n"
-            replacement = DOCKERFILE_BASE_REPLACEMENT + newline
+            replacement = postprocessed_from_instruction(entry.image_ref) + newline
             if line != replacement:
                 lines[index] = replacement
-                changes.append("wce1sr base rewritten")
+                changes.append("database image ref rewritten to wce1sr")
             break
     rendered = "".join(lines)
 
@@ -1062,17 +1089,36 @@ def write_cwm_metadata(task_dir: Path, entry: Entry, issue_number: str) -> bool:
     return True
 
 
+def copy_successful_task(
+    entry: Entry,
+    tasks_dir: Path,
+    successful_dir: Path,
+) -> str:
+    """Copy a successful task unchanged from ``tasks`` into ``tasks_bz``."""
+    name = entry_instance_id(entry)
+    src_dir = tasks_dir / name
+    if not src_dir.is_dir():
+        return f"skipped (no task dir {name})"
+
+    dst_dir = successful_dir / name
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
+    shutil.copytree(src_dir, dst_dir)
+    return "original task copied unchanged"
+
+
 def postprocess_task(
     entry: Entry,
     tasks_dir: Path,
     postprocessed_dir: Path,
     tokens: list[str] | None,
 ) -> str:
-    """Copy one successful task into the postprocessed-output tree, then post-process.
+    """Copy one successful task into ``tasks_postprocessed``, then rewrite it.
 
     The original task under ``tasks_dir`` is left untouched. The copy under
     ``postprocessed_dir`` gets, in order:
       - the Dockerfile base image rewritten to the wce1sr swesandbox image
+        using the repository-specific database image reference
       - the bundled Huawei proxy CA installation
       - exact fetches before detached SHA checkouts
       - a hard reset/clean before checkout while retaining the real git clone
@@ -1354,6 +1400,7 @@ def process_claimed_entry(
     repo_cache_dir: Path | None,
     transient_attempts: int,
     token_pool: list[str],
+    successful_dir: Path,
     postprocessed_dir: Path,
 ) -> Outcome:
     process_result = process_entry(
@@ -1373,6 +1420,7 @@ def process_claimed_entry(
     returncode = process_result.returncode
     failure_reason = process_result.failure_reason
     hacking_status = "not run"
+    successful_copy_status = ""
     postprocess_status = ""
     swr_upload_status = "not run"
     swr_remote_ref = ""
@@ -1393,6 +1441,23 @@ def process_claimed_entry(
         if not passed_hacking:
             returncode = 2
             failure_reason = hacking_reason
+
+    if returncode == 0:
+        try:
+            successful_copy_status = copy_successful_task(
+                entry,
+                output_dir,
+                successful_dir,
+            )
+            if successful_copy_status.startswith("skipped"):
+                raise RuntimeError(successful_copy_status)
+        except Exception as exc:
+            successful_copy_status = f"ERROR: {exc}"
+            returncode = 3
+            failure_reason = f"Successful task copy failed: {exc}"
+        log.write(f"{tag} successful original copy: {successful_copy_status}\n")
+        log.flush()
+        print(f"{tag} successful original copy: {successful_copy_status}", flush=True)
 
     if returncode == 0:
         try:
@@ -1445,6 +1510,7 @@ def process_claimed_entry(
         entry=entry,
         returncode=returncode,
         failure_reason=failure_reason,
+        successful_copy_status=successful_copy_status,
         postprocess_status=postprocess_status,
         hacking_status=hacking_status,
         swr_upload_status=swr_upload_status,
@@ -1478,13 +1544,21 @@ def run_consumer(
     repo_cache_dir: Path | None = None,
     transient_attempts: int = 3,
     github_tokens: list[str] | None = None,
+    successful_dir: Path | None = None,
     postprocessed_dir: Path | None = None,
     progress_queue: queue.Queue[Outcome | None] | None = None,
     production_quota: ProductionQuota | None = None,
 ) -> list[Outcome]:
     """Atomically claim and process repository packages until none remain."""
-    if output_dir is None or state_dir is None or postprocessed_dir is None:
-        raise ValueError("consumer requires output, state, and tasks_bz directories")
+    if (
+        output_dir is None
+        or state_dir is None
+        or successful_dir is None
+        or postprocessed_dir is None
+    ):
+        raise ValueError(
+            "consumer requires tasks, state, tasks_bz, and tasks_postprocessed directories"
+        )
     token_pool = github_tokens or []
     outcomes: list[Outcome] = []
     log_path = log_dir / f"worker-{worker_id}.log"
@@ -1518,6 +1592,7 @@ def run_consumer(
                     base_commit=item.base_commit,
                     instance_id=item.instance_id,
                     swegen_retries=item.swegen_retries,
+                    image_ref=item.image_ref,
                 )
                 for item in claimed
             ]
@@ -1560,6 +1635,7 @@ def run_consumer(
                         repo_cache_dir,
                         transient_attempts,
                         token_pool,
+                        successful_dir,
                         postprocessed_dir,
                     )
                 except Exception:
@@ -1671,6 +1747,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Root task output dir. Defaults to <run>/tasks. (--tasks-dir is a deprecated alias.)",
+    )
+    parser.add_argument(
+        "--successful-output",
+        dest="successful_dir",
+        type=Path,
+        default=None,
+        help="Directory for untouched copies of successful tasks. Defaults "
+        f"to <run>/{SUCCESSFUL_OUTPUT_NAME}.",
     )
     parser.add_argument(
         "--postprocessed-output",
@@ -1787,6 +1871,11 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    args.successful_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Untouched copies of successful tasks -> {args.successful_dir}/",
+        flush=True,
+    )
     args.postprocessed_dir.mkdir(parents=True, exist_ok=True)
     print(
         f"Post-processed copies of successful tasks -> {args.postprocessed_dir}/",
@@ -1823,6 +1912,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.repo_cache_dir,
                     args.transient_attempts,
                     github_tokens,
+                    args.successful_dir,
                     args.postprocessed_dir,
                     progress_queue,
                     production_quota,
@@ -1835,8 +1925,8 @@ def main(argv: list[str] | None = None) -> int:
         progress_queue.put(None)
         progress_thread.join()
 
-    # Post-processing already ran incrementally per task (copied into
-    # args.postprocessed_dir and rewritten as each PR succeeded).
+    # Successful original copying and postprocessing already ran incrementally
+    # into their separate output trees as each PR passed the hacking check.
 
     # Summary
     failures = [o for o in all_outcomes if not o.ok]

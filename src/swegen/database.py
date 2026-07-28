@@ -14,6 +14,7 @@ class DatabasePRTask:
     base_commit: str
     instance_id: str
     swegen_retries: int
+    image_ref: str = ""
 
 
 class PRTaskDatabase:
@@ -23,6 +24,9 @@ class PRTaskDatabase:
         self.settings = settings
         schema, table = settings.table.split(".", 1)
         self._relation = sql.Identifier(schema, table)
+        self._image_mapping_relation = sql.Identifier(
+            "swegen", "repo_mapping_swr_image_hk"
+        )
 
     def _connect(self):
         return connect(
@@ -120,6 +124,17 @@ class PRTaskDatabase:
                     rows = cursor.fetchall()
                     if not rows:
                         continue
+                    image_query = sql.SQL(
+                        "SELECT swr_image_name FROM {table} "
+                        "WHERE LOWER(repo_name) = LOWER(%s)"
+                    ).format(table=self._image_mapping_relation)
+                    cursor.execute(image_query, (repo,))
+                    image_row = cursor.fetchone()
+                    image_ref = (
+                        str(image_row[0]).strip()
+                        if image_row and image_row[0] is not None
+                        else ""
+                    )
                     rows.sort(key=lambda row: (int(row[4]), -int(row[1])))
                     return [
                         DatabasePRTask(
@@ -128,6 +143,7 @@ class PRTaskDatabase:
                             base_commit=str(row[2]),
                             instance_id=str(row[3]),
                             swegen_retries=int(row[4]),
+                            image_ref=image_ref,
                         )
                         for row in rows
                     ]

@@ -8,15 +8,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_agent_sdk import (
-    AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     HookMatcher,
-    ResultMessage,
-    TextBlock,
-    query,
 )
 
-from swegen.create.claude_code_utils import Colors, print_sdk_message
+from swegen.create.claude_code_utils import (
+    DISALLOWED_AUTOMATION_TOOLS,
+    TASK_GENERATION_TOOLS,
+    Colors,
+    claude_permission_mode,
+    print_sdk_message,
+)
 from swegen.model_settings import claude_runtime_env, load_model_settings
 from swegen.tools.harbor_runner import parse_harbor_outcome, suffixed_docker_config_args
 
@@ -829,8 +832,10 @@ async def _run_claude_code_session_async(
 
         # Configure SDK options
         options = ClaudeAgentOptions(
-            allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "LS", "Bash"],
-            permission_mode="bypassPermissions",  # Auto-approve actions
+            tools=list(TASK_GENERATION_TOOLS),
+            allowed_tools=list(TASK_GENERATION_TOOLS),
+            disallowed_tools=list(DISALLOWED_AUTOMATION_TOOLS),
+            permission_mode=claude_permission_mode(),
             cwd=os.getcwd(),  # Run from project root
             model=model_settings.model,
             env=session_env,
@@ -843,39 +848,39 @@ async def _run_claude_code_session_async(
             ),
         )
 
-        # Run with timeout
+        # Use the stateful client so the SDK's AnyIO task group is created,
+        # consumed, and closed by this same asyncio task. Calling aclose() on
+        # the one-shot query() generator closes that task group from a
+        # different task and produces cancel-scope/event-loop errors.
+        client = ClaudeSDKClient(options=options)
+        connected = False
+        timed_out = False
         try:
             async with asyncio.timeout(timeout):
-                response_parts = []
-
-                # NOTE: The SDK's message generator does not finish when the
-                # ResultMessage is emitted — it keeps reading until the CLI
-                # subprocess closes stdout (EOF). Custom model backends may
-                # emit the result but never exit, so we break on ResultMessage
-                # ourselves and aclose() the generator to tear down the
-                # subprocess deterministically (otherwise the loop hangs until
-                # the asyncio timeout fires).
-                agen = query(prompt=prompt_text, options=options)
-                try:
-                    async for message in agen:
-                        if verbose:
-                            print_sdk_message(message)
-
-                        # Collect text for final result
-                        if isinstance(message, AssistantMessage):
-                            for block in message.content:
-                                if isinstance(block, TextBlock):
-                                    response_parts.append(block.text)
-
-                        if isinstance(message, ResultMessage):
-                            break
-                finally:
-                    await agen.aclose()
-
+                await client.connect()
+                connected = True
+                await client.query(prompt_text)
+                async for message in client.receive_response():
+                    if verbose:
+                        print_sdk_message(message)
         except TimeoutError:
+            timed_out = True
             logger.warning("Claude Code session timed out after %ds", timeout)
             if verbose:
                 print(f"\n[SDK] Timed out after {timeout}s", flush=True)
+        finally:
+            if connected:
+                if timed_out:
+                    try:
+                        await asyncio.wait_for(client.interrupt(), timeout=5)
+                    except Exception:
+                        logger.debug("Claude Code interrupt failed during timeout cleanup")
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=30)
+                except Exception as cleanup_error:
+                    logger.warning("Claude Code cleanup failed: %s", cleanup_error)
+
+        if timed_out:
             return _check_validation_state(jobs_dir, task_id, logger, timed_out=True)
 
         if verbose:

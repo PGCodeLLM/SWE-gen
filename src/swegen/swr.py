@@ -32,7 +32,7 @@ class SWRUploadResult:
 
 def _remote_image_name(instance_id: str, settings: SWRSettings) -> str:
     image = re.sub(r"[^a-z0-9._-]", "-", instance_id.lower())
-    return f"{settings.registry}/{settings.repository}/{settings.image_prefix}{image}:latest"
+    return f"{settings.registry}/{settings.repository}:{settings.tag_prefix}{image}"
 
 
 def _proxy_free_environment() -> dict[str, str]:

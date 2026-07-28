@@ -2,6 +2,11 @@
 # API keys, credentials, endpoints, and model names are intentionally read only
 # from this file; inherited shell/.env values are ignored.
 
+[orchestrator]
+# Optional successful-instance target for one run. When omitted, SWE-gen keeps
+# processing until no eligible database rows remain.
+# produce_count = 100
+
 [database]
 # PostgreSQL database containing the qualified swegen.pr_tasks relation.
 host = "localhost"
@@ -13,6 +18,10 @@ table = "swegen.pr_tasks"
 # A row is eligible while COALESCE(swegen_retries, 0) is below this value.
 # Lower-retry PRs are allocated before higher-retry PRs.
 max-retries = 3
+# Case-insensitive primary_language values that must never be allocated.
+exclude_languages = []
+# Case-insensitive pr_category values that are eligible. Defaults to feature.
+pr_category = ["feature"]
 connect_timeout = 10
 
 [github]
@@ -63,12 +72,12 @@ api_key = "replace_me"
 
 [swr]
 # Successful non-hacking images are tagged as:
-# <registry>/<repository>/<image_prefix><instance_id>:latest
+# <registry>/<repository>:<tag_prefix><instance_id>
 enabled = true
 registry = "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"
-repository = "swr-coder-data-trajectory"
+repository = "aifm.coder.exp/swegen/generated"
 username = "replace_me"
 password = "replace_me"
-image_prefix = "ea_sz_"
+tag_prefix = ""
 retries = 3
 push_timeout = 1800

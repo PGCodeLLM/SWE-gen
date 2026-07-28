@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+
 from claude_agent_sdk import (
     AssistantMessage,
+    PermissionMode,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -9,6 +12,30 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+
+TASK_GENERATION_TOOLS = ("Bash", "Glob", "Grep", "Read", "Edit", "Write")
+CLASSIFIER_TOOLS = ("Glob", "Read")
+DISALLOWED_AUTOMATION_TOOLS = (
+    "Task",
+    "TaskOutput",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "AskUserQuestion",
+)
+
+
+def claude_permission_mode() -> PermissionMode:
+    """Return an unattended Claude Code permission mode safe for this user.
+
+    Claude Code rejects ``bypassPermissions`` when the process has root
+    privileges. SWE-Gen already supplies an explicit ``allowed_tools`` list,
+    so normal permission mode remains non-interactive for those tools when it
+    is run as root.
+    """
+    get_effective_uid = getattr(os, "geteuid", None)
+    if get_effective_uid is not None and get_effective_uid() == 0:
+        return "default"
+    return "bypassPermissions"
 
 
 # ANSI color codes for verbose output
@@ -48,11 +75,7 @@ def print_sdk_message(message: object) -> None:
                     # For bash commands, show up to 2000 chars; for other inputs, 1000 chars
                     max_len = 2000 if tool_name.lower() == "bash" else 1000
                     summary = {
-                        k: (
-                            v[:max_len] + "..."
-                            if isinstance(v, str) and len(v) > max_len
-                            else v
-                        )
+                        k: (v[:max_len] + "..." if isinstance(v, str) and len(v) > max_len else v)
                         for k, v in tool_input.items()
                     }
                 else:
@@ -92,4 +115,3 @@ def print_sdk_message(message: object) -> None:
         msg_text = getattr(message, "text", str(message))
         if msg_text:
             print(f"{Colors.YELLOW}[System]{Colors.RESET} {msg_text}", flush=True)
-

@@ -26,6 +26,8 @@ class FakeCursor:
         elif "GREATEST" in rendered:
             self._stage = "release"
             self.rowcount = 1
+        elif "repo_mapping_swr_image_hk" in rendered:
+            self._stage = "image_mapping"
         elif "UPDATE" in rendered:
             self._stage = "update"
 
@@ -41,6 +43,11 @@ class FakeCursor:
         return []
 
     def fetchone(self):
+        if self._stage == "image_mapping":
+            return (
+                "swr-aifm-code-data-platform-6sudmx.swr-pro.myhuaweicloud.com/"
+                "swesandbox/public/repo/platform/pool-00001:owner-repo-v1",
+            )
         return (True,)
 
 
@@ -97,6 +104,10 @@ def test_claim_repo_package_updates_lease_and_retry_in_same_transaction(monkeypa
         "owner__repo-12",
     ]
     assert [task.swegen_retries for task in tasks] == [1, 1, 3]
+    assert {task.image_ref for task in tasks} == {
+        "swr-aifm-code-data-platform-6sudmx.swr-pro.myhuaweicloud.com/"
+        "swesandbox/public/repo/platform/pool-00001:owner-repo-v1"
+    }
     assert connection.committed
     update_call = next(call for call in connection.cursor_instance.calls if "UPDATE" in call[0])
     assert update_call[1] == (
@@ -118,6 +129,13 @@ def test_claim_repo_package_updates_lease_and_retry_in_same_transaction(monkeypa
     assert "MIN(COALESCE(swegen_retries, 0))" in candidate_query
     assert "AVG(COALESCE(swegen_retries, 0))" in candidate_query
     assert "ORDER BY min_retries, avg_retries, task_count DESC, repo" in candidate_query
+    image_query, image_params = next(
+        call
+        for call in connection.cursor_instance.calls
+        if "repo_mapping_swr_image_hk" in call[0]
+    )
+    assert "swr_image_name" in image_query
+    assert image_params == ("owner/repo",)
 
 
 def test_force_and_obs_flags_remove_only_the_requested_filters():

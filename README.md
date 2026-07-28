@@ -204,11 +204,12 @@ A task is successful only after the complete production gate:
 
 1. Harbor validation produces NOP reward `0` and Oracle reward `1`.
 2. Every `[[hacking.llm]]` configured in `swegen.toml` returns `is_hacking=false` for the newly generated task.
-3. The task is copied from `<run>/tasks/` to `<run>/tasks_bz/` and postprocessed.
-4. The retained Harbor image is uploaded to Huawei SWR.
-5. The database row is updated with `swegen_bz_passed=true`.
+3. The original task is copied unchanged from `<run>/tasks/` to `<run>/tasks_bz/`.
+4. A separate copy is written to `<run>/tasks_postprocessed/` and postprocessed.
+5. The retained Harbor image is uploaded to Huawei SWR.
+6. The database row is updated with `swegen_bz_passed=true`.
 
-The `tasks_bz` Dockerfile uses the wce1sr `swesandbox` base, installs the bundled Huawei proxy CA, retains a real clone of the source repository, fetches detached SHAs when necessary, and resets/cleans the repository before checkout to tolerate dirty SWR layers. The local Docker image is pruned only after its SWR upload succeeds.
+The `tasks_bz` tree is an untouched successful-task archive. Dockerfile and metadata rewrites are applied only under `tasks_postprocessed`: its Dockerfile uses the wce1sr `swesandbox` base, installs the bundled Huawei proxy CA, retains a real clone of the source repository, fetches detached SHAs when necessary, and resets/cleans the repository before checkout to tolerate dirty SWR layers. The local Docker image is pruned only after its SWR upload succeeds.
 
 All gate results and failure reasons—including reward-hacking diagnoses—are written to `orchestrator-progress.jsonl` and `orchestrator-instance-status.jsonl`. API credentials, endpoints, model names, database settings, hacking-checker settings, and SWR credentials are centralized in `swegen.toml`; inherited API/model environment variables are ignored.
 
