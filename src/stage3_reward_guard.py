@@ -418,19 +418,56 @@ class Stage3Guard:
             },
         )
 
+    def _scan_pg(self) -> tuple[list[dict[str, Any]], int]:
+        """Fetch reward-backfill rows appended since the last seen id (pg backend).
+
+        Mirrors read_appended_jsonl's incremental contract: returns only records
+        newer than the stored cursor (the BIGSERIAL ``id``), in insertion order.
+        """
+        from swegen import db
+
+        last_id_value = self.state.get("ledger_id")
+        last_id = last_id_value if isinstance(last_id_value, int) else 0
+        try:
+            rows = db.query_all(
+                "SELECT id, payload FROM reward_backfill_status "
+                "WHERE id > %s ORDER BY id ASC",
+                (last_id,),
+            )
+        except Exception:
+            return [], last_id
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            value = row.get("payload")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (ValueError, TypeError):
+                    continue
+            if isinstance(value, dict):
+                records.append(value)
+            rid = row.get("id")
+            if isinstance(rid, int) and rid > last_id:
+                last_id = rid
+        return records, last_id
+
     def scan(self) -> dict[str, Any] | None:
-        inode_value = self.state.get("ledger_inode")
-        inode = inode_value if isinstance(inode_value, int) else None
-        offset_value = self.state.get("ledger_offset")
-        offset = offset_value if isinstance(offset_value, int) else 0
-        resuming = inode is not None
-        records, inode, offset = read_appended_jsonl(
-            self.ledger_path,
-            inode=inode,
-            offset=offset,
-        )
-        self.state["ledger_inode"] = inode
-        self.state["ledger_offset"] = offset
+        resuming = self.state.get("ledger_inode") is not None or self.state.get("ledger_id") is not None
+        if self._ledger_repo.backend == "postgres":
+            records, last_id = self._scan_pg()
+            self.state["ledger_id"] = last_id
+        else:
+            inode_value = self.state.get("ledger_inode")
+            inode = inode_value if isinstance(inode_value, int) else None
+            offset_value = self.state.get("ledger_offset")
+            offset = offset_value if isinstance(offset_value, int) else 0
+            records, inode, offset = read_appended_jsonl(
+                self.ledger_path,
+                inode=inode,
+                offset=offset,
+            )
+            self.state["ledger_inode"] = inode
+            self.state["ledger_offset"] = offset
 
         cutoff = time.time() - self.args.transient_window
         initial_cutoff = self.started_epoch - self.args.lookback_seconds

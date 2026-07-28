@@ -29,6 +29,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from swegen.ledger_repo import LedgerRepo
+
 CREATE_INSTANCE_RE = re.compile(r"--repo\x00([^\x00]+)\x00--pr\x00([^\x00]+)")
 STATUS_JOURNAL_GLOB = "orchestrator-instance-status*.jsonl"
 BACKUP_MARKER = ".before-"
@@ -219,6 +221,28 @@ def shared_postcheck_ledger_path(run_dir: Path) -> Path | None:
     return None
 
 
+def load_authoritative_postchecks(run_dir: Path) -> dict[str, dict[str, Any]]:
+    """Newest postcheck record per instance from the authoritative source.
+
+    With the Postgres backend all per-worker journals and the shared merged
+    ledger are one table (postcheck_status), so this is a single
+    LedgerRepo.load_latest() query — the old multi-path "shared wins ties"
+    ordering is preserved because later writes (including merged verdicts) have
+    higher ids and win the DISTINCT ON tiebreak. In jsonl mode it falls back
+    to the original multi-path load_latest_postchecks over all journals.
+    """
+    paths = authoritative_postcheck_paths(run_dir)
+    shared = run_dir / SHARED_POSTCHECK_LEDGER_NAME
+    repo = LedgerRepo(shared)
+    if repo.backend == "jsonl":
+        # Original semantics: merge all journal paths, shared-ledger wins ties.
+        if not paths:
+            return {}
+        return load_latest_postchecks(paths)
+    # Postgres: one table for every journal + the shared ledger.
+    return repo.load_latest()
+
+
 def _string_value(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -357,42 +381,47 @@ def load_success_ledger(
 ) -> dict[str, dict[str, Any]]:
     """Load the run's authoritative successful-instance ledger."""
     successes: dict[str, dict[str, Any]] = {}
-    sequence: dict[str, tuple[str, int]] = {}
-    if not create_path.exists():
-        return successes
+    repo = LedgerRepo(create_path)
+    # Latest record per task_id (mirrors the old (ts, line_index) dedup).
+    latest = repo.load_latest() if repo.backend == "postgres" else None
+    if latest is None:
+        # jsonl fallback: original file scan.
+        if not create_path.exists():
+            return successes
+        try:
+            fh = create_path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            return successes
+        records: list[dict[str, Any]] = []
+        with fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    records.append(rec)
+    else:
+        records = list(latest.values())
 
-    try:
-        fh = create_path.open(encoding="utf-8", errors="replace")
-    except OSError:
-        return successes
-    with fh:
-        for index, line in enumerate(fh):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(record, dict):
-                continue
-            instance = record.get("task_id")
-            if not isinstance(instance, str) or not instance:
-                harbor = record.get("harbor")
-                instance = Path(harbor).name if isinstance(harbor, str) else ""
-            if not instance:
-                continue
-            timestamp = record.get("ts")
-            if not isinstance(timestamp, str):
-                timestamp = ""
-            key = (timestamp, index)
-            if instance not in sequence or key >= sequence[instance]:
-                success_record = {
-                    "instance": instance,
-                    "status": "success",
-                    "timestamp": timestamp,
-                    "worker_id": None,
-                }
-                _copy_validation_evidence(success_record, record)
-                successes[instance] = _enrich_node_identity(success_record, create_path, run_dir)
-                sequence[instance] = key
+    for record in records:
+        instance = record.get("task_id")
+        if not isinstance(instance, str) or not instance:
+            harbor = record.get("harbor")
+            instance = Path(harbor).name if isinstance(harbor, str) else ""
+        if not instance:
+            continue
+        timestamp = record.get("ts")
+        if not isinstance(timestamp, str):
+            timestamp = ""
+        success_record = {
+            "instance": instance,
+            "status": "success",
+            "timestamp": timestamp,
+            "worker_id": None,
+        }
+        _copy_validation_evidence(success_record, record)
+        successes[instance] = _enrich_node_identity(success_record, create_path, run_dir)
     return successes
 
 
@@ -738,7 +767,7 @@ def load_node_baseline_worker_status(
 
 def load_latest_reward_backfills(run_dir: Path) -> dict[str, dict[str, Any]]:
     """Load independent tests-only reward-hack results, if available."""
-    return load_latest_postchecks(run_dir / REWARD_BACKFILL_LEDGER)
+    return LedgerRepo(run_dir / REWARD_BACKFILL_LEDGER).load_latest()
 
 
 def _utc_timestamp(value: Any) -> datetime | None:
@@ -1011,7 +1040,18 @@ def collect_latest_statuses(
         run_dir=run_dir,
         include_unprocessed=include_unprocessed,
     )
-    for ledger_path in success_ledger_paths(run_dir):
+    # Success ledger paths to merge. In Postgres mode all create.jsonl paths
+    # resolve to one create_success table, so a single canonical path suffices
+    # (and the files may not exist on disk at all). In jsonl mode, merge every
+    # discovered path as before.
+    canonical_success = run_dir / SUCCESS_LEDGER_NAME
+    success_repo = LedgerRepo(canonical_success)
+    success_paths = (
+        [canonical_success]
+        if success_repo.backend == "postgres"
+        else success_ledger_paths(run_dir)
+    )
+    for ledger_path in success_paths:
         for instance, success_record in load_success_ledger(ledger_path, run_dir=run_dir).items():
             current = latest.get(instance)
             if current is None:
@@ -1758,7 +1798,7 @@ def calculate_status(
         run_dir,
         include_unprocessed=True,
     )
-    postchecks = load_latest_postchecks(authoritative_postcheck_paths(run_dir))
+    postchecks = load_authoritative_postchecks(run_dir)
     reward_backfills = load_latest_reward_backfills(run_dir)
     postchecks = merge_reward_backfill_evidence(postchecks, reward_backfills)
     apply_postcheck_evidence(latest, postchecks)
@@ -1815,6 +1855,19 @@ def calculate_status(
                 timespec="seconds"
             )
         except OSError:
+            pass
+    # In Postgres mode the ledger lives in the postcheck_status table; report
+    # that plus a row count so the dashboard still shows ledger provenance.
+    if not ledger_path:
+        try:
+            from swegen import db
+
+            row = db.query_one("SELECT count(*) AS n FROM postcheck_status")
+            if row is not None:
+                ledger["backend"] = "postgres"
+                ledger["table"] = "postcheck_status"
+                ledger["rows"] = row["n"]
+        except Exception:
             pass
     stage_i_throughput = build_stage_i_throughput(throughput_latest)
 
@@ -3099,7 +3152,7 @@ def _reward_hack_records(
 ) -> dict[str, dict[str, Any]]:
     """Return Stage-I tasks accepted or rejected by the reward-hack check."""
     latest, _order = collect_latest_statuses(run_dir)
-    postchecks = load_latest_postchecks(authoritative_postcheck_paths(run_dir))
+    postchecks = load_authoritative_postchecks(run_dir)
     reward_backfills = load_latest_reward_backfills(run_dir)
     postchecks = merge_reward_backfill_evidence(postchecks, reward_backfills)
 

@@ -1098,6 +1098,25 @@ def _load_progress_lists(
 
 def _create_log_has_success(create_log_path: Path, instance: str) -> bool:
     """Return True if run-local create.jsonl has a successful task record."""
+    from swegen.ledger_repo import LedgerRepo
+
+    repo = LedgerRepo(create_log_path)
+    if repo.backend == "postgres":
+        # create_success has typed columns task_id and harbor; match either.
+        from swegen import db
+
+        try:
+            row = db.query_one(
+                "SELECT 1 FROM create_success "
+                "WHERE task_id = %s OR "
+                "(harbor IS NOT NULL AND split_part(harbor, '/', -1) = %s) "
+                "LIMIT 1",
+                (instance, instance),
+            )
+        except Exception:
+            return False
+        return row is not None
+
     if not create_log_path.exists():
         return False
 

@@ -1,8 +1,9 @@
 """Postgres connection layer for the swegen ledger.
 
-Replaces the append-only JSONL ledgers with tables in a dedicated ``swegen``
-database. Configuration is environment-driven (via ``python-dotenv``, which is
-already a project dependency) so no credentials are hard-coded in source.
+Replaces the append-only JSONL ledgers with tables in a dedicated
+``swegen_distributed`` database. Configuration is environment-driven (via
+``python-dotenv``, which is already a project dependency) so no credentials are
+hard-coded in source.
 
 Environment variables (all optional, with the dev defaults shown):
 
@@ -10,7 +11,7 @@ Environment variables (all optional, with the dev defaults shown):
     SWEGEN_PG_PORT=5432
     SWEGEN_PG_USER=root
     SWEGEN_PG_PASSWORD=...        # read from .env, never committed
-    SWEGEN_PG_DB=swegen
+    SWEGEN_PG_DB=swegen_distributed
     SWEGEN_PG_POOL_MIN=1
     SWEGEN_PG_POOL_MAX=4
 
@@ -38,13 +39,13 @@ except Exception:  # pragma: no cover - dotenv is a declared dep, but stay safe
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
-# Dev defaults — host/db match the provisioned swegen instance. The password is
-# NEVER defaulted here; it must come from the environment / .env.
+# Dev defaults — host/db match the provisioned swegen_distributed instance. The
+# password is NEVER defaulted here; it must come from the environment / .env.
 _DEFAULTS = {
     "host": "7.237.95.141",
     "port": "5432",
     "user": "root",
-    "dbname": "swegen",
+    "dbname": "swegen_distributed",
 }
 
 _pool: ConnectionPool | None = None

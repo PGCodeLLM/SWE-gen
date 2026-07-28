@@ -135,6 +135,10 @@ def local_image_tag(instance: str) -> str:
 
 def load_accepted_instances(ledger_path: Path) -> list[str]:
     """Return instance IDs with status='accepted' from the postcheck ledger."""
+    repo = LedgerRepo(ledger_path)
+    if repo.backend == "postgres":
+        return repo.load_accepted()
+    # jsonl fallback: original scan + latest-wins + accepted filter.
     latest: dict[str, dict] = {}
     if not ledger_path.is_file():
         return []
@@ -164,7 +168,27 @@ _jsonl_lock = threading.Lock()
 
 
 def load_jsonl_set(path: Path, key: str = "instance_id") -> set[str]:
-    """Load a set of values from a JSONL file."""
+    """Load a set of values from a JSONL file (jsonl) or the pushed_images
+    table (postgres). The path stem selects the subset: all_images* -> every
+    row for that suffix; pushed_images* -> only rows with pushed=true."""
+    repo = LedgerRepo(path)
+    if repo.backend == "postgres":
+        from swegen import db
+
+        stem = path.stem  # e.g. "all_images_platform" or "pushed_images"
+        only_pushed = stem.startswith("pushed_images")
+        prefix = "pushed_images" if only_pushed else "all_images"
+        suffix = stem[len(prefix):]  # e.g. "_platform" or ""
+        sql = "SELECT DISTINCT instance FROM pushed_images WHERE suffix = %s"
+        params: tuple = (suffix,)
+        if only_pushed:
+            sql += " AND pushed = TRUE"
+        try:
+            rows = db.query_all(sql, params)
+        except Exception:
+            return set()
+        return {r["instance"] for r in rows if r.get("instance")}
+    # jsonl fallback
     if not path.is_file():
         return set()
     values: set[str] = set()

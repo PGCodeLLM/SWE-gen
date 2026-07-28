@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -91,12 +92,58 @@ _TABLE_COLUMNS: dict[str, set[str]] = {
 }
 
 
+# Path-stem prefixes that map to the pushed_images table but carry a per-suffix
+# variant in their filename (e.g. all_images_platform.jsonl, pushed_images_x86.jsonl).
+# The suffix after the prefix is stored in the `suffix` typed column.
+_PUSHED_IMAGE_PREFIXES = ("all_images", "pushed_images")
+
+# Orchestrator ledger stems that get copied per-shard with a region/route/node
+# suffix, e.g. orchestrator-progress-de-n1-a-r6.jsonl or
+# orchestrator-instance-status-sg-n3-b-r9.jsonl. Both map to the same table as
+# the unsuffixed authoritative ledger.
+_ORCHESTRATOR_PREFIXES = ("orchestrator-progress", "orchestrator-instance-status")
+
+# Shard suffix appended to orchestrator ledger copies: a 2-letter region, an
+# optional ``nN-`` node group, a single a/b/c route letter, and ``rN``. Examples:
+#   -de-a-r4   -de-n1-a-r6   -hk-n3-c-r9   -sg-n3-b-r8
+_SHARD_SUFFIX_RE = re.compile(
+    r"-(?P<region>[a-z]{2})"
+    r"(?:-n(?P<node>\d+))?"
+    r"-[abc]"
+    r"-r\d+$"
+)
+
+
+def _image_suffix_from_path(source_file: str) -> str:
+    """Derive the per-registry ``suffix`` column for a pushed_images backfill
+    row from its source filename. ``all_images.jsonl``/``pushed_images.jsonl``
+    -> "" (the "trajectory" registry); ``all_images_platform.jsonl`` ->
+    "_platform". The suffix is everything after the ``all_images`` /
+    ``pushed_images`` prefix in the stem."""
+    stem = Path(source_file).stem
+    for prefix in _PUSHED_IMAGE_PREFIXES:
+        if stem == prefix:
+            return ""
+        if stem.startswith(prefix + "_"):
+            return stem[len(prefix):]  # keeps the leading "_"
+    return ""
+
+
 def _resolve(path: str | Path) -> tuple[str, str]:
     """Return (table, event) for a ledger path, raising on unknown ledgers."""
     p = Path(path)
     stem = p.stem  # e.g. "postcheck-status" from "postcheck-status.jsonl"
     if stem in _TABLE_REGISTRY:
         return _TABLE_REGISTRY[stem]
+    # Suffixed image ledgers: all_images_<sfx> / pushed_images_<sfx>. The prefix
+    # alone is in the registry; the trailing part is the variant suffix.
+    for prefix in _PUSHED_IMAGE_PREFIXES:
+        if stem == prefix or stem.startswith(prefix + "_"):
+            return _TABLE_REGISTRY[prefix]
+    # Per-shard copies of the orchestrator ledgers (region/node/route suffix).
+    for prefix in _ORCHESTRATOR_PREFIXES:
+        if stem.startswith(prefix) and _SHARD_SUFFIX_RE.match(stem, prefix.__len__()):
+            return _TABLE_REGISTRY[prefix]
     # Try the full name in case of unusual stems.
     name = p.name
     if name in _TABLE_REGISTRY:
@@ -192,6 +239,9 @@ class LedgerRepo:
             cols["error"] = record.get("error")
         # pushed_images-specific columns
         if self.table == "pushed_images":
+            # ``instance`` may be carried as ``instance_id`` by raw records;
+            # the canonical writer (push_all_verified) pre-stuffs ``instance``.
+            cols["instance"] = record.get("instance") or record.get("instance_id")
             cols["registry"] = record.get("registry")
             cols["suffix"] = record.get("suffix", "")
             cols["swr_url"] = record.get("swr_url")
@@ -321,6 +371,59 @@ class LedgerRepo:
 # Backfill helper (used by scripts/backfill_jsonl_to_pg.py)
 # ---------------------------------------------------------------------------
 
+def _backfill_columns(
+    table: str,
+    record: dict[str, Any],
+    *,
+    source_file: str,
+    source_line: int,
+) -> dict[str, Any]:
+    """Build the column dict for a backfilled row (shared by row + batch paths)."""
+    cols: dict[str, Any] = {
+        "payload": _json(record),
+        "source_file": source_file,
+        "source_line": source_line,
+    }
+    generic = {
+        "instance": record.get("instance"),
+        "attempt": record.get("attempt") if isinstance(record.get("attempt"), int) else None,
+        "status": record.get("status"),
+        "stage": record.get("stage"),
+        "event": record.get("event", table),
+        "timestamp": record.get("timestamp"),
+    }
+    allowed = _TABLE_COLUMNS.get(table, set())
+    for k, v in generic.items():
+        if k in allowed:
+            cols[k] = v
+    if table == "create_success":
+        cols["task_id"] = record.get("task_id") or record.get("instance")
+        cols["key"] = record.get("key")
+        cols["repo"] = record.get("repo")
+        cols["pr"] = record.get("pr")
+        cols["harbor"] = record.get("harbor")
+        cols["ts"] = record.get("ts")
+    if table == "blacklist":
+        cols["attempts"] = record.get("attempts")
+        cols["blacklisted_at"] = record.get("blacklisted_at")
+        cols["error"] = record.get("error")
+    if table == "pushed_images":
+        # Raw image-ledger lines key the instance on ``instance_id`` (not
+        # ``instance``); the per-registry ``suffix`` is recoverable from the
+        # source filename, and ``pushed`` is implied by the ledger type:
+        # pushed_images*.jsonl holds the verified-pushed subset, all_images*
+        # holds every candidate. ``registry`` (the short label) is not
+        # recoverable from a raw line and is left NULL (nullable).
+        cols["instance"] = record.get("instance") or record.get("instance_id")
+        cols["suffix"] = record.get("suffix", _image_suffix_from_path(source_file))
+        cols["swr_url"] = record.get("swr_url")
+        cols["pushed"] = bool(
+            record.get("pushed", Path(source_file).stem.startswith("pushed_images"))
+        )
+    # Drop None values except payload (which is always required/non-null).
+    return {k: v for k, v in cols.items() if v is not None or k == "payload"}
+
+
 def backfill_row(
     table: str,
     record: dict[str, Any],
@@ -331,11 +434,6 @@ def backfill_row(
     """Insert a backfilled JSONL row tagged with its origin so the import is
     idempotent. Returns True if inserted, False if it was already present
     (ON CONFLICT skip via the partial unique index)."""
-    repo = LedgerRepo.__new__(LedgerRepo)
-    repo.path = Path(source_file)
-    repo.table = table
-    repo.event = record.get("event", table)
-    repo.backend = "postgres"
     with db.connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -344,35 +442,9 @@ def backfill_row(
             )
             if cur.fetchone() is not None:
                 return False
-            cols = {
-                "payload": _json(record),
-                "source_file": source_file,
-                "source_line": source_line,
-            }
-            generic = {
-                "instance": record.get("instance"),
-                "attempt": record.get("attempt") if isinstance(record.get("attempt"), int) else None,
-                "status": record.get("status"),
-                "stage": record.get("stage"),
-                "event": record.get("event", table),
-                "timestamp": record.get("timestamp"),
-            }
-            allowed = _TABLE_COLUMNS.get(table, set())
-            for k, v in generic.items():
-                if k in allowed:
-                    cols[k] = v
-            if table == "create_success":
-                cols["task_id"] = record.get("task_id") or record.get("instance")
-                cols["key"] = record.get("key")
-                cols["repo"] = record.get("repo")
-                cols["pr"] = record.get("pr")
-                cols["harbor"] = record.get("harbor")
-                cols["ts"] = record.get("ts")
-            if table == "blacklist":
-                cols["attempts"] = record.get("attempts")
-                cols["blacklisted_at"] = record.get("blacklisted_at")
-                cols["error"] = record.get("error")
-            clean = {k: v for k, v in cols.items() if v is not None or k == "payload"}
+            clean = _backfill_columns(
+                table, record, source_file=source_file, source_line=source_line
+            )
             colnames = list(clean.keys())
             placeholders = ", ".join(f"%({c})s" for c in colnames)
             collist = ", ".join(colnames)
@@ -380,3 +452,56 @@ def backfill_row(
                 f"INSERT INTO {table} ({collist}) VALUES ({placeholders})", clean
             )
             return True
+
+
+def backfill_rows(
+    table: str,
+    rows: list[tuple[dict[str, Any], int]],
+    *,
+    source_file: str,
+    batch_size: int = 1000,
+) -> tuple[int, int]:
+    """Bulk-insert backfilled rows for one source file, idempotently.
+
+    ``rows`` is a list of ``(record, source_line)`` pairs. Already-imported
+    source_lines are filtered in a single query first, then the remainder is
+    inserted via pipelined ``executemany``. Returns ``(inserted, skipped)``.
+    """
+    if not rows:
+        return (0, 0)
+    with db.connection() as conn:
+        with conn.transaction():
+            # Filter already-imported lines for this file in one round-trip.
+            present: set[int] = set()
+            cur = conn.execute(
+                f"SELECT source_line FROM {table} WHERE source_file = %s",
+                (source_file,),
+            )
+            for r in cur:
+                line = r[0] if not isinstance(r, dict) else r.get("source_line")
+                if isinstance(line, int):
+                    present.add(line)
+            pending = [(rec, ln) for rec, ln in rows if ln not in present]
+            if not pending:
+                return (0, len(rows))
+            # All rows in a file share the same column shape; build from the first.
+            first = _backfill_columns(
+                table, pending[0][0], source_file=source_file, source_line=pending[0][1]
+            )
+            colnames = list(first.keys())
+            collist = ", ".join(colnames)
+            placeholders = ", ".join(f"%({c})s" for c in colnames)
+            sql = f"INSERT INTO {table} ({collist}) VALUES ({placeholders})"
+            cur = conn.cursor()
+            inserted = 0
+            for start in range(0, len(pending), batch_size):
+                chunk = pending[start : start + batch_size]
+                params = [
+                    _backfill_columns(
+                        table, rec, source_file=source_file, source_line=ln
+                    )
+                    for rec, ln in chunk
+                ]
+                cur.executemany(sql, params)
+                inserted += len(chunk)
+            return (inserted, len(rows) - inserted)

@@ -336,13 +336,28 @@ def safe_extract(payload: bytes, destination: Path) -> None:
 # shares one ``/data`` filesystem, so task dirs are already readable by the
 # controller and re-archiving ~180k files over SSH is both redundant and slow
 # enough to wedge the reconcile loop.
-_ARCHIVE_NAME_PATTERNS = (
+# The .jsonl ledgers are only collected in jsonl-backend mode: in postgres mode
+# the canonical ledger already lives in the DB, so scraping stale node-local
+# copies is pointless (and could resurrect superseded rows via backfill).
+_ARCHIVE_LEDGER_PATTERNS = (
     "create.jsonl",
     "orchestrator-instance-status*.jsonl",
     "orchestrator-progress*.jsonl",
+)
+_ARCHIVE_NAME_PATTERNS = (
+    *_ARCHIVE_LEDGER_PATTERNS,
     "task_references.json",
     "slurm-*.out",
 )
+
+
+def _active_archive_patterns() -> tuple[str, ...]:
+    """Patterns to collect, dropping ledger files when the backend is postgres."""
+    from swegen.ledger_repo import LedgerRepo
+
+    if LedgerRepo(Path("create.jsonl")).backend == "postgres":
+        return tuple(p for p in _ARCHIVE_NAME_PATTERNS if p not in _ARCHIVE_LEDGER_PATTERNS)
+    return _ARCHIVE_NAME_PATTERNS
 
 
 def _shared_fs_archive(remote_run_dir: str, destination: Path) -> bool:
@@ -356,7 +371,7 @@ def _shared_fs_archive(remote_run_dir: str, destination: Path) -> bool:
     if not source.is_dir():
         return False
     destination.mkdir(parents=True, exist_ok=True)
-    for pattern in _ARCHIVE_NAME_PATTERNS:
+    for pattern in _active_archive_patterns():
         for match in source.rglob(pattern):
             if not match.is_file():
                 continue
@@ -386,7 +401,8 @@ def collect_archive(
     # journal set directly and skip the SSH transport entirely.
     if _shared_fs_archive(remote_run_dir, destination):
         return
-    name_find = " -o ".join(f"-name {shlex.quote(pattern)}" for pattern in _ARCHIVE_NAME_PATTERNS)
+    patterns = _active_archive_patterns()
+    name_find = " -o ".join(f"-name {shlex.quote(pattern)}" for pattern in patterns)
     script = (
         "set -euo pipefail; "
         f"cd {shlex.quote(remote_run_dir)}; "
