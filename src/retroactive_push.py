@@ -31,6 +31,40 @@ DEFAULT_SWR_REPOSITORY = "aifm.coder.exp/swegen/generated"
 SWEGEN_IMAGE_SUFFIX = "-swegenimage"
 
 
+def load_accepted_instances(ledger_path: Path) -> list[str]:
+    """Return instance IDs with status='accepted' from the postcheck ledger.
+
+    In postgres backend mode the ledger file may not exist on disk; the accepted
+    set is read server-side from the postcheck_status table instead.
+    """
+    from swegen.ledger_repo import LedgerRepo
+
+    repo = LedgerRepo(ledger_path)
+    if repo.backend == "postgres":
+        try:
+            return sorted(repo.load_accepted())
+        except Exception:
+            return []
+    if not ledger_path.is_file():
+        return []
+    latest: dict[str, dict] = {}
+    with ledger_path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            inst = rec.get("instance")
+            if not isinstance(inst, str) or not inst:
+                continue
+            ts = rec.get("timestamp", "")
+            if inst not in latest or ts >= latest[inst].get("timestamp", ""):
+                latest[inst] = rec
+    return sorted(inst for inst, rec in latest.items() if rec.get("status") == "accepted")
+
+
 def _docker_image_name(name: str) -> str:
     """Mirror Harbor's Docker image-name sanitization."""
     name = name.lower()
@@ -51,28 +85,6 @@ def local_image_tag(instance: str) -> str:
 def swr_image_tag(instance: str, registry: str, repository: str) -> str:
     """Return the SWR registry image tag for an instance."""
     return f"{registry}/{repository}:{instance}"
-
-
-def load_accepted_instances(ledger_path: Path) -> list[str]:
-    """Return instance IDs with status='accepted' from the postcheck ledger."""
-    latest: dict[str, dict] = {}
-    if not ledger_path.is_file():
-        return []
-    with ledger_path.open(encoding="utf-8", errors="replace") as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            inst = rec.get("instance")
-            if not isinstance(inst, str) or not inst:
-                continue
-            ts = rec.get("timestamp", "")
-            if inst not in latest or ts >= latest[inst].get("timestamp", ""):
-                latest[inst] = rec
-    return sorted(inst for inst, rec in latest.items() if rec.get("status") == "accepted")
 
 
 def image_exists_in_registry(remote_tag: str) -> bool:

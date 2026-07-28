@@ -271,8 +271,12 @@ def _save_state_record(
             "harbor": str(task_dir.resolve()),
             "ts": datetime.now(UTC).isoformat(),
         }
-        with open(state_file, "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        # Write to the Postgres ledger (create_success table); falls back to
+        # JSONL append when SWEGEN_LEDGER_BACKEND=jsonl. The repo resolves the
+        # table from the path stem ("create" -> create_success).
+        from swegen.ledger_repo import LedgerRepo
+
+        LedgerRepo(state_file).append(rec)
     except (OSError, ValueError) as e:
         # Non-fatal; log but continue
         logger.warning(f"Failed to save state record for {repo_key}: {e}")

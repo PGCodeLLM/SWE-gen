@@ -1098,6 +1098,25 @@ def _load_progress_lists(
 
 def _create_log_has_success(create_log_path: Path, instance: str) -> bool:
     """Return True if run-local create.jsonl has a successful task record."""
+    from swegen.ledger_repo import LedgerRepo
+
+    repo = LedgerRepo(create_log_path)
+    if repo.backend == "postgres":
+        # create_success has typed columns task_id and harbor; match either.
+        from swegen import db
+
+        try:
+            row = db.query_one(
+                "SELECT 1 FROM create_success "
+                "WHERE task_id = %s OR "
+                "(harbor IS NOT NULL AND split_part(harbor, '/', -1) = %s) "
+                "LIMIT 1",
+                (instance, instance),
+            )
+        except Exception:
+            return False
+        return row is not None
+
     if not create_log_path.exists():
         return False
 
@@ -1161,11 +1180,17 @@ def write_progress_jsonl(
     instance_status_path: Path,
 ) -> None:
     """Write compact per-task progress and per-instance status JSONL records."""
+    from swegen.ledger_repo import LedgerRepo
+
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     instance_status_path.parent.mkdir(parents=True, exist_ok=True)
     successful_instances, failed_instances = _load_progress_lists(
         progress_path, instance_status_path
     )
+    # Ledger repositories (Postgres by default; JSONL append when
+    # SWEGEN_LEDGER_BACKEND=jsonl). Path stem resolves the target table.
+    progress_repo = LedgerRepo(progress_path)
+    status_repo = LedgerRepo(instance_status_path)
 
     with progress_path.open("a") as progress_fh, instance_status_path.open("a") as status_fh:
         while True:
@@ -1275,10 +1300,18 @@ def write_progress_jsonl(
                 )
                 if outcome.model_profile_id:
                     progress_record["model_profile_id"] = outcome.model_profile_id
-                status_fh.write(json.dumps(status_record) + "\n")
-                status_fh.flush()
-                progress_fh.write(json.dumps(progress_record) + "\n")
-                progress_fh.flush()
+                if progress_repo.backend == "postgres":
+                    # Postgres: stamp pr for the indexed column and append.
+                    status_record["pr"] = str(outcome.entry.pull_number)
+                    progress_record["pr"] = str(outcome.entry.pull_number)
+                    status_repo.append(status_record)
+                    progress_repo.append(progress_record)
+                else:
+                    # JSONL fallback: original file-handle append.
+                    status_fh.write(json.dumps(status_record) + "\n")
+                    status_fh.flush()
+                    progress_fh.write(json.dumps(progress_record) + "\n")
+                    progress_fh.flush()
             finally:
                 progress_queue.task_done()
 

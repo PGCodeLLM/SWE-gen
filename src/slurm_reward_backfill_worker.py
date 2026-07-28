@@ -38,8 +38,9 @@ from reward_hacking_detector.hacking import (
     check_instance_with_fallback,
     write_instance_log,
 )
-from run_dashboard import collect_latest_statuses, load_latest_postchecks
+from run_dashboard import collect_latest_statuses
 from slurm_collect import job_state, load_plan, redact, run_bytes, safe_extract, srun_base
+from swegen.ledger_repo import LedgerRepo
 
 SAFE_INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 TERMINAL_STATUSES = {"pass", "fail"}
@@ -247,6 +248,9 @@ class RewardBackfillWorker:
         self.run_dir = args.run_dir.resolve()
         self.worker_dir = (args.worker_dir or self.run_dir / ".validation-worker").resolve()
         self.ledger_path = self.worker_dir / "reward-backfill-status.jsonl"
+        # Ledger repository (Postgres by default; JSONL if
+        # SWEGEN_LEDGER_BACKEND=jsonl). Path stem resolves the target table.
+        self._ledger_repo = LedgerRepo(self.ledger_path)
         self.status_path = self.worker_dir / "reward-backfill-worker-status.json"
         self.pid_path = (args.pid_file or self.worker_dir / "reward-backfill-worker.pid").resolve()
         self.tasks_dir = self.worker_dir / "reward-backfill-tasks"
@@ -260,7 +264,7 @@ class RewardBackfillWorker:
         self.generations: dict[str, dict[str, Any]] = {}
         self.generation_order: list[str] = []
         self.node_map: dict[str, dict[str, Any]] = {}
-        self.records = load_latest_postchecks(self.ledger_path)
+        self.records = self._ledger_repo.load_latest()
         self.sequential_records: dict[str, dict[str, Any]] = {}
         self._postcheck_signature: tuple[int, int] | None = None
         self.llm_config, self.fallback_llm_config = self._configure_network()
@@ -372,21 +376,27 @@ class RewardBackfillWorker:
 
     def append(self, record: dict[str, Any], *, publish: bool = True) -> None:
         record["timestamp"] = utc_now()
-        append_private_jsonl(self.ledger_path, record)
+        self._ledger_repo.append(record)
         self.records[str(record["instance"])] = copy.deepcopy(record)
         if publish:
             self.publish_status("running" if self.futures else "idle")
 
     def _refresh_sequential_records(self, *, force: bool = False) -> None:
-        try:
-            stat = self.postcheck_ledger_path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            signature = (-1, -1)
-        if not force and signature == self._postcheck_signature:
-            return
-        self.sequential_records = load_latest_postchecks(self.postcheck_ledger_path)
-        self._postcheck_signature = signature
+        # In jsonl mode the file mtime/size acts as a cheap "unchanged?"
+        # cache; in postgres mode there is no file to stat, so always reload
+        # (the query is the source of truth and cheap).
+        postcheck_repo = LedgerRepo(self.postcheck_ledger_path)
+        if postcheck_repo.backend == "jsonl":
+            try:
+                stat = self.postcheck_ledger_path.stat()
+                signature = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                signature = (-1, -1)
+            if not force and signature == self._postcheck_signature:
+                return
+        self.sequential_records = postcheck_repo.load_latest()
+        if postcheck_repo.backend == "jsonl":
+            self._postcheck_signature = signature
 
     def node_records(self) -> dict[str, dict[str, Any]]:
         """Resolve each node to the newest usable record across both plans."""

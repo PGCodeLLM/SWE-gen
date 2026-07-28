@@ -48,6 +48,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from swegen.ledger_repo import LedgerRepo
+
 SWEGEN_IMAGE_SUFFIX = "-swegenimage"
 
 # ── Registry definitions ────────────────────────────────────────────
@@ -70,6 +72,12 @@ class Registry:
 
     def remote_tag(self, instance: str) -> str:
         return f"{self.registry}/{self.repository}:{instance}"
+
+    def all_images_repo(self) -> LedgerRepo:
+        return LedgerRepo(self.all_images_path)
+
+    def pushed_images_repo(self) -> LedgerRepo:
+        return LedgerRepo(self.pushed_images_path)
 
 
 DEFAULT_REGISTRIES = [
@@ -127,6 +135,10 @@ def local_image_tag(instance: str) -> str:
 
 def load_accepted_instances(ledger_path: Path) -> list[str]:
     """Return instance IDs with status='accepted' from the postcheck ledger."""
+    repo = LedgerRepo(ledger_path)
+    if repo.backend == "postgres":
+        return repo.load_accepted()
+    # jsonl fallback: original scan + latest-wins + accepted filter.
     latest: dict[str, dict] = {}
     if not ledger_path.is_file():
         return []
@@ -156,7 +168,27 @@ _jsonl_lock = threading.Lock()
 
 
 def load_jsonl_set(path: Path, key: str = "instance_id") -> set[str]:
-    """Load a set of values from a JSONL file."""
+    """Load a set of values from a JSONL file (jsonl) or the pushed_images
+    table (postgres). The path stem selects the subset: all_images* -> every
+    row for that suffix; pushed_images* -> only rows with pushed=true."""
+    repo = LedgerRepo(path)
+    if repo.backend == "postgres":
+        from swegen import db
+
+        stem = path.stem  # e.g. "all_images_platform" or "pushed_images"
+        only_pushed = stem.startswith("pushed_images")
+        prefix = "pushed_images" if only_pushed else "all_images"
+        suffix = stem[len(prefix):]  # e.g. "_platform" or ""
+        sql = "SELECT DISTINCT instance FROM pushed_images WHERE suffix = %s"
+        params: tuple = (suffix,)
+        if only_pushed:
+            sql += " AND pushed = TRUE"
+        try:
+            rows = db.query_all(sql, params)
+        except Exception:
+            return set()
+        return {r["instance"] for r in rows if r.get("instance")}
+    # jsonl fallback
     if not path.is_file():
         return set()
     values: set[str] = set()
@@ -179,6 +211,21 @@ def append_jsonl(path: Path, record: dict) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
             f.flush()
+
+
+def _append_image_record(repo: LedgerRepo, record: dict, *, reg: "Registry", pushed: bool) -> None:
+    """Append an image ledger record via the repo, stamping the indexed
+    columns (instance/registry/suffix/pushed) used for set-membership reads.
+    The full record (with instance_id, swr_url, timestamps) is kept in payload."""
+    record = {
+        **record,
+        "instance": record.get("instance_id"),
+        "registry": reg.name,
+        "suffix": reg.file_suffix,
+        "pushed": pushed,
+    }
+    with _jsonl_lock:
+        repo.append(record)
 
 
 # ── Docker operations ───────────────────────────────────────────────
@@ -386,10 +433,15 @@ def process_instance(
     for reg in registries:
         remote_tag = reg.remote_tag(instance)
         if instance not in reg.already_recorded:
-            append_jsonl(reg.all_images_path, {
-                "instance_id": instance,
-                "swr_url": remote_tag,
-            })
+            _append_image_record(
+                reg.all_images_repo(),
+                {
+                    "instance_id": instance,
+                    "swr_url": remote_tag,
+                },
+                reg=reg,
+                pushed=False,
+            )
             reg.already_recorded.add(instance)
 
         if instance in reg.already_pushed:
@@ -399,11 +451,16 @@ def process_instance(
 
         if not args.skip_registry_check and image_exists_in_registry(remote_tag):
             log(f"  [{reg.name}] REGISTRY already has it")
-            append_jsonl(reg.pushed_images_path, {
-                "instance_id": instance,
-                "swr_url": remote_tag,
-                "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
+            _append_image_record(
+                reg.pushed_images_repo(),
+                {
+                    "instance_id": instance,
+                    "swr_url": remote_tag,
+                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+                reg=reg,
+                pushed=True,
+            )
             reg.already_pushed.add(instance)
             result.skipped.append(reg.name)
             continue
@@ -453,11 +510,16 @@ def process_instance(
     for reg in pending:
         remote_tag = reg.remote_tag(instance)
         if push_to_registry(local_tag, remote_tag, log=log):
-            append_jsonl(reg.pushed_images_path, {
-                "instance_id": instance,
-                "swr_url": remote_tag,
-                "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
+            _append_image_record(
+                reg.pushed_images_repo(),
+                {
+                    "instance_id": instance,
+                    "swr_url": remote_tag,
+                    "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+                reg=reg,
+                pushed=True,
+            )
             reg.already_pushed.add(instance)
             result.pushed.append(reg.name)
         else:

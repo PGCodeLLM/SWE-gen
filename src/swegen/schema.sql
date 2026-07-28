@@ -1,0 +1,193 @@
+-- swegen ledger schema
+--
+-- Replaces the append-only JSONL ledgers with Postgres tables. Design rules:
+--
+--   * Append, don't upsert. Every write is a plain INSERT; "latest wins" is
+--     computed on read, mirroring load_latest_postchecks() which kept the
+--     newest record per `instance` by (attempt, timestamp, line_index). A
+--     BIGSERIAL `id` stands in for line_index; `written_at` for timestamp.
+--     This preserves the original write-never-blocks semantics and avoids
+--     upsert contention across the sharded workers.
+--   * Hot query fields are typed columns; the full original record is kept in
+--     `payload JSONB` so no data is lost vs. the JSONL files and reads can
+--     reconstruct the exact dict the workers used to emit.
+--   * `source_file` + `source_line` tag rows imported by the JSONL backfill
+--     so it is idempotent; worker-written rows leave them NULL.
+--
+-- Applied on first connect by swegen.db.apply_schema().
+
+-- ---------------------------------------------------------------------------
+-- postcheck-status.jsonl  (ValidationWorker, +shared merged copy)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS postcheck_status (
+    id              BIGSERIAL PRIMARY KEY,
+    instance        TEXT        NOT NULL,
+    attempt         INTEGER     NOT NULL DEFAULT 1,
+    status          TEXT,
+    stage           TEXT,
+    event           TEXT        NOT NULL DEFAULT 'postcheck_status',
+    schema_version  INTEGER     NOT NULL DEFAULT 1,
+    worker_id       TEXT,
+    checker_node    TEXT,
+    source_node     TEXT,
+    merged_from_backfill BOOLEAN NOT NULL DEFAULT FALSE,
+    timestamp       TEXT,
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_postcheck_latest
+    ON postcheck_status (instance, attempt DESC, written_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_postcheck_status
+    ON postcheck_status (status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_postcheck_backfill
+    ON postcheck_status (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- reward-backfill-status.jsonl  (RewardBackfillWorker)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS reward_backfill_status (
+    id              BIGSERIAL PRIMARY KEY,
+    instance        TEXT        NOT NULL,
+    attempt         INTEGER     NOT NULL DEFAULT 1,
+    status          TEXT,
+    stage           TEXT,
+    event           TEXT        NOT NULL DEFAULT 'reward_backfill_status',
+    schema_version  INTEGER     NOT NULL DEFAULT 1,
+    worker_id       TEXT,
+    checker_node    TEXT,
+    source_node     TEXT,
+    timestamp       TEXT,
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_reward_backfill_latest
+    ON reward_backfill_status (instance, attempt DESC, written_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_reward_backfill_status
+    ON reward_backfill_status (status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reward_backfill_backfill
+    ON reward_backfill_status (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- blacklist.jsonl  (ValidationWorker._record_blacklist)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS blacklist (
+    id              BIGSERIAL PRIMARY KEY,
+    instance        TEXT        NOT NULL,
+    stage           TEXT,
+    attempts        INTEGER,
+    blacklisted_at  TEXT,
+    error           TEXT,
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_blacklist_instance
+    ON blacklist (instance, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_blacklist_backfill
+    ON blacklist (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- create.jsonl  (success ledger, swegen/create/create.py) — keyed by task_id
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS create_success (
+    id              BIGSERIAL PRIMARY KEY,
+    task_id         TEXT        NOT NULL,
+    key             TEXT,
+    repo            TEXT,
+    pr              TEXT,
+    harbor          TEXT,
+    ts              TEXT,
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_create_success_task
+    ON create_success (task_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_create_success_backfill
+    ON create_success (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- stage3-reward-guard.jsonl  (Stage3Guard.emit)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS stage3_reward_guard (
+    id              BIGSERIAL PRIMARY KEY,
+    instance        TEXT,
+    event           TEXT        NOT NULL DEFAULT 'stage3_reward_guard',
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_stage3_guard_instance
+    ON stage3_reward_guard (instance, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_stage3_guard_backfill
+    ON stage3_reward_guard (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- orchestrator-progress.jsonl  /  orchestrator-instance-status.jsonl
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS orchestrator_progress (
+    id              BIGSERIAL PRIMARY KEY,
+    pr              TEXT,
+    instance        TEXT,
+    status          TEXT,
+    event           TEXT        NOT NULL DEFAULT 'orchestrator_progress',
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_orch_progress_pr
+    ON orchestrator_progress (pr, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_orch_progress_backfill
+    ON orchestrator_progress (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS orchestrator_instance_status (
+    id              BIGSERIAL PRIMARY KEY,
+    instance        TEXT        NOT NULL,
+    status          TEXT,
+    event           TEXT        NOT NULL DEFAULT 'orchestrator_instance_status',
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_orch_instance_latest
+    ON orchestrator_instance_status (instance, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_orch_instance_backfill
+    ON orchestrator_instance_status (source_file, source_line)
+    WHERE source_file IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- all_images<suffix>.jsonl / pushed_images<suffix>.jsonl  (push_all_verified)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pushed_images (
+    id              BIGSERIAL PRIMARY KEY,
+    instance        TEXT        NOT NULL,
+    registry        TEXT,
+    suffix          TEXT        NOT NULL DEFAULT '',
+    swr_url         TEXT,
+    pushed          BOOLEAN     NOT NULL DEFAULT FALSE,
+    event           TEXT        NOT NULL DEFAULT 'pushed_images',
+    written_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_file     TEXT,
+    source_line     INTEGER,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_pushed_images_lookup
+    ON pushed_images (registry, suffix, instance, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pushed_images_backfill
+    ON pushed_images (source_file, source_line)
+    WHERE source_file IS NOT NULL;

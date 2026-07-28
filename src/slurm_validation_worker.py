@@ -47,6 +47,7 @@ from reward_hacking_detector.hacking import (
 )
 from run_dashboard import collect_latest_statuses
 from slurm_collect import load_plan, redact
+from swegen.ledger_repo import LedgerRepo
 from swegen.tools.harbor_runner import parse_harbor_outcome, run_harbor_agent
 from swegen.tools.validate_utils import validate_task_structure
 
@@ -474,6 +475,10 @@ class ValidationWorker:
             if configured_ledger
             else self.worker_dir / "postcheck-status.jsonl"
         )
+        # Ledger repository: writes to Postgres (or JSONL if
+        # SWEGEN_LEDGER_BACKEND=jsonl). The path's stem resolves the target
+        # table (postcheck-status -> postcheck_status). See swegen.ledger_repo.
+        self._ledger_repo = LedgerRepo(self.ledger_path)
         configured_backfill_ledger = getattr(args, "reward_backfill_ledger", None)
         self.reward_backfill_ledger_path = (
             configured_backfill_ledger or self.worker_dir / "reward-backfill-status.jsonl"
@@ -517,7 +522,7 @@ class ValidationWorker:
         # newly-found work by _owns_shard; this applies the same rule at load.
         self.records = {
             instance: record
-            for instance, record in load_latest_postchecks(self.ledger_path).items()
+            for instance, record in self._ledger_repo.load_latest().items()
             if self._owns_shard(instance)
         }
         self.plan_paths = [path.resolve() for path in args.plan]
@@ -604,7 +609,7 @@ class ValidationWorker:
         path = getattr(self, "reward_backfill_ledger_path", None)
         if not isinstance(path, Path):
             return {}
-        return load_latest_postchecks(path)
+        return LedgerRepo(path).load_latest()
 
     def sync_backfill_reward(self, record: dict[str, Any]) -> str | None:
         if self._is_baseline_only():
@@ -709,7 +714,11 @@ class ValidationWorker:
             ledger_lock = threading.Lock()
             self._ledger_lock = ledger_lock
         with ledger_lock:
-            append_private_jsonl(self.ledger_path, record)
+            ledger_repo = getattr(self, "_ledger_repo", None)
+            if ledger_repo is None:
+                ledger_repo = LedgerRepo(self.ledger_path)
+                self._ledger_repo = ledger_repo
+            ledger_repo.append(record)
         with self._state_guard():
             self.records[str(record["instance"])] = copy.deepcopy(record)
         if publish and self._worker_thread_may_publish_status():
@@ -992,8 +1001,7 @@ class ValidationWorker:
         """
         blacklist_path = self.worker_dir / "blacklist.jsonl"
         try:
-            append_private_jsonl(
-                blacklist_path,
+            LedgerRepo(blacklist_path).append(
                 {
                     "instance": instance,
                     "stage": stage,

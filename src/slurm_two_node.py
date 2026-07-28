@@ -163,7 +163,24 @@ def completed_instances(run_dir: Path) -> set[str]:
     """Return successful instances that still have a local task artifact."""
     ledger = run_dir / "create.jsonl"
     successful: set[str] = set()
-    if ledger.is_file():
+    from swegen.ledger_repo import LedgerRepo
+
+    repo = LedgerRepo(ledger)
+    if repo.backend == "postgres":
+        try:
+            records = repo.load_all()
+        except Exception:
+            records = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            instance = record.get("task_id")
+            if not isinstance(instance, str) or not instance:
+                harbor = record.get("harbor")
+                instance = Path(harbor).name if isinstance(harbor, str) else ""
+            if instance:
+                successful.add(instance)
+    elif ledger.is_file():
         with ledger.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
