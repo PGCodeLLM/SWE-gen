@@ -48,25 +48,30 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
 import random
 import re
-import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import TextIO
 from urllib.parse import urlsplit
 
 import requests
 from dotenv import load_dotenv
+from dotenv.parser import parse_stream
 
 from swegen.net import github_requests_kwargs, requests_ssl_kwargs
 
@@ -78,11 +83,6 @@ DEFAULT_RUNS_DIR = Path("runs")
 DEFAULT_REPO_CACHE_DIR = Path("data_cache/repos")
 RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 SWEGEN_IMAGE_SUFFIX = "-swegenimage"
-
-# The legacy in-process Slurm fan-out assumed a shared filesystem and obsolete
-# node names.  It remains parseable only to emit a migration error; new Slurm
-# runs are planned and staged by ``src/slurm_two_node.py``.
-SLURM_NODES: list[str] = []
 
 # Substrings in a failed `swegen create` run that indicate a transient
 # network/API error worth retrying (vs. a genuine task failure like a trivial
@@ -102,6 +102,66 @@ RETRYABLE_ERROR_SIGNATURES = (
     "503 Server Error: Service Unavailable",
     "504 Gateway Timeout",
     "529",
+)
+
+# Authentication and capacity failures from the model backend are operational
+# failures, not evidence that a generated task has invalid NOP/Oracle behavior.
+# Keep these separate from the generic transport signatures above because they
+# are matched case-insensitively and include the structured error codes emitted
+# by OpenAI-compatible gateways such as LiteLLM.
+MODEL_API_FAILURE_SIGNATURES = (
+    "authenticationerror",
+    "authentication_error",
+    "authentication_failed",
+    "authentication failed",
+    "authentication failure",
+    "failed to authenticate",
+    "incorrect api key",
+    "invalid api key",
+    "api key is invalid",
+    "api key not valid",
+    "invalid x-api-key",
+    "not authorized to use model",
+    "does not have access to model",
+    "model access denied",
+    "no authentication configured",
+    "could not resolve authentication method",
+    "openai_api_key not set",
+    "anthropic_api_key not set",
+    "insufficient_quota",
+    "quota_exceeded",
+    "resource_exhausted",
+    "usage_exhausted",
+    "usage exhausted",
+    "quota exhausted",
+    "credits exhausted",
+    "resource exhausted",
+    "usage limit exceeded",
+    "quota exceeded",
+    "credit limit exceeded",
+    "exceeded your current quota",
+    "credit balance is too low",
+    "insufficient credits",
+    "billing hard limit",
+    "remainquota",
+)
+
+# Match common rendered forms without treating an unrelated bare number 401 as
+# an API failure. Examples include ``Error code: 401``, ``HTTP/1.1 401``, and
+# JSON-ish ``status_code: 401`` diagnostics.
+BACKEND_HTTP_401_RE = re.compile(
+    r"(?:\bhttp(?:/\d(?:\.\d)?)?\s*401\b|"
+    r"\b(?:api error|error code|status(?:[_ ]code)?)\s*[:=]\s*401\b|"
+    r"\b401\s+(?:client error|unauthorized)\b)",
+    re.IGNORECASE,
+)
+
+# Credential pools often report a sentence rather than a stable error code,
+# e.g. "all credentials are exhausted" or "API keys are cooling down".
+CREDENTIAL_EXHAUSTION_RE = re.compile(
+    r"\b(?:credentials?|api keys?)\b[^\n]{0,100}"
+    r"\b(?:exhausted|depleted|unavailable|cooling down)\b",
+    re.IGNORECASE,
 )
 # Substrings indicating the active GitHub token is rate limited / forbidden, so
 # the run should be retried with a *different* token from the configured pool.
@@ -137,25 +197,18 @@ MAX_CC_TIMEOUT_SECONDS = 3 * 60 * 60
 # internal mirror so generated tasks build against it.
 DOCKERFILE_BASE_FROM = "FROM ubuntu:24.04"
 DOCKERFILE_BASE_REPLACEMENT = (
-    "FROM swr-aifm-code-data-platform-6sudmx.swr-pro.myhuaweicloud.com/"
-    "swesandbox/ubuntu:24.04"
+    "FROM swr-aifm-code-data-platform-6sudmx.swr-pro.myhuaweicloud.com/swesandbox/ubuntu:24.04"
 )
 
 # Post-processing: Voyager repo images already contain the repository under
 # /app/<owner>/<repo>, so generated Dockerfiles should move that checkout to the
 # task's working path and then check out the fixed PR commit there.
-VOYAGER_PATH_MARKER = (
-    "# Move the preloaded Voyager repository to the path expected by the task."
-)
+VOYAGER_PATH_MARKER = "# Move the preloaded Voyager repository to the path expected by the task."
 FROM_RE = re.compile(r"^FROM\s+\S+(?P<suffix>.*)$")
 HEAD_SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
-LOG_TIMESTAMP_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00\s+"
-)
+LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00\s+")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-GIT_FETCH_HEAD_RE = re.compile(
-    r"\bgit fetch(?: --depth \d+)? origin (?P<sha>[0-9a-f]{40})\b"
-)
+GIT_FETCH_HEAD_RE = re.compile(r"\bgit fetch(?: --depth \d+)? origin (?P<sha>[0-9a-f]{40})\b")
 GIT_CHECKOUT_RE = re.compile(
     r"^RUN cd (?P<path>\S+) && git checkout --detach (?P<sha>[0-9a-f]{40})$"
 )
@@ -171,10 +224,53 @@ SECRET_ENV_VARS = {
     "openai_base_url": "OPENAI_BASE_URL",
 }
 
-WORKER_PROXY_POOL_ENV = "SWEGEN_WORKER_PROXY_POOL"
-CLAUDE_PROXY_POOL_ENV = "SWEGEN_CLAUDE_PROXY_POOL"
-PROXY_CAPACITY_ENV = "SWEGEN_PROXY_WORKERS_PER_ENDPOINT"
-DEFAULT_PROXY_CAPACITY = 16
+MODEL_PROFILE_DIR_ENV = "SWEGEN_MODEL_PROFILE_DIR"
+MODEL_PROFILE_ID_ENV = "SWEGEN_MODEL_PROFILE"
+MODEL_PROFILE_MANIFEST = "profiles.list"
+MODEL_PROFILE_FILE_RE = re.compile(r"^backend-[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.env$")
+MODEL_PROFILE_ENV_VARS = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_MODEL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    }
+)
+MODEL_PROFILE_STALE_AUTH_VARS = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+MODEL_PROFILE_FAST_MODEL_VARS = frozenset(
+    {
+        "SWEGEN_CLAUDE_FAST_MODEL",
+        "SWEGEN_CLAUDE_FAST_FALLBACK_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    }
+)
+MODEL_PROFILE_URL_VARS = frozenset({"OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"})
+MODEL_PROFILE_MODEL_VARS = frozenset(
+    {
+        "OPENAI_MODEL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    }
+)
+
+
+class ModelProfileError(ValueError):
+    """A configured model endpoint profile is unsafe or incomplete."""
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    """One complete, task-scoped model backend environment."""
+
+    profile_id: str
+    env: dict[str, str] = field(repr=False)
 
 
 @dataclass
@@ -199,6 +295,7 @@ class Outcome:
     image_names: tuple[str, ...] = ()
     image_ids: tuple[str, ...] = ()
     compose_projects: tuple[str, ...] = ()
+    model_profile_id: str = ""
 
     @property
     def ok(self) -> bool:
@@ -214,6 +311,7 @@ class ProcessResult:
     image_names: tuple[str, ...] = ()
     image_ids: tuple[str, ...] = ()
     compose_projects: tuple[str, ...] = ()
+    model_profile_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -256,9 +354,7 @@ class TimestampedLog:
         return self._fh.fileno()
 
 
-def run_command_to_log(
-    cmd: list[str], env: dict[str, str], log: TimestampedLog
-) -> int:
+def run_command_to_log(cmd: list[str], env: dict[str, str], log: TimestampedLog) -> int:
     """Run a command and timestamp each combined stdout/stderr line."""
     proc = subprocess.Popen(
         cmd,
@@ -296,18 +392,12 @@ def load_entries(jsonl_path: Path) -> list[Entry]:
                 repo = str(obj["repo"]).strip()
                 pull_number = str(obj["pull_number"]).strip()
             except KeyError as err:
-                raise ValueError(
-                    f"{jsonl_path}:{lineno}: missing required key {err}"
-                ) from err
+                raise ValueError(f"{jsonl_path}:{lineno}: missing required key {err}") from err
             if not repo or not pull_number:
-                raise ValueError(
-                    f"{jsonl_path}:{lineno}: empty 'repo' or 'pull_number'"
-                )
+                raise ValueError(f"{jsonl_path}:{lineno}: empty 'repo' or 'pull_number'")
             # Optional: used by post-processing to populate task metadata.
             base_commit = str(obj.get("base_commit", "")).strip()
-            image_ref = str(
-                obj.get("image_ref") or obj.get("voyager_image_ref") or ""
-            ).strip()
+            image_ref = str(obj.get("image_ref") or obj.get("voyager_image_ref") or "").strip()
             entries.append(
                 Entry(
                     repo=repo,
@@ -329,44 +419,6 @@ def _pr_desc_key(entry: Entry) -> tuple[int, int, str]:
         return (0, -int(entry.pull_number), "")
     except ValueError:
         return (1, 0, entry.pull_number)
-
-
-def split_into_segments(items: list[Entry], n: int) -> list[list[Entry]]:
-    """Partition entries into up to ``n`` balanced segments, one repo per segment.
-
-    Every PR of a given repo is kept together in a single segment, so the shared
-    per-repo git cache (data_cache/repos/<repo>) is never touched by two workers at
-    once. Repos are distributed greedily (largest group first → least-loaded
-    segment) to balance the number of PRs per segment as evenly as the
-    one-repo-per-segment constraint allows. Within a segment, each repo's PRs are
-    ordered from highest PR number to lowest, and same-repo PRs are contiguous.
-
-    Returns at most ``min(n, number-of-repos)`` non-empty segments.
-    """
-    if not items:
-        return []
-
-    # Group by repo (first-seen order kept only for stable tie-breaking later).
-    groups: dict[str, list[Entry]] = {}
-    for entry in items:
-        groups.setdefault(entry.repo, []).append(entry)
-
-    # Order each repo's PRs highest → lowest.
-    for entries in groups.values():
-        entries.sort(key=_pr_desc_key)
-
-    num_bins = max(1, min(n, len(groups)))
-    bins: list[list[Entry]] = [[] for _ in range(num_bins)]
-    loads = [0] * num_bins
-
-    # Greedy longest-processing-time: assign the largest repo groups first, each
-    # to the currently least-loaded segment (ties broken by lowest index).
-    for _repo, entries in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        target = min(range(num_bins), key=lambda i: (loads[i], i))
-        bins[target].extend(entries)
-        loads[target] += len(entries)
-
-    return bins
 
 
 def build_packages(
@@ -435,117 +487,189 @@ def build_child_env(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
-def _proxy_pool(env: dict[str, str], key: str) -> list[str]:
-    return [item.strip() for item in env.get(key, "").split(",") if item.strip()]
+def _validate_model_profile_value(profile_id: str, name: str, value: str) -> None:
+    if not value or value != value.strip():
+        raise ModelProfileError(f"model profile {profile_id} has an empty or padded {name}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ModelProfileError(f"model profile {profile_id} has control characters in {name}")
+
+    if name in MODEL_PROFILE_URL_VARS:
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            _port = parsed.port
+        except ValueError as error:
+            raise ModelProfileError(f"model profile {profile_id} has an invalid {name}") from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not hostname
+            or any(character.isspace() for character in value)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ModelProfileError(f"model profile {profile_id} has an invalid {name}")
+    elif name in MODEL_PROFILE_MODEL_VARS and len(value) > 256:
+        raise ModelProfileError(f"model profile {profile_id} has an invalid {name}")
 
 
-def _proxy_bypass_value(env: dict[str, str], proxy_urls: list[str]) -> str:
-    """Return NO_PROXY with every proxy endpoint host included exactly."""
-    entries: list[str] = []
-    seen: set[str] = set()
-
-    for value in (env.get("no_proxy", ""), env.get("NO_PROXY", "")):
-        for item in value.split(","):
-            item = item.strip()
-            normalized = item.casefold()
-            if item and normalized not in seen:
-                seen.add(normalized)
-                entries.append(item)
-
-    for proxy_url in proxy_urls:
-        host = urlsplit(proxy_url).hostname
-        normalized = host.casefold() if host else ""
-        if host and normalized not in seen:
-            seen.add(normalized)
-            entries.append(host)
-
-    return ",".join(entries)
-
-
-def _proxy_capacity(env: dict[str, str]) -> int:
-    raw = env.get(PROXY_CAPACITY_ENV, str(DEFAULT_PROXY_CAPACITY)).strip()
+@contextmanager
+def _open_private_text(path: Path, label: str) -> Iterator[TextIO]:
+    """Open one mode-0600 regular file without following a replacement symlink."""
     try:
-        capacity = int(raw)
-    except ValueError as error:
-        raise ValueError(f"{PROXY_CAPACITY_ENV} must be an integer, got {raw!r}") from error
-    if capacity <= 0:
-        raise ValueError(f"{PROXY_CAPACITY_ENV} must be positive")
-    return capacity
+        metadata = path.lstat()
+    except OSError as error:
+        raise ModelProfileError(f"could not inspect {label}: {error}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ModelProfileError(f"{label} must be a regular file")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise ModelProfileError(f"{label} must be a regular file")
+        mode = stat.S_IMODE(opened_metadata.st_mode)
+        if mode != 0o600:
+            raise ModelProfileError(f"{label} must be mode 0600 (found {mode:04o})")
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = -1
+            yield stream
+    except ModelProfileError:
+        raise
+    except OSError as error:
+        raise ModelProfileError(f"could not open {label}: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
-def validate_worker_proxy_config(env: dict[str, str], workers: int) -> list[str]:
-    """Validate proxy pools and return human-readable worker assignments."""
-    socks_pool = _proxy_pool(env, WORKER_PROXY_POOL_ENV)
-    claude_pool = _proxy_pool(env, CLAUDE_PROXY_POOL_ENV)
-    if not socks_pool and not claude_pool:
-        return []
-    if not socks_pool or not claude_pool:
-        raise ValueError(
-            f"{WORKER_PROXY_POOL_ENV} and {CLAUDE_PROXY_POOL_ENV} must both be set"
+def _read_model_profile(path: Path) -> ModelProfile:
+    if not MODEL_PROFILE_FILE_RE.fullmatch(path.name):
+        raise ModelProfileError("model profile has an invalid backend-*.env filename")
+    profile_id = path.stem
+
+    values: dict[str, str] = {}
+    try:
+        with _open_private_text(path, f"model profile {profile_id}") as stream:
+            for binding in parse_stream(stream):
+                if binding.error:
+                    raise ModelProfileError(
+                        f"model profile {profile_id} has malformed syntax "
+                        f"at line {binding.original.line}"
+                    )
+                if binding.key is None:
+                    continue
+                if binding.value is None:
+                    raise ModelProfileError(
+                        f"model profile {profile_id} has no value for {binding.key}"
+                    )
+                if binding.key in values:
+                    raise ModelProfileError(f"model profile {profile_id} repeats {binding.key}")
+                values[binding.key] = binding.value
+    except ModelProfileError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise ModelProfileError(f"could not read model profile {profile_id}: {error}") from error
+
+    unknown = sorted(set(values) - MODEL_PROFILE_ENV_VARS)
+    if unknown:
+        raise ModelProfileError(
+            f"model profile {profile_id} has unsupported variables: {', '.join(unknown)}"
         )
-    if len(socks_pool) != len(claude_pool):
-        raise ValueError("worker SOCKS and Claude proxy pools must have equal lengths")
-
-    capacity = _proxy_capacity(env)
-    maximum = len(socks_pool) * capacity
-    if workers > maximum:
-        raise ValueError(
-            f"{workers} workers exceed proxy capacity {maximum} "
-            f"({len(socks_pool)} endpoints x {capacity})"
+    missing = sorted(MODEL_PROFILE_ENV_VARS - set(values))
+    if missing:
+        raise ModelProfileError(
+            f"model profile {profile_id} is missing required variables: {', '.join(missing)}"
         )
+    for name, value in values.items():
+        _validate_model_profile_value(profile_id, name, value)
 
-    assignments: list[str] = []
-    for index, socks_proxy in enumerate(socks_pool):
-        first = index * capacity
-        if first >= workers:
-            break
-        last = min(workers, first + capacity) - 1
-        assignments.append(
-            f"workers {first}-{last}: {socks_proxy} "
-            f"(Claude bridge {claude_pool[index]})"
-        )
-    return assignments
-
-
-def worker_child_env(base_env: dict[str, str], worker_id: int) -> dict[str, str]:
-    """Return a child environment pinned to this worker's proxy endpoint."""
-    socks_pool = _proxy_pool(base_env, WORKER_PROXY_POOL_ENV)
-    if not socks_pool:
-        return base_env
-    claude_pool = _proxy_pool(base_env, CLAUDE_PROXY_POOL_ENV)
-    capacity = _proxy_capacity(base_env)
-    endpoint_index = worker_id // capacity
-    if endpoint_index >= len(socks_pool) or endpoint_index >= len(claude_pool):
-        raise ValueError(f"worker {worker_id} has no configured proxy endpoint")
-
-    socks_proxy = socks_pool[endpoint_index]
-    claude_proxy = claude_pool[endpoint_index]
-    plain_http_proxy = base_env.get("GIT_PROXY", "").strip() or claude_proxy
-    no_proxy = _proxy_bypass_value(base_env, socks_pool)
-    env = base_env.copy()
-    env.update(
-        {
-            # Some HTTP client stacks accept a socks5:// URL syntactically but
-            # still send an HTTP CONNECT request to it. Route all HTTPS traffic
-            # through our HTTP-to-SOCKS bridge so only the bridge ever speaks
-            # the raw SOCKS5 protocol. Plain HTTP stays on the SG proxy.
-            "http_proxy": plain_http_proxy,
-            "https_proxy": claude_proxy,
-            "HTTP_PROXY": plain_http_proxy,
-            "HTTPS_PROXY": claude_proxy,
-            "ALL_PROXY": claude_proxy,
-            "SWEGEN_CLAUDE_PROXY": claude_proxy,
-            "SWEGEN_CLAUDE_HTTP_PROXY": plain_http_proxy,
-            "SWEGEN_ASSIGNED_SOCKS_PROXY": socks_proxy,
-            "SWEGEN_PROXY_ENDPOINT_INDEX": str(endpoint_index),
-            # A worker may probe or connect to its SOCKS endpoint directly.
-            # Exact host entries are required because wildcard forms such as
-            # ``10.*`` are not interpreted consistently across HTTP stacks.
-            "no_proxy": no_proxy,
-            "NO_PROXY": no_proxy,
-        }
+    return ModelProfile(
+        profile_id=profile_id,
+        env={name: values[name] for name in sorted(MODEL_PROFILE_ENV_VARS)},
     )
-    return env
+
+
+def _profile_paths(directory: Path) -> list[Path]:
+    manifest = directory / MODEL_PROFILE_MANIFEST
+    if not manifest.exists():
+        return sorted(directory.glob("backend-*.env"), key=lambda item: item.name)
+
+    try:
+        with _open_private_text(manifest, MODEL_PROFILE_MANIFEST) as stream:
+            names = [line.strip() for line in stream.read().splitlines()]
+    except (OSError, UnicodeError) as error:
+        raise ModelProfileError(f"could not read {MODEL_PROFILE_MANIFEST}: {error}") from error
+    names = [name for name in names if name]
+    if len(names) != len(set(names)):
+        raise ModelProfileError(f"{MODEL_PROFILE_MANIFEST} contains duplicate profile names")
+    if any(not MODEL_PROFILE_FILE_RE.fullmatch(name) for name in names):
+        raise ModelProfileError(f"{MODEL_PROFILE_MANIFEST} contains an invalid profile name")
+    return [directory / name for name in names]
+
+
+def load_model_profiles(profile_dir: str | Path | None = None) -> tuple[ModelProfile, ...]:
+    """Load private profiles in manifest order, or filename order as a fallback.
+
+    An unset ``SWEGEN_MODEL_PROFILE_DIR`` retains the historical single inherited
+    environment. Once a directory is explicitly configured, errors are fatal so a
+    malformed pool cannot silently fall back to an unintended endpoint.
+    """
+    configured = os.environ.get(MODEL_PROFILE_DIR_ENV, "") if profile_dir is None else profile_dir
+    if isinstance(configured, Path):
+        directory = configured.expanduser()
+    else:
+        if not configured.strip():
+            return ()
+        directory = Path(configured).expanduser()
+
+    if directory.is_symlink() or not directory.is_dir():
+        raise ModelProfileError(
+            f"configured model profile directory is not a directory: {directory}"
+        )
+    paths = _profile_paths(directory)
+    if not paths:
+        raise ModelProfileError("configured model profile directory has no backend-*.env files")
+    return tuple(_read_model_profile(path) for path in paths)
+
+
+def select_model_profile(
+    entry: Entry,
+    profiles: tuple[ModelProfile, ...],
+    failover_offset: int = 0,
+) -> ModelProfile | None:
+    """Select a stable task profile, advancing deterministically for failover."""
+    if not profiles:
+        return None
+    instance = task_dir_name(entry.repo, entry.pull_number)
+    digest = hashlib.sha256(instance.encode("utf-8")).digest()
+    initial_index = int.from_bytes(digest[:8], "big") % len(profiles)
+    return profiles[(initial_index + failover_offset) % len(profiles)]
+
+
+def build_model_profile_env(
+    base_env: dict[str, str], profile: ModelProfile | None
+) -> dict[str, str]:
+    """Return an isolated child environment pinned to one complete model profile."""
+    attempt_env = dict(base_env)
+    if profile is None:
+        return attempt_env
+    for name in MODEL_PROFILE_ENV_VARS:
+        attempt_env.pop(name, None)
+    for name in MODEL_PROFILE_STALE_AUTH_VARS:
+        attempt_env.pop(name, None)
+    for name in MODEL_PROFILE_FAST_MODEL_VARS:
+        attempt_env.pop(name, None)
+    attempt_env.pop(MODEL_PROFILE_DIR_ENV, None)
+    attempt_env.pop(MODEL_PROFILE_ID_ENV, None)
+    attempt_env.update(profile.env)
+    fast_model = profile.env["ANTHROPIC_DEFAULT_SONNET_MODEL"]
+    for name in MODEL_PROFILE_FAST_MODEL_VARS:
+        attempt_env[name] = fast_model
+    attempt_env[MODEL_PROFILE_ID_ENV] = profile.profile_id
+    return attempt_env
 
 
 def _timestamp_run_name() -> str:
@@ -602,144 +726,6 @@ def create_run_dirs(args: argparse.Namespace) -> None:
     args.instance_status_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
 
-def write_chunk(path: Path, segment: list[Entry]) -> None:
-    """Write a segment of entries to a JSONL chunk file for a slurm child run.
-
-    Preserves the fields the child needs for downstream post-processing and
-    cwm_task_metadata.
-    """
-    with path.open("w") as fh:
-        for entry in segment:
-            fh.write(
-                json.dumps(
-                    {
-                        "repo": entry.repo,
-                        "pull_number": entry.pull_number,
-                        "base_commit": entry.base_commit,
-                        "image_ref": entry.image_ref,
-                    }
-                )
-                + "\n"
-            )
-
-
-def build_child_command(
-    args: argparse.Namespace, chunk_path: Path, node_log_dir: Path
-) -> list[str]:
-    """Build the argv for the per-node orchestrator run (no --slurm).
-
-    Secrets are intentionally NOT passed as flags (they would be visible via
-    squeue/scontrol); they travel to the node through the exported environment.
-    """
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        str(chunk_path),
-        "--workers",
-        str(args.workers),
-        "--runs-dir",
-        str(args.runs_dir),
-        "--run-name",
-        args.run_name,
-        "--repo-cache-dir",
-        str(args.repo_cache_dir),
-        "--log-dir",
-        str(node_log_dir),
-        "--progress-jsonl",
-        str(node_log_dir / PROGRESS_JSONL_NAME),
-        "--instance-status-jsonl",
-        str(node_log_dir / INSTANCE_STATUS_JSONL_NAME),
-        # Shared, flat output dir — outputs are NOT subfoldered per node.
-        "--output",
-        str(args.tasks_dir),
-        # Shared postprocessed-output tree for the post-processed copies.
-        "--postprocessed-output",
-        str(args.postprocessed_dir),
-        "--swegen-bin",
-        args.swegen_bin,
-    ]
-    if args.cc_timeout is not None:
-        cmd += ["--cc-timeout", str(args.cc_timeout)]
-    cmd += ["--max-retries", str(args.max_retries)]
-    if args.force:
-        cmd.append("--force")
-    return cmd
-
-
-def submit_slurm_jobs(
-    entries: list[Entry], args: argparse.Namespace, env: dict[str, str]
-) -> int:
-    """Submit one sbatch job per node over SLURM_NODES, then return.
-
-    Returns 0 if every non-empty chunk was submitted successfully, else 1.
-    """
-    segments = split_into_segments(entries, len(SLURM_NODES))
-    cwd = os.getcwd()
-    submitted: list[tuple[str, str]] = []  # (node, job_id)
-    failures = 0
-
-    for node, segment in zip(SLURM_NODES, segments):
-        if not segment:
-            continue
-        node_log_dir = args.log_dir / node
-        node_log_dir.mkdir(parents=True, exist_ok=True)
-        chunk_path = node_log_dir / "chunk.jsonl"
-        write_chunk(chunk_path, segment)
-
-        child_cmd = build_child_command(args, chunk_path, node_log_dir)
-        sbatch_cmd = [
-            "sbatch",
-            f"--nodelist={node}",
-            "--nodes=1",
-            "--ntasks=1",
-            "--exclusive",
-            f"--job-name=swegen-{node}",
-            f"--chdir={cwd}",
-            f"--output={node_log_dir / 'slurm-%j.out'}",
-            "--export=ALL",
-            f"--wrap={shlex.join(child_cmd)}",
-        ]
-
-        try:
-            proc = subprocess.run(
-                sbatch_cmd, env=env, capture_output=True, text=True
-            )
-        except FileNotFoundError:
-            print(
-                "error: 'sbatch' not found; is slurm installed / on PATH?",
-                file=sys.stderr,
-            )
-            return 1
-
-        if proc.returncode != 0:
-            failures += 1
-            print(
-                f"  {node}: sbatch failed (rc={proc.returncode}): "
-                f"{proc.stderr.strip()}",
-                file=sys.stderr,
-            )
-            continue
-
-        # sbatch prints "Submitted batch job <id>"
-        job_id = proc.stdout.strip().split()[-1] if proc.stdout.strip() else "?"
-        submitted.append((node, job_id))
-        print(
-            f"  {node}: {len(segment)} entr"
-            f"{'y' if len(segment) == 1 else 'ies'} -> job {job_id} "
-            f"(logs: {node_log_dir}/)",
-            flush=True,
-        )
-
-    print(
-        f"\nSubmitted {len(submitted)} sbatch job(s); "
-        f"{failures} submission(s) failed.",
-        flush=True,
-    )
-    if submitted:
-        print(f"Track with: squeue -u {os.environ.get('USER', 'alex')}", flush=True)
-    return 0 if failures == 0 and submitted else 1
-
-
 def task_dir_name(repo: str, pull_number: str) -> str:
     """Compute the task directory name `swegen create` writes for a PR.
 
@@ -793,22 +779,16 @@ def _instance_harbor_job_dirs(harbor_jobs_dir: Path, instance: str) -> list[Path
     )
 
 
-def _instance_harbor_config_paths(
-    state_dir: Path | None, instance: str
-) -> set[Path]:
+def _instance_harbor_config_paths(state_dir: Path | None, instance: str) -> set[Path]:
     """Find Harbor trial config files currently recorded for one instance."""
-    harbor_jobs_dir = (
-        (state_dir / "harbor-jobs") if state_dir else Path(".swegen/harbor-jobs")
-    )
+    harbor_jobs_dir = (state_dir / "harbor-jobs") if state_dir else Path(".swegen/harbor-jobs")
     configs: set[Path] = set()
     for job_dir in _instance_harbor_job_dirs(harbor_jobs_dir, instance):
         configs.update(path.resolve() for path in job_dir.rglob("config.json"))
     return configs
 
 
-def _docker_refs_from_trial_config(
-    config_path: Path, instance: str
-) -> tuple[str, str] | None:
+def _docker_refs_from_trial_config(config_path: Path, instance: str) -> tuple[str, str] | None:
     """Best-effort Docker tag and Compose project extraction from a trial config."""
     try:
         config = json.loads(config_path.read_text())
@@ -1061,9 +1041,7 @@ def _load_legacy_progress_lists(progress_path: Path) -> tuple[list[str], list[st
     return successful_instances, failed_instances
 
 
-def _move_instance(
-    instance: str, target: list[str], opposite: list[str]
-) -> None:
+def _move_instance(instance: str, target: list[str], opposite: list[str]) -> None:
     """Record the latest status for an instance without duplicate list entries."""
     opposite[:] = [item for item in opposite if item != instance]
     if instance not in target:
@@ -1103,9 +1081,7 @@ def _replay_instance_status_jsonl(
                 except json.JSONDecodeError:
                     continue
                 if isinstance(record, dict):
-                    _apply_instance_status_record(
-                        record, successful_instances, failed_instances
-                    )
+                    _apply_instance_status_record(record, successful_instances, failed_instances)
     except OSError:
         return
 
@@ -1116,9 +1092,7 @@ def _load_progress_lists(
     """Load current success/failure lists from legacy progress and status logs."""
     successful_instances, failed_instances = _load_legacy_progress_lists(progress_path)
     if instance_status_path is not None:
-        _replay_instance_status_jsonl(
-            instance_status_path, successful_instances, failed_instances
-        )
+        _replay_instance_status_jsonl(instance_status_path, successful_instances, failed_instances)
     return successful_instances, failed_instances
 
 
@@ -1151,9 +1125,7 @@ def _instance_artifact_exists(
     instance: str, output_dir: Path | None, postprocessed_dir: Path | None
 ) -> bool:
     """Return True if one of the run-local produced task directories exists."""
-    candidate_roots = [
-        path for path in (output_dir, postprocessed_dir) if path is not None
-    ]
+    candidate_roots = [path for path in (output_dir, postprocessed_dir) if path is not None]
     if not candidate_roots:
         return True
     return any((root / instance).exists() for root in candidate_roots)
@@ -1172,9 +1144,7 @@ def instance_successfully_produced(
     if not _instance_artifact_exists(instance, output_dir, postprocessed_dir):
         return False
 
-    if state_dir is not None and _create_log_has_success(
-        state_dir / "create.jsonl", instance
-    ):
+    if state_dir is not None and _create_log_has_success(state_dir / "create.jsonl", instance):
         return True
 
     if progress_path is None:
@@ -1186,7 +1156,7 @@ def instance_successfully_produced(
 
 
 def write_progress_jsonl(
-    progress_queue: "queue.Queue[Outcome | None]",
+    progress_queue: queue.Queue[Outcome | None],
     progress_path: Path,
     instance_status_path: Path,
 ) -> None:
@@ -1197,18 +1167,14 @@ def write_progress_jsonl(
         progress_path, instance_status_path
     )
 
-    with progress_path.open("a") as progress_fh, instance_status_path.open(
-        "a"
-    ) as status_fh:
+    with progress_path.open("a") as progress_fh, instance_status_path.open("a") as status_fh:
         while True:
             outcome = progress_queue.get()
             try:
                 if outcome is None:
                     break
 
-                instance = task_dir_name(
-                    outcome.entry.repo, outcome.entry.pull_number
-                )
+                instance = task_dir_name(outcome.entry.repo, outcome.entry.pull_number)
                 if outcome.ok:
                     status = "success"
                     _move_instance(instance, successful_instances, failed_instances)
@@ -1228,17 +1194,14 @@ def write_progress_jsonl(
                         outcome.image_names, outcome.compose_projects
                     )
 
-                image_ids = tuple(
-                    dict.fromkeys((*outcome.image_ids, *prune_result.image_ids))
-                )
+                image_ids = tuple(dict.fromkeys((*outcome.image_ids, *prune_result.image_ids)))
                 print(
                     f"[orchestrator] {status}: {instance} image tags: "
                     f"{json.dumps(list(outcome.image_names))}",
                     flush=True,
                 )
                 print(
-                    f"[orchestrator] {status}: {instance} image ids: "
-                    f"{json.dumps(list(image_ids))}",
+                    f"[orchestrator] {status}: {instance} image ids: {json.dumps(list(image_ids))}",
                     flush=True,
                 )
                 if outcome.image_names or outcome.compose_projects:
@@ -1280,6 +1243,8 @@ def write_progress_jsonl(
                 status_record.update(
                     {key: value for key, value in runtime_metadata.items() if value}
                 )
+                if outcome.model_profile_id:
+                    status_record["model_profile_id"] = outcome.model_profile_id
                 if not outcome.ok:
                     status_record["failure_reason"] = outcome.failure_reason
                 progress_record = {
@@ -1308,6 +1273,8 @@ def write_progress_jsonl(
                 progress_record.update(
                     {key: value for key, value in runtime_metadata.items() if value}
                 )
+                if outcome.model_profile_id:
+                    progress_record["model_profile_id"] = outcome.model_profile_id
                 status_fh.write(json.dumps(status_record) + "\n")
                 status_fh.flush()
                 progress_fh.write(json.dumps(progress_record) + "\n")
@@ -1353,9 +1320,7 @@ def fetch_issue_number(repo: str, pull_number: str, tokens: list[str] | None) ->
             if not issues:
                 return ""
             # Prefer the lowest-numbered linked issue for determinism.
-            return str(
-                min(int(i["number"]) for i in issues if i.get("number") is not None)
-            )
+            return str(min(int(i["number"]) for i in issues if i.get("number") is not None))
 
     if last_err is not None:
         print(
@@ -1375,9 +1340,7 @@ def _dockerfile_path(task_dir: Path) -> Path:
     return task_dir / "environment" / "Dockerfile"
 
 
-def _replace_dockerfile_base(
-    lines: list[str], image_ref: str | None
-) -> tuple[list[str], bool]:
+def _replace_dockerfile_base(lines: list[str], image_ref: str | None) -> tuple[list[str], bool]:
     if not lines or not lines[0].startswith("FROM "):
         return lines, False
 
@@ -1490,8 +1453,7 @@ def _replace_git_clone_with_checkout(
 def _has_voyager_path_adjustment(lines: list[str], repo: str) -> bool:
     source = f"/app/{repo}"
     return any(
-        VOYAGER_PATH_MARKER in line or ("ln -s " in line and source in line)
-        for line in lines
+        VOYAGER_PATH_MARKER in line or ("ln -s " in line and source in line) for line in lines
     )
 
 
@@ -1533,12 +1495,8 @@ def rewrite_dockerfile_for_voyager(task_dir: Path, entry: Entry) -> list[str]:
     if base_changed:
         changes.append("voyager base rewritten" if image_ref else "base rewritten")
 
-    fallback_sha = (
-        entry.base_commit if HEAD_SHA_RE.fullmatch(entry.base_commit) else None
-    )
-    lines, clone_changed, checkout_path = _replace_git_clone_with_checkout(
-        lines, fallback_sha
-    )
+    fallback_sha = entry.base_commit if HEAD_SHA_RE.fullmatch(entry.base_commit) else None
+    lines, clone_changed, checkout_path = _replace_git_clone_with_checkout(lines, fallback_sha)
     if clone_changed:
         changes.append("git clone replaced with checkout")
     elif any(line.lstrip().startswith("RUN git clone ") for line in lines):
@@ -1548,9 +1506,7 @@ def rewrite_dockerfile_for_voyager(task_dir: Path, entry: Entry) -> list[str]:
 
     if not checkout_path:
         checkout_path = _first_repo_workdir(lines)
-    lines, path_changed = _insert_voyager_path_adjustment(
-        lines, entry.repo, checkout_path
-    )
+    lines, path_changed = _insert_voyager_path_adjustment(lines, entry.repo, checkout_path)
     if path_changed:
         changes.append("voyager symlink added")
     elif _has_voyager_path_adjustment(lines, entry.repo):
@@ -1632,7 +1588,13 @@ def postprocess_task(
 
 def _is_retryable_failure(output_tail: str) -> bool:
     """Whether a failed run's output looks like a transient network/API error."""
-    return any(sig in output_tail for sig in RETRYABLE_ERROR_SIGNATURES)
+    lowered = output_tail.casefold()
+    return (
+        any(sig.casefold() in lowered for sig in RETRYABLE_ERROR_SIGNATURES)
+        or any(sig in lowered for sig in MODEL_API_FAILURE_SIGNATURES)
+        or BACKEND_HTTP_401_RE.search(output_tail) is not None
+        or CREDENTIAL_EXHAUSTION_RE.search(output_tail) is not None
+    )
 
 
 def _is_github_rate_limited(output_tail: str) -> bool:
@@ -1673,6 +1635,20 @@ def failure_reason_from_output(output_tail: str, returncode: int) -> str:
     lowered = [(line, line.lower()) for line in lines]
 
     priority_markers = (
+        (
+            "server certificate verification failed",
+            "Git clone TLS certificate verification failed",
+        ),
+        (
+            "unable to connect to archive.ubuntu.com",
+            "Docker build could not reach Ubuntu package mirrors",
+        ),
+        (
+            "unable to connect to security.ubuntu.com",
+            "Docker build could not reach Ubuntu package mirrors",
+        ),
+        ("unable to locate package git", "Docker build dependency installation failed"),
+        ("validation incomplete", "Claude/Harbor validation incomplete"),
         ("validation failed", "Validation failed (NOP or Oracle)"),
         ("cc did not complete task", None),
         ("cc session timed out", None),
@@ -1793,6 +1769,7 @@ def process_entry(
     max_retries: int,
     token_pool: list[str],
     force: bool,
+    model_profiles: tuple[ModelProfile, ...] | None = None,
 ) -> ProcessResult:
     """Run `swegen create` for a single PR, writing to the open ``log`` handle.
 
@@ -1840,6 +1817,9 @@ def process_entry(
     # hit a rate limit. Tracks which tokens we've already tried.
     current_token = pick_github_token(token_pool, set())
     tried_tokens: set[str] = {current_token} if current_token else set()
+    profiles = model_profiles or ()
+    profile_failover_offset = 0
+    current_profile = select_model_profile(entry, profiles, profile_failover_offset)
 
     for attempt in range(1, max_retries + 1):
         # The orchestrator owns skip/rebuild decisions by run-local task dirs,
@@ -1847,16 +1827,19 @@ def process_entry(
         cmd = base_cmd + ["--force"]
         attempt_note = "" if attempt == 1 else f" (retry {attempt}/{max_retries})"
         token_note = f" [token {_mask_token(current_token)}]" if token_pool else ""
-        print(f"{tag} starting{attempt_note}{token_note}", flush=True)
+        profile_note = f" [model-profile {current_profile.profile_id}]" if current_profile else ""
+        print(f"{tag} starting{attempt_note}{token_note}{profile_note}", flush=True)
 
-        # Inject the chosen token for this attempt without mutating the shared
-        # base env (consumers run concurrently).
-        attempt_env = env
+        # Pin one coherent backend for this entire subprocess attempt. Always
+        # work on a fresh mapping so concurrent consumers never mutate shared
+        # process state or observe a partially applied credential set.
+        attempt_env = build_model_profile_env(env, current_profile)
         if current_token:
-            attempt_env = {**env, "GITHUB_TOKEN": current_token}
+            attempt_env["GITHUB_TOKEN"] = current_token
 
         log.write(
-            f"\n{'=' * 80}\n{tag}{attempt_note}{token_note}\n$ {' '.join(cmd)}\n{'=' * 80}\n"
+            f"\n{'=' * 80}\n{tag}{attempt_note}{token_note}{profile_note}\n"
+            f"$ {' '.join(cmd)}\n{'=' * 80}\n"
         )
         log.flush()
         start_size = os.fstat(log.fileno()).st_size
@@ -1865,24 +1848,20 @@ def process_entry(
             returncode = run_command_to_log(cmd, attempt_env, log)
         except FileNotFoundError:
             # Not transient — abort retries for this entry.
-            msg = (
-                f"could not find executable {swegen_bin!r}; "
-                "is swegen installed / on PATH?"
-            )
+            msg = f"could not find executable {swegen_bin!r}; is swegen installed / on PATH?"
             log.write(msg + "\n")
             print(f"{tag} ERROR: {msg}", flush=True)
             image_names, compose_projects = collect_new_instance_docker_refs(
                 state_dir, instance, before_configs
             )
-            image_ids = collect_instance_docker_image_ids(
-                image_names, compose_projects
-            )
+            image_ids = collect_instance_docker_image_ids(image_names, compose_projects)
             return ProcessResult(
                 returncode=127,
                 failure_reason=msg,
                 image_names=image_names,
                 image_ids=image_ids,
                 compose_projects=compose_projects,
+                model_profile_id=current_profile.profile_id if current_profile else "",
             )
         log.flush()
 
@@ -1893,7 +1872,7 @@ def process_entry(
         end_size = os.fstat(log.fileno()).st_size
         output_tail = ""
         try:
-            with open(log_path, "r", errors="replace") as reader:
+            with open(log_path, errors="replace") as reader:
                 reader.seek(max(start_size, end_size - 65536))
                 output_tail = reader.read()
         except OSError:
@@ -1901,24 +1880,39 @@ def process_entry(
         final_output_tail = output_tail
 
         rate_limited = _is_github_rate_limited(output_tail)
-        if attempt < max_retries and (
-            rate_limited or _is_retryable_failure(output_tail)
-        ):
+        retryable_failure = _is_retryable_failure(output_tail)
+        if attempt < max_retries and (rate_limited or retryable_failure):
             backoff = RETRY_BACKOFF_SEC * attempt
+            causes: list[str] = []
             if rate_limited and len(token_pool) > 1:
                 # Swap to a different token before retrying the clone/API.
                 next_token = pick_github_token(token_pool, tried_tokens)
                 tried_tokens.add(next_token)
-                cause = (
+                causes.append(
                     f"github rate limit on token "
                     f"{_mask_token(current_token)}; rotating to "
                     f"{_mask_token(next_token)}"
                 )
                 current_token = next_token
             elif rate_limited:
-                cause = "github rate limit (no alternate token available)"
-            else:
-                cause = "transient error"
+                causes.append("github rate limit (no alternate token available)")
+
+            if retryable_failure:
+                previous_profile = current_profile
+                if len(profiles) > 1:
+                    profile_failover_offset += 1
+                    current_profile = select_model_profile(entry, profiles, profile_failover_offset)
+                    causes.append(
+                        "transient error; rotating model profile "
+                        f"{previous_profile.profile_id} -> {current_profile.profile_id}"
+                    )
+                elif current_profile is not None:
+                    causes.append(
+                        f"transient error; retaining model profile {current_profile.profile_id}"
+                    )
+                else:
+                    causes.append("transient error")
+            cause = "; ".join(causes)
             retry_msg = (
                 f"{cause} (rc={returncode}); retrying in {backoff}s "
                 f"[attempt {attempt + 1}/{max_retries}]"
@@ -1947,12 +1941,13 @@ def process_entry(
         image_names=image_names,
         image_ids=image_ids,
         compose_projects=compose_projects,
+        model_profile_id=current_profile.profile_id if current_profile else "",
     )
 
 
 def run_consumer(
     worker_id: int,
-    work_queue: "queue.Queue[list[Entry] | None]",
+    work_queue: queue.Queue[list[Entry] | None],
     env: dict[str, str],
     swegen_bin: str,
     log_dir: Path,
@@ -1964,9 +1959,10 @@ def run_consumer(
     github_tokens: list[str] | None = None,
     force: bool = False,
     postprocessed_dir: Path | None = None,
-    progress_queue: "queue.Queue[Outcome | None] | None" = None,
+    progress_queue: queue.Queue[Outcome | None] | None = None,
     progress_path: Path | None = None,
     instance_status_path: Path | None = None,
+    model_profiles: tuple[ModelProfile, ...] | None = None,
 ) -> list[Outcome]:
     """Consumer thread: pull repo packages off ``work_queue`` until drained.
 
@@ -1982,19 +1978,12 @@ def run_consumer(
     happens incrementally rather than in a batch at the end.
     """
     token_pool = github_tokens or []
-    worker_env = worker_child_env(env, worker_id)
+    worker_env = env
     outcomes: list[Outcome] = []
     log_path = log_dir / f"worker-{worker_id}.log"
 
     with log_path.open("w") as raw_log:
         log = TimestampedLog(raw_log)
-        assigned_proxy = worker_env.get("SWEGEN_ASSIGNED_SOCKS_PROXY")
-        if assigned_proxy:
-            log.write(
-                f"[worker {worker_id}] LLM proxy: {assigned_proxy}; "
-                f"Claude bridge: {worker_env['SWEGEN_CLAUDE_PROXY']}\n"
-            )
-            log.flush()
         while True:
             package = work_queue.get()
             try:
@@ -2008,10 +1997,7 @@ def run_consumer(
                 )
                 log.flush()
                 for idx, entry in enumerate(package, 1):
-                    tag = (
-                        f"[worker {worker_id}] ({idx}/{total}) "
-                        f"{entry.repo}#{entry.pull_number}"
-                    )
+                    tag = f"[worker {worker_id}] ({idx}/{total}) {entry.repo}#{entry.pull_number}"
                     if not force and instance_successfully_produced(
                         entry,
                         state_dir,
@@ -2041,6 +2027,7 @@ def run_consumer(
                         max_retries,
                         token_pool,
                         force,
+                        model_profiles,
                     )
                     returncode = process_result.returncode
                     postprocess_status = ""
@@ -2069,6 +2056,7 @@ def run_consumer(
                         image_names=process_result.image_names,
                         image_ids=process_result.image_ids,
                         compose_projects=process_result.compose_projects,
+                        model_profile_id=process_result.model_profile_id,
                     )
                     outcomes.append(outcome)
                     if progress_queue is not None:
@@ -2080,7 +2068,7 @@ def run_consumer(
 
 
 def producer(
-    work_queue: "queue.Queue[list[Entry] | None]",
+    work_queue: queue.Queue[list[Entry] | None],
     packages: list[list[Entry]],
     num_consumers: int,
 ) -> None:
@@ -2138,12 +2126,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "rerun only fills the gaps.",
     )
     parser.add_argument(
-        "--slurm",
-        action="store_true",
-        help="Deprecated legacy Slurm mode. Use src/slurm_two_node.py, which "
-        "stages node-local workspaces and preserves the 8+8+8 proxy topology.",
-    )
-    parser.add_argument(
         "--runs-dir",
         type=Path,
         default=DEFAULT_RUNS_DIR,
@@ -2185,8 +2167,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="tasks_dir",
         type=Path,
         default=None,
-        help="Root task output dir. Defaults to <run>/tasks. "
-        "(--tasks-dir is a deprecated alias.)",
+        help="Root task output dir. Defaults to <run>/tasks. (--tasks-dir is a deprecated alias.)",
     )
     parser.add_argument(
         "--postprocessed-output",
@@ -2219,8 +2200,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.cc_timeout is not None and args.cc_timeout > MAX_CC_TIMEOUT_SECONDS:
         print(
-            f"Capping --cc-timeout from {args.cc_timeout}s to "
-            f"{MAX_CC_TIMEOUT_SECONDS}s (3 hours).",
+            f"Capping --cc-timeout from {args.cc_timeout}s to {MAX_CC_TIMEOUT_SECONDS}s (3 hours).",
             flush=True,
         )
         args.cc_timeout = MAX_CC_TIMEOUT_SECONDS
@@ -2232,6 +2212,18 @@ def main(argv: list[str] | None = None) -> int:
     if not entries:
         print(f"error: no entries found in {args.jsonl}", file=sys.stderr)
         return 2
+
+    try:
+        model_profiles = load_model_profiles()
+    except ModelProfileError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 3
+    if model_profiles:
+        print(
+            f"Using {len(model_profiles)} private model profile(s) "
+            "(stable per task, rotating on transient retries).",
+            flush=True,
+        )
 
     # Resolve the pool of GitHub tokens used for cloning + issue-number lookups.
     # An explicit token (--github-token flag or GITHUB_TOKEN env var) overrides
@@ -2247,6 +2239,18 @@ def main(argv: list[str] | None = None) -> int:
             github_tokens = load_github_tokens()
         except Exception:
             github_tokens = []
+    if os.environ.get("SWEGEN_DELETE_CONFIG_AFTER_LOAD") == "1":
+        config_path = os.environ.get("SWEGEN_CONFIG", "").strip()
+        if config_path:
+            try:
+                Path(config_path).unlink(missing_ok=True)
+            except OSError as error:
+                print(
+                    f"error: could not remove private token-pool config after load: {error}",
+                    file=sys.stderr,
+                )
+                return 3
+        os.environ.pop("SWEGEN_CONFIG", None)
     configured_github_tokens = len(github_tokens)
     if github_tokens:
         github_tokens = preflight_github_tokens(github_tokens)
@@ -2278,28 +2282,25 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    raw_start_delay = os.environ.pop("SWEGEN_ORCHESTRATOR_START_DELAY_SECONDS", "0")
+    try:
+        start_delay = int(raw_start_delay)
+    except ValueError:
+        print("error: invalid orchestrator startup delay", file=sys.stderr)
+        return 2
+    if start_delay < 0:
+        print("error: orchestrator startup delay must be non-negative", file=sys.stderr)
+        return 2
+    if start_delay:
+        print(f"Initial orchestrator stagger: {start_delay}s", flush=True)
+        time.sleep(start_delay)
+
     resolve_run_layout(args)
     create_run_dirs(args)
     env = build_child_env(args)
 
-    try:
-        proxy_assignments = validate_worker_proxy_config(env, args.workers)
-    except ValueError as error:
-        print(f"error: invalid worker proxy configuration: {error}", file=sys.stderr)
-        return 2
-
     print(f"Run: {args.run_name} -> {args.run_dir}", flush=True)
     print(f"Repo cache: {args.repo_cache_dir}", flush=True)
-    for assignment in proxy_assignments:
-        print(f"Proxy assignment: {assignment}", flush=True)
-
-    if args.slurm:
-        print(
-            "error: the legacy --slurm mode assumes a shared filesystem and "
-            "obsolete node names. Use `python src/slurm_two_node.py ...` instead.",
-            file=sys.stderr,
-        )
-        return 2
 
     # Group the entries into one package per repo, dropping only instances that
     # were already recorded as successful. Failed/interrupted task directories
@@ -2331,10 +2332,7 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     for package in packages:
-        print(
-            f"  {package[0].repo}: {len(package)} "
-            f"PR{'s' if len(package) != 1 else ''}"
-        )
+        print(f"  {package[0].repo}: {len(package)} PR{'s' if len(package) != 1 else ''}")
 
     args.postprocessed_dir.mkdir(parents=True, exist_ok=True)
     print(
@@ -2346,7 +2344,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Producer-consumer: a producer thread feeds repo packages onto the queue;
     # each consumer pulls a package, processes its PRs, then pulls the next.
-    work_queue: "queue.Queue[list[Entry] | None]" = queue.Queue()
+    work_queue: queue.Queue[list[Entry] | None] = queue.Queue()
     producer_thread = threading.Thread(
         target=producer,
         args=(work_queue, packages, num_consumers),
@@ -2354,7 +2352,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     producer_thread.start()
 
-    progress_queue: "queue.Queue[Outcome | None]" = queue.Queue()
+    progress_queue: queue.Queue[Outcome | None] = queue.Queue()
     progress_thread = threading.Thread(
         target=write_progress_jsonl,
         args=(progress_queue, args.progress_jsonl, args.instance_status_jsonl),
@@ -2384,6 +2382,7 @@ def main(argv: list[str] | None = None) -> int:
                     progress_queue,
                     args.progress_jsonl,
                     args.instance_status_jsonl,
+                    model_profiles,
                 ): i
                 for i in range(num_consumers)
             }

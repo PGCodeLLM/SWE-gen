@@ -19,6 +19,7 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -84,10 +85,17 @@ def read_records(path: Path) -> list[Record]:
     return records
 
 
-def lpt_partition(records: Sequence[Record], shard_count: int) -> list[list[Record]]:
+def lpt_partition(
+    records: Sequence[Record],
+    shard_count: int,
+    weights: Sequence[int] | None = None,
+) -> list[list[Record]]:
     """Partition records by whole repository using deterministic LPT."""
     if shard_count < 1:
         raise ValueError("shard_count must be positive")
+    capacities = list(weights) if weights is not None else [1] * shard_count
+    if len(capacities) != shard_count or any(weight < 1 for weight in capacities):
+        raise ValueError("weights must contain one positive value per shard")
 
     groups: dict[str, list[Record]] = {}
     for record in records:
@@ -96,7 +104,14 @@ def lpt_partition(records: Sequence[Record], shard_count: int) -> list[list[Reco
     shards: list[list[Record]] = [[] for _ in range(shard_count)]
     loads = [0] * shard_count
     for repo in sorted(groups, key=lambda item: (-len(groups[item]), item)):
-        target = min(range(shard_count), key=lambda index: (loads[index], index))
+        target = min(
+            range(shard_count),
+            key=lambda index: (
+                Fraction(loads[index], capacities[index]),
+                loads[index],
+                index,
+            ),
+        )
         shards[target].extend(groups[repo])
         loads[target] += len(groups[repo])
     return shards
@@ -159,17 +174,26 @@ def generate_shards(
     names: Sequence[str] = DEFAULT_SHARD_NAMES,
     manifest_name: str = "r3-shards-manifest.json",
     run_name: str = DEFAULT_RUN_NAME,
-    workers: int = 4,
+    workers: int | Sequence[int] = 4,
 ) -> dict[str, Any]:
     """Generate shard JSONL files and return/write their deterministic manifest."""
     if len(set(names)) != len(names):
         raise ValueError("shard names must be unique")
-    if workers < 1:
+    if isinstance(workers, int):
+        worker_counts = [workers] * len(names)
+    else:
+        worker_counts = list(workers)
+        if len(worker_counts) != len(names):
+            raise ValueError("workers must contain one count per shard name")
+    if any(worker < 1 for worker in worker_counts):
         raise ValueError("workers must be positive")
-    layouts = [_runtime_layout(name, run_name, workers) for name in names]
+    layouts = [
+        _runtime_layout(name, run_name, worker)
+        for name, worker in zip(names, worker_counts, strict=True)
+    ]
 
     records = read_records(source_path)
-    shards = lpt_partition(records, len(names))
+    shards = lpt_partition(records, len(names), worker_counts)
     validate_partition(records, shards)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,6 +230,7 @@ def generate_shards(
             "minimum_entries": min(loads),
             "maximum_entries": max(loads),
             "entry_spread": max(loads) - min(loads),
+            "worker_counts": worker_counts,
         },
         "shards": shard_records,
     }

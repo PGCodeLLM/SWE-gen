@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +25,12 @@ def harbor_cmd_base() -> list[str]:
     """
     if shutil.which("harbor"):
         return ["harbor"]
+    sibling = Path(sys.executable).with_name("harbor")
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return [str(sibling)]
     if shutil.which("uv"):
         return ["uv", "run", "harbor"]
-    return ["python", "-m", "harbor"]
+    return [sys.executable, "-c", "from harbor.cli.main import app; app()"]
 
 
 def _is_docker_environment(environment: EnvironmentType | str) -> bool:
@@ -53,6 +59,55 @@ def suffixed_docker_config_args(config_dir: Path, environment: EnvironmentType |
     return ["--config", str(write_suffixed_docker_config(config_dir))]
 
 
+def _reap_harbor_containers(task_id: str, environment: EnvironmentType | str) -> None:
+    """Force-remove any Docker containers Harbor left behind for ``task_id``.
+
+    Harbor tears down its ``docker compose`` project only if its ``stop()`` runs
+    to completion. When a run hits the wall-timeout and we SIGKILL the Harbor
+    process group (below), or ``compose down`` fails under daemon load, the
+    ``<project>-main-1`` container is orphaned and stays ``Up`` forever. Dozens
+    accumulate per node over days and exhaust the Docker daemon, freezing all
+    subsequent builds. Harbor names the compose project ``<task_id>__<suffix>``,
+    so remove every container whose ``com.docker.compose.project`` label starts
+    with ``<task_id>__``. This removes CONTAINERS ONLY (no ``--rmi``), so the
+    built images are preserved for the SWR push / faster subsequent runs.
+    """
+    if not _is_docker_environment(environment):
+        return
+    # Docker's --filter label match does not support prefix globs, so list all
+    # containers with their compose-project label and prefix-match in Python.
+    try:
+        described = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--format",
+                "{{.ID}} {{.Label \"com.docker.compose.project\"}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:  # best-effort cleanup; never let it break the caller
+        return
+    ids = [
+        parts[0]
+        for line in described.stdout.splitlines()
+        if len(parts := line.split(" ", 1)) == 2 and parts[1].startswith(f"{task_id}__")
+    ]
+    for container_id in ids:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception:
+            pass
+
+
 def run_harbor_agent(
     task_id: str,
     dataset_path: Path,
@@ -62,6 +117,7 @@ def run_harbor_agent(
     capture_output: bool = False,
     delete_after: bool = True,
     environment: EnvironmentType = EnvironmentType.DOCKER,
+    wall_timeout_seconds: float | None = None,
 ) -> tuple[int, Path | None]:
     """Run a Harbor agent and return (exit_code, job_result_path).
 
@@ -75,6 +131,9 @@ def run_harbor_agent(
         delete_after: If True, delete Docker images after run (default: True)
                      Set to False to keep images for faster subsequent runs
         environment: Environment type (docker, daytona, e2b, modal, runloop, gke)
+        wall_timeout_seconds: Optional outer wall-clock limit. When exceeded,
+            terminate the complete Harbor/Compose client process group so a
+            timed-out Docker build cannot orphan clients and block a worker.
 
     Returns:
         Tuple of (exit_code, path_to_result_json or None)
@@ -105,18 +164,60 @@ def run_harbor_agent(
     if not delete_after:
         cmd.append("--no-delete")
 
-    proc: subprocess.CompletedProcess[str]
-    if capture_output:
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    else:
-        proc_bytes = subprocess.run(cmd, check=False)
-        # Convert to text version for consistent return type
-        proc = subprocess.CompletedProcess(
-            args=proc_bytes.args,
-            returncode=proc_bytes.returncode,
-            stdout="",
-            stderr="",
-        )
+    # Force Compose's build onto the legacy per-service build path instead of
+    # delegating to `docker buildx bake`. Compose v2 (v5.3.1 here) defaults to
+    # bake, whose `docker-buildx bake` procs deadlock on futex_wait_queue under
+    # Stage-2 concurrency (builds wedge at ~0% CPU, never harvested, slots never
+    # free — the whole baseline queue stalls). COMPOSE_BAKE=0 disables that path.
+    # Passed explicitly in the child env (not just inherited) so it survives any
+    # sg/newgrp/login-shell hop Harbor makes when it shells out to Compose.
+    child_env = {
+        **os.environ,
+        "COMPOSE_BAKE": "0",
+        "DOCKER_BUILDKIT": "1",
+    }
+    child = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=True,
+        start_new_session=True,
+        env=child_env,
+    )
+    try:
+        stdout, stderr = child.communicate(timeout=wall_timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.communicate()
+        # Killing the Harbor process group skips its compose teardown, so the
+        # container is orphaned. Reap it explicitly (images preserved) before
+        # surfacing the timeout, or leaked containers pile up and wedge Docker.
+        _reap_harbor_containers(task_id, environment)
+        raise TimeoutError(
+            f"Harbor {agent} timed out after {wall_timeout_seconds:g} seconds"
+        ) from error
+
+    # Normal completion: Harbor's own teardown may still have failed silently
+    # under daemon load (it swallows compose-down errors), so reap defensively.
+    # Containers only — images are kept for the SWR push.
+    _reap_harbor_containers(task_id, environment)
+
+    proc = subprocess.CompletedProcess(
+        args=cmd,
+        returncode=child.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
 
     # Check if directory still exists after subprocess
     if not unique_parent.exists():

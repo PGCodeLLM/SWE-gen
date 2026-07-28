@@ -8,15 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_agent_sdk import (
-    AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     HookMatcher,
-    ResultMessage,
-    TextBlock,
-    query,
 )
 
-from swegen.create.claude_code_utils import Colors, print_sdk_message
+from swegen.create.claude_code_utils import (
+    Colors,
+    print_sdk_message,
+    redact_sensitive_text,
+)
 from swegen.model_settings import claude_session_env, load_model_settings
 from swegen.tools.harbor_runner import parse_harbor_outcome, suffixed_docker_config_args
 
@@ -579,6 +580,11 @@ Inside each job directory:
 
 ## Your Approach
 
+Work synchronously in this session. Do not delegate to Task/subagents or launch
+background agents. Do not end a turn with a progress update such as "work is in
+progress" or "waiting for analysis". Continue until the task files are complete
+and both Harbor validations have actually finished.
+
 1. **Read the skeleton files** first
 2. **Detect language** from repo files (package.json, go.mod, Cargo.toml, etc.)
 3. **Deep-analyze the repo** (package.json, CI config, test configs, version files)
@@ -602,6 +608,16 @@ Inside each job directory:
 - `{task_dir}/environment/Dockerfile` - Remove TODOs, keep comments explaining non-standard steps
 - `{task_dir}/tests/test.sh` - Remove TODOs and all example templates, keep only test-specific comments
 """
+
+CC_CONTINUATION_PROMPT = """
+Continue the same task now. The prior turn ended before both Harbor validations
+passed. Do not provide a progress-only response, delegate to subagents, or stop
+while work is still in progress. Inspect the current files and Harbor job state,
+finish the Dockerfile and test runner, run NOP and Oracle, iterate as needed, and
+end only after NOP has reward 0 and Oracle has reward 1 with no template TODOs.
+"""
+
+MAX_INCOMPLETE_CONTINUATIONS = 3
 
 
 def run_claude_code_session(
@@ -717,6 +733,7 @@ async def _run_claude_code_session_async(
         jobs_dir = Path(jobs_dir)
     jobs_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = jobs_dir.resolve()
+    validation_baseline = _snapshot_job_results(jobs_dir, task_id)
 
     harbor_config_args = " ".join(suffixed_docker_config_args(jobs_dir, environment))
 
@@ -761,6 +778,7 @@ async def _run_claude_code_session_async(
         """Log Harbor validation attempts for debugging."""
         command = input_data.get("tool_input", {}).get("command", "")
         if "harbor run" in command:
+            command = redact_sensitive_text(command)
             harbor_runs.append(command)
             if verbose:
                 print(f"{Colors.YELLOW}[Harbor]{Colors.RESET} {command}", flush=True)
@@ -802,16 +820,18 @@ async def _run_claude_code_session_async(
         # (ECONNRESET, timeouts, the undici cause chain). Opt-in via
         # SWEGEN_CC_DEBUG=1 so big runs don't accumulate large debug files.
         extra_args: dict[str, str | None] = {}
-        stderr_cb = None
-        if os.environ.get("SWEGEN_CC_DEBUG", "").strip().lower() in ("1", "true", "yes"):
 
-            def stderr_cb(line: str) -> None:
-                # Surface only error-ish stderr inline; full detail is in debug_file.
-                low = line.lower()
-                if any(
-                    k in low for k in ("error", "socket", "econn", "etimedout", "fetch", "timeout")
-                ):
-                    print(f"[cc-stderr] {line.rstrip()}", flush=True)
+        def stderr_cb(line: str) -> None:
+            # Always pipe stderr through the redactor. Surface only error-ish
+            # lines so normal CLI chatter does not bloat batch logs.
+            low = line.lower()
+            if any(
+                key in low for key in ("error", "socket", "econn", "etimedout", "fetch", "timeout")
+            ):
+                print(
+                    f"[cc-stderr] {redact_sensitive_text(line.rstrip())}",
+                    flush=True,
+                )
 
         # Build the shared SDK environment: pin this instance via X-Session-ID
         # and route Claude Code's internal lightweight calls to our fast model.
@@ -823,9 +843,9 @@ async def _run_claude_code_session_async(
         # tool traffic.
         claude_proxy = os.environ.get("SWEGEN_CLAUDE_PROXY", "").strip()
         if claude_proxy:
-            claude_http_proxy = os.environ.get(
-                "SWEGEN_CLAUDE_HTTP_PROXY", claude_proxy
-            ).strip() or claude_proxy
+            claude_http_proxy = (
+                os.environ.get("SWEGEN_CLAUDE_HTTP_PROXY", claude_proxy).strip() or claude_proxy
+            )
             session_env.update(
                 {
                     "http_proxy": claude_http_proxy,
@@ -836,9 +856,7 @@ async def _run_claude_code_session_async(
                 }
             )
 
-        requested_effort = os.environ.get(
-            "SWEGEN_AGENT_REASONING_EFFORT", "high"
-        ).strip().lower()
+        requested_effort = os.environ.get("SWEGEN_AGENT_REASONING_EFFORT", "high").strip().lower()
         supported_efforts = {"low", "medium", "high", "xhigh", "max"}
         if requested_effort not in supported_efforts:
             logger.warning(
@@ -856,6 +874,7 @@ async def _run_claude_code_session_async(
         # Configure SDK options
         options = ClaudeAgentOptions(
             allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "LS", "Bash"],
+            disallowed_tools=["Task"],
             permission_mode="bypassPermissions",  # Auto-approve actions
             cwd=os.getcwd(),  # Run from project root
             model=model_settings.model,
@@ -871,56 +890,89 @@ async def _run_claude_code_session_async(
             ),
         )
 
-        # Run with timeout
+        # Keep one interactive SDK process alive so an incomplete end_turn can
+        # be followed up in the same conversation. A one-shot query accepted a
+        # progress-only ResultMessage as completion and tore down background
+        # work, leaving the scaffold untouched.
+        hidden_env = {
+            key: os.environ.pop(key)
+            for key in ("GITHUB_TOKEN", "SWEGEN_CONFIG", "SWEGEN_DELETE_CONFIG_AFTER_LOAD")
+            if key in os.environ
+        }
         try:
-            async with asyncio.timeout(timeout):
-                response_parts = []
+            try:
+                async with asyncio.timeout(timeout):
+                    async with ClaudeSDKClient(options=options) as client:
+                        next_prompt = prompt_text
+                        for turn in range(MAX_INCOMPLETE_CONTINUATIONS + 1):
+                            await client.query(next_prompt)
+                            async for message in client.receive_response():
+                                if verbose:
+                                    print_sdk_message(message)
 
-                # NOTE: The SDK's message generator does not finish when the
-                # ResultMessage is emitted — it keeps reading until the CLI
-                # subprocess closes stdout (EOF). Custom model backends may
-                # emit the result but never exit, so we break on ResultMessage
-                # ourselves and aclose() the generator to tear down the
-                # subprocess deterministically (otherwise the loop hangs until
-                # the asyncio timeout fires).
-                agen = query(prompt=prompt_text, options=options)
-                try:
-                    async for message in agen:
-                        if verbose:
-                            print_sdk_message(message)
+                            state = _check_validation_state(
+                                jobs_dir,
+                                task_id,
+                                logger,
+                                baseline=validation_baseline,
+                            )
+                            if state.success:
+                                if verbose:
+                                    print("-" * 60, flush=True)
+                                    print("[SDK] Session complete", flush=True)
+                                return state
 
-                        # Collect text for final result
-                        if isinstance(message, AssistantMessage):
-                            for block in message.content:
-                                if isinstance(block, TextBlock):
-                                    response_parts.append(block.text)
+                            if turn >= MAX_INCOMPLETE_CONTINUATIONS:
+                                logger.warning(
+                                    "Claude Code ended %d turn(s) without completing validation",
+                                    turn + 1,
+                                )
+                                return state
 
-                        if isinstance(message, ResultMessage):
-                            break
-                finally:
-                    await agen.aclose()
+                            logger.warning(
+                                "Claude Code turn %d ended with validation incomplete; "
+                                "sending continuation %d/%d",
+                                turn + 1,
+                                turn + 1,
+                                MAX_INCOMPLETE_CONTINUATIONS,
+                            )
+                            if verbose:
+                                print(
+                                    f"[SDK] Validation incomplete; continuing turn {turn + 2}",
+                                    flush=True,
+                                )
+                            next_prompt = CC_CONTINUATION_PROMPT
 
-        except TimeoutError:
-            logger.warning("Claude Code session timed out after %ds", timeout)
-            if verbose:
-                print(f"\n[SDK] Timed out after {timeout}s", flush=True)
-            return _check_validation_state(jobs_dir, task_id, logger, timed_out=True)
+            except TimeoutError:
+                logger.warning("Claude Code session timed out after %ds", timeout)
+                if verbose:
+                    print(f"\n[SDK] Timed out after {timeout}s", flush=True)
+                return _check_validation_state(
+                    jobs_dir,
+                    task_id,
+                    logger,
+                    timed_out=True,
+                    baseline=validation_baseline,
+                )
+        finally:
+            os.environ.update(hidden_env)
 
-        if verbose:
-            print("-" * 60, flush=True)
-            print("[SDK] Session complete", flush=True)
-
-        # Check final state from job files
-        return _check_validation_state(jobs_dir, task_id, logger)
+        return _check_validation_state(jobs_dir, task_id, logger, baseline=validation_baseline)
 
     except Exception as e:
-        logger.error("Claude Code session failed: %s", e)
-        return ClaudeCodeResult(
-            success=False,
-            nop_passed=False,
-            oracle_passed=False,
-            error_message=f"SDK failed: {e}",
+        safe_error = redact_sensitive_text(str(e))
+        logger.error("Claude Code session failed: %s", safe_error)
+        state = _check_validation_state(
+            jobs_dir,
+            task_id,
+            logger,
+            baseline=validation_baseline,
         )
+        if not state.success:
+            state.error_message = "; ".join(
+                part for part in (f"SDK failed: {safe_error}", state.error_message) if part
+            )
+        return state
 
 
 def _check_validation_state(
@@ -928,9 +980,10 @@ def _check_validation_state(
     task_id: str,
     logger: logging.Logger,
     timed_out: bool = False,
+    baseline: dict[Path, tuple[int, int]] | None = None,
 ) -> ClaudeCodeResult:
     """Check validation state from harbor job results."""
-    nop_passed, oracle_passed = _check_job_results(jobs_dir, task_id)
+    nop_passed, oracle_passed = _check_job_results(jobs_dir, task_id, baseline=baseline)
     success = nop_passed and oracle_passed
 
     error_message = None
@@ -952,7 +1005,29 @@ def _check_validation_state(
     )
 
 
-def _check_job_results(jobs_dir: Path, task_id: str) -> tuple[bool, bool]:
+def _snapshot_job_results(jobs_dir: Path, task_id: str) -> dict[Path, tuple[int, int]]:
+    """Snapshot existing results so a rerun cannot accept stale validations."""
+    baseline: dict[Path, tuple[int, int]] = {}
+    if not jobs_dir.exists():
+        return baseline
+    for pattern in (f"{task_id}-nop-*", f"{task_id}-oracle-*"):
+        for result_file in jobs_dir.glob(pattern):
+            if not result_file.is_dir():
+                continue
+            for path in result_file.rglob("result.json"):
+                try:
+                    stat_result = path.stat()
+                except OSError:
+                    continue
+                baseline[path.resolve()] = (stat_result.st_mtime_ns, stat_result.st_size)
+    return baseline
+
+
+def _check_job_results(
+    jobs_dir: Path,
+    task_id: str,
+    baseline: dict[Path, tuple[int, int]] | None = None,
+) -> tuple[bool, bool]:
     """Check the actual job results to determine validation state.
 
     Looks for job directories matching:
@@ -977,7 +1052,16 @@ def _check_job_results(jobs_dir: Path, task_id: str) -> tuple[bool, bool]:
                 continue
             # Find result.json (Harbor creates a timestamped subdir inside --jobs-dir)
             for result_file in job_dir.rglob("result.json"):
-                mtime = result_file.stat().st_mtime
+                try:
+                    stat_result = result_file.stat()
+                except OSError:
+                    continue
+                if baseline is not None and baseline.get(result_file.resolve()) == (
+                    stat_result.st_mtime_ns,
+                    stat_result.st_size,
+                ):
+                    continue
+                mtime = stat_result.st_mtime
                 if mtime > best_mtime:
                     best_mtime = mtime
                     best_path = result_file
