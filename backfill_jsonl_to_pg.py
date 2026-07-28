@@ -46,7 +46,6 @@ from swegen.ledger_repo import (  # noqa: E402
     backfill_rows,
 )
 
-
 # Snapshot copies of ledgers taken before a maintenance action, e.g.
 # orchestrator-progress.before-failure-clear-20260716T123736Z.jsonl. These hold
 # superseded state and must NOT be backfilled (latest-wins reads could let a

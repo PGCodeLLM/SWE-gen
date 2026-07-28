@@ -1,15 +1,13 @@
 # JSONL → Postgres Ledger Migration — Summary
 
-Status: **complete** (writers, readers, schema, backfill, parity check all
-landed; historical ledgers imported). This document is the handoff for the next
-agent: it explains what changed, how to run things, and where the old JSONL
-codepaths still live so they can be cleaned up later.
+Status: **migration complete; compatibility retirement deferred**. Writers,
+readers, schema, backfill, and parity checks have landed and historical ledgers
+were imported. The remaining work in section 7 is intentionally delayed until
+the PostgreSQL/PGMQ k3s pipeline passes its live end-to-end validation.
 
-> Working source of truth is the **deployed** tree `/data/work/slurm-swegen`
-> (branch `slurm-refactor`). The pristine source lives at
-> `/data/work/alex/SWE-gen`. The migration code is developed in the source tree
-> and synced to the deployed tree. See
-> `memory/swegen-source-vs-deployed-trees.md`.
+> The source repository is `/data/work/alex/SWE-gen`; the integrated branch is
+> `slurm-swegen` in its linked worktree. `/data/work/slurm-swegen` remains the
+> deployed Slurm tree until the k3s worker rollout replaces it.
 
 ---
 
@@ -186,11 +184,13 @@ Totals: **608,147 imported, 1,555 skipped (already present), 86 malformed.**
   bootstrapped automatically. Do not run `schema.sql` manually against
   `mindforge`.
 
-## 7. Old JSONL codepaths (for later cleanup)
+## 7. Deferred JSONL compatibility retirement
 
 The `jsonl` backend is preserved as a fallback (`SWEGEN_LEDGER_BACKEND=jsonl`)
-so the migration is reversible, but these are now legacy and can be removed
-once Postgres is confirmed stable in production:
+so the migration remains reversible during live validation. These are genuine
+outstanding cleanup items, not missing migration commits. Remove them only
+after the PostgreSQL/PGMQ k3s pipeline completes an end-to-end task and the
+existing Slurm services no longer require rollback compatibility:
 
 - `append_private_jsonl` / `read_appended_jsonl` and the inode/offset resume
   logic in `src/slurm_validation_worker.py` — still used by the jsonl backend
@@ -199,10 +199,9 @@ once Postgres is confirmed stable in production:
   `src/slurm_validation_worker.py` — superseded by `LedgerRepo.load_latest()`
   but still referenced by `pg_ledger_verify.py`'s reference readers and the
   jsonl fallback readers.
-- `src/merge_backfill_into_postcheck.py` (deployed tree only, untracked) — a
-  one-shot that merges Stage-3 reward-backfill verdicts into the shared
-  postcheck **JSONL** ledger. Its logic now belongs against
-  `postcheck_status` / `reward_backfill_status` tables; rewrite or retire.
+- `src/merge_backfill_into_postcheck.py` — a legacy one-shot merger retained
+  for rollout compatibility. Retire it once queue handoffs write stage results
+  directly and transactionally in PostgreSQL.
 - The per-run `.jsonl` files themselves are no longer authoritative once
   backfilled, but workers in `jsonl` mode still write them. After flipping fully
   to postgres, the `jsonl` branches in `LedgerRepo` and the backend-aware
@@ -215,9 +214,10 @@ once Postgres is confirmed stable in production:
 
 - `f2b6aa8` — Postgres ledger foundation: `db.py`, `schema.sql`, `ledger_repo.py`.
 - `3a37d06` — refactor ledger writers to use `LedgerRepo`.
-- Uncommitted (this round): reader refactor (`orchestrator.py`,
-  `push_all_verified.py`, `retroactive_push.py`, `run_dashboard.py`,
-  `slurm_collect.py`, `slurm_two_node.py`, `stage3_reward_guard.py`), the
-  `pushed_images` backfill fix in `ledger_repo.py`, the `swegen_distributed`
-  default in `db.py`, and the new ops scripts `backfill_jsonl_to_pg.py` /
-  `pg_ledger_verify.py`.
+- `a20abfe` — reader refactor, backfill/verification utilities, final database
+  defaults, and this migration summary.
+- `131098e` on `slurm-swegen` — merge of the complete Postgres migration with
+  the PGMQ/Slurm branch, including test isolation and compatibility fixes.
+
+There is no uncommitted JSONL-to-Postgres migration work. Section 7 tracks the
+separate, intentionally deferred removal of the rollback backend.

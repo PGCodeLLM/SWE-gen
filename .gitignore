@@ -93,6 +93,14 @@ swegen.toml
 data_cache/
 boyuan_graphing/
 boyuan_hack_example/
+
+# Root-level agent/session and runtime artifacts
+/.plan-*.md
+/plan.md
+/conversation-*.txt
+/20??-??-??-*.txt
+/*.bak-*
+/*.yaml.lock
 slurm-candidate-runtime/
 .claude-tmp/
 .env.ats
