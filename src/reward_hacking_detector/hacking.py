@@ -13,11 +13,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from loguru import logger
+try:
+    from loguru import logger
+except ImportError:  # Keep the focused checker usable in the base SWE-gen venv.
+    logger = logging.getLogger(__name__)
 
 
 # Default location for the checker config, alongside this module.
@@ -34,6 +38,10 @@ class HackCheckResult:
     test_framework: str = ""  # Identified test framework
     prompt: str = ""  # The exact prompt sent to the LLM
     raw_response: str = ""  # The raw response text received from the LLM
+    error: str | None = None  # Infrastructure/parser failure, distinct from hacking
+    http_status: int | None = None  # Structured HTTP failure metadata for fallback.
+    error_code: str | None = None
+    error_body: str = ""
 
 
 @dataclass
@@ -293,6 +301,113 @@ _RETRY_BACKOFF = (1, 3, 5)  # seconds between retries
 # window.
 _MAX_BUNDLE_FILE_BYTES = 75 * 1024
 
+# When the primary model rejects a bundle for exceeding its context window, we
+# retry the SAME model once with a much smaller per-file cap before giving up
+# and (optionally) falling back to a larger-context model. The files dropped by
+# this tighter cap are almost always generated data fixtures that carry no
+# reward-hacking signal.
+_OVERFLOW_BUNDLE_FILE_BYTES = 20 * 1024
+
+# Phrases that identify a context-window-overflow rejection (e.g. from a
+# LiteLLM proxy fronting a model with a smaller context limit such as
+# glm-5.2-moedsa's 161,280 tokens). These are distinct from quota/model
+# availability errors and trigger a truncate-then-retry path.
+_CONTEXT_OVERFLOW_PHRASES = (
+    "maximum context length",
+    "reduce the length of the messages",
+    "context window",
+    "contextwindowexceedederror",
+)
+
+_FALLBACK_ERROR_CODES = {
+    "insufficient_quota",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+    "model_not_found",
+    "model_unavailable",
+}
+_FALLBACK_ERROR_PHRASES = (
+    "unknown provider for model",
+    "model is unavailable",
+    "model unavailable",
+    "model was not found",
+    "model not found",
+    "no provider for model",
+    "no deployment for model",
+    "not authorized to use model",
+    "not allowed to use model",
+    "usage exhausted",
+    "quota exhausted",
+    "credits exhausted",
+    "resource exhausted",
+    "usage limit exceeded",
+    "quota exceeded",
+    "credit limit exceeded",
+)
+
+
+def _http_error_details(response: object) -> tuple[str | None, str, str]:
+    """Extract OpenAI-compatible error metadata without assuming one schema."""
+    body = str(getattr(response, "text", ""))[:4000]
+    code: str | None = None
+    message = body
+    try:
+        payload = response.json()  # type: ignore[attr-defined]
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            raw_code = error.get("code") or error.get("type")
+            if raw_code is not None:
+                code = str(raw_code)
+            raw_message = error.get("message")
+            if raw_message is not None:
+                message = str(raw_message)
+        elif error is not None:
+            message = str(error)
+    return code, message, body
+
+
+def is_context_overflow(result: HackCheckResult) -> bool:
+    """Return whether a rejection was caused by the prompt exceeding the
+    model's context window (e.g. glm-5.2-moedsa's 161,280-token limit
+    surfaced by a LiteLLM proxy as an HTTP 400 ``ContextWindowExceededError``).
+
+    Distinct from ``should_fallback``: an overflow is handled by truncating
+    the test bundle and retrying the SAME model first; the larger-context
+    fallback model is only used if the truncated retry still overflows.
+    """
+    if not result.error:
+        return False
+    code = (result.error_code or "").strip().lower()
+    if "context" in code and "window" in code:
+        return True
+    details = " ".join((result.error, result.error_body, code)).lower()
+    return any(phrase in details for phrase in _CONTEXT_OVERFLOW_PHRASES)
+
+
+def should_fallback(result: HackCheckResult) -> bool:
+    """Return whether an infrastructure failure warrants the backup model.
+
+    Classification content never triggers fallback. Only structured quota,
+    rate-limit, model availability, or context-window-overflow failures from
+    the primary request do. (Context overflow first gets a truncate-and-retry
+    on the same model; this returns True so a *persistent* overflow still
+    escalates to the larger-context fallback model.)
+    """
+    if not result.error:
+        return False
+    if is_context_overflow(result):
+        return True
+    if result.http_status == 429:
+        return True
+    code = (result.error_code or "").strip().lower()
+    if code in _FALLBACK_ERROR_CODES:
+        return True
+    details = " ".join((result.error, result.error_body)).lower()
+    return any(phrase in details for phrase in _FALLBACK_ERROR_PHRASES)
+
 
 def _coerce_is_hacking(value: object) -> bool:
     """Normalize model output to a strict boolean.
@@ -339,11 +454,13 @@ async def hack_check(
         return HackCheckResult(
             is_hacking=True,
             reason=f"LLM '{config.name}' check unavailable (no endpoint configured).",
+            error="no endpoint configured",
         )
     if not config.model:
         return HackCheckResult(
             is_hacking=True,
             reason=f"LLM '{config.name}' check unavailable (no model configured).",
+            error="no model configured",
         )
 
     headers = {"Content-Type": "application/json"}
@@ -359,6 +476,10 @@ async def hack_check(
 
     # Retry loop for transient failures
     last_err: Exception | None = None
+    last_http_status: int | None = None
+    last_error_code: str | None = None
+    last_error_body = ""
+    resp = None
     for attempt in range(_MAX_RETRIES):
         try:
             # Generous timeout: reasoning models can be slow, especially under
@@ -367,15 +488,38 @@ async def hack_check(
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, headers=headers, json=payload)
 
-                # Retry on 5xx server errors
-                if resp.status_code >= 500:
-                    body = resp.text[:500]
+                if resp.status_code >= 400:
+                    code, message, body = _http_error_details(resp)
+                    error_text = f"HTTP {resp.status_code}: {message or body}"
+                    last_http_status = resp.status_code
+                    last_error_code = code
+                    last_error_body = body
+
+                    # Retry generic 5xx server errors on the primary model.
+                    # A fallback-eligible 5xx (for example, an endpoint that
+                    # reports an unknown model provider as 502) retains its
+                    # response body so the wrapper can switch after retries.
+                    if resp.status_code < 500:
+                        return HackCheckResult(
+                            is_hacking=True,
+                            reason=(
+                                f"LLM check unavailable ({error_text}); "
+                                "rejecting as precaution (fail-closed)"
+                            ),
+                            prompt=prompt,
+                            raw_response=body or f"(no response - {error_text})",
+                            error=error_text,
+                            http_status=resp.status_code,
+                            error_code=code,
+                            error_body=body,
+                        )
+
                     logger.warning(
                         f"{tag}Hack check attempt {attempt + 1}/{_MAX_RETRIES}: "
-                        f"HTTP {resp.status_code} from {url}: {body}"
+                        f"{error_text} from {url}"
                     )
                     last_err = httpx.HTTPStatusError(
-                        f"HTTP {resp.status_code}: {body}",
+                        error_text,
                         request=resp.request,
                         response=resp,
                     )
@@ -470,7 +614,8 @@ async def hack_check(
                     "rejecting as precaution (fail-closed)"
                 ),
                 prompt=prompt,
-                raw_response=f"(no response — {type(e).__name__}: {e})",
+                raw_response=f"(no response - {type(e).__name__}: {e})",
+                error=f"{type(e).__name__}: {e}",
             )
 
     # All retries exhausted
@@ -485,7 +630,11 @@ async def hack_check(
             "rejecting as precaution (fail-closed)"
         ),
         prompt=prompt,
-        raw_response=f"(no response after {_MAX_RETRIES} retries — {err_detail})",
+        raw_response=f"(no response after {_MAX_RETRIES} retries - {err_detail})",
+        error=err_detail,
+        http_status=last_http_status,
+        error_code=last_error_code,
+        error_body=last_error_body,
     )
 
 
@@ -544,7 +693,7 @@ def load_llm_configs(config_path: Path | None = None) -> list[LLMConfig]:
 # ── Test-bundle assembly ─────────────────────────────────────────────
 
 
-def build_test_bundle(instance_dir: Path) -> str:
+def build_test_bundle(instance_dir: Path, max_file_bytes: int = _MAX_BUNDLE_FILE_BYTES) -> str:
     """Assemble the prompt's `{files}` payload for one Harbor instance.
 
     Reads every file under `<instance_dir>/tests` (recursively, including
@@ -558,9 +707,12 @@ def build_test_bundle(instance_dir: Path) -> str:
     `tests/test.sh` is placed first so it matches the prompt's framing
     ("the first file below is the test script"). Files that cannot be
     decoded as UTF-8 (binaries) are skipped. Files larger than
-    ``_MAX_BUNDLE_FILE_BYTES`` have their contents replaced with a placeholder
+    ``max_file_bytes`` have their contents replaced with a placeholder
     (they are almost always generated data fixtures that would only blow past
-    the model's context window).
+    the model's context window). The default cap is tuned for large-context
+    models; callers pass a smaller ``max_file_bytes`` (e.g.
+    ``_OVERFLOW_BUNDLE_FILE_BYTES``) when retrying after a context-window
+    rejection on a smaller-context model such as glm-5.2-moedsa.
     """
     tests_dir = instance_dir / "tests"
     if not tests_dir.is_dir():
@@ -574,6 +726,7 @@ def build_test_bundle(instance_dir: Path) -> str:
 
     files.sort(key=sort_key)
 
+    cap_label = "75KB" if max_file_bytes == _MAX_BUNDLE_FILE_BYTES else f"{max_file_bytes} bytes"
     blocks: list[str] = []
     for p in files:
         rel = p.relative_to(instance_dir)
@@ -582,12 +735,12 @@ def build_test_bundle(instance_dir: Path) -> str:
         except OSError as e:
             logger.warning(f"[{instance_dir.name}] skipping unreadable file {rel}: {e}")
             continue
-        if size > _MAX_BUNDLE_FILE_BYTES:
+        if size > max_file_bytes:
             logger.info(
                 f"[{instance_dir.name}] {rel} is {size} bytes "
-                f"(> {_MAX_BUNDLE_FILE_BYTES}); replacing contents with placeholder."
+                f"(> {max_file_bytes}); replacing contents with placeholder."
             )
-            blocks.append(f"```{rel}\n<File skipped due to being above 75KB>\n```")
+            blocks.append(f"```{rel}\n<File skipped due to being above {cap_label}>\n```")
             continue
         try:
             contents = p.read_text(encoding="utf-8")
@@ -632,6 +785,8 @@ def write_instance_log(
             f"VERDICT: is_hacking={res.is_hacking}, "
             f"framework={res.test_framework}, passed={not res.is_hacking}"
         )
+        if res.error:
+            parts.append(f"ERROR: {res.error}")
         parts.append("RESPONSE:")
         parts.append(sub)
         parts.append(res.raw_response if res.raw_response else "(no response recorded)")
@@ -656,7 +811,55 @@ async def check_instance(
     results = await asyncio.gather(
         *(hack_check(test_bundle, cfg, task_id) for cfg in configs)
     )
-    return list(zip(configs, results))
+    return list(zip(configs, results, strict=True))
+
+
+async def check_instance_with_fallback(
+    test_bundle: str,
+    primary: LLMConfig,
+    fallback: LLMConfig | None,
+    task_id: str = "",
+    instance_dir: Path | None = None,
+) -> tuple[LLMConfig, HackCheckResult, list[tuple[LLMConfig, HackCheckResult]]]:
+    """Check with ``primary`` and use ``fallback`` only for eligible failures.
+
+    The returned list contains every attempted model in order so callers can
+    retain complete prompt/response evidence. A valid hacking or clean verdict
+    from the primary is always authoritative and never invokes the fallback.
+
+    Context-window handling: if the primary rejects the bundle for exceeding
+    its context window and ``instance_dir`` is provided, the bundle is rebuilt
+    with a tighter per-file cap (``_OVERFLOW_BUNDLE_FILE_BYTES``) and the SAME
+    primary model is retried once. This keeps the check on the primary model
+    (e.g. glm-5.2-moedsa) for the common case where the overflow came from a
+    large generated fixture that carries no hack signal. If the truncated retry
+    still overflows (or otherwise qualifies for fallback), the larger-context
+    ``fallback`` model is then used.
+    """
+    primary_result = await hack_check(test_bundle, primary, task_id)
+    attempts: list[tuple[LLMConfig, HackCheckResult]] = [(primary, primary_result)]
+
+    if is_context_overflow(primary_result) and instance_dir is not None:
+        truncated = build_test_bundle(instance_dir, _OVERFLOW_BUNDLE_FILE_BYTES)
+        if truncated and truncated != test_bundle:
+            logger.info(
+                f"[{task_id or primary.name}] context-window overflow on primary; "
+                f"retrying {primary.model} with truncated bundle "
+                f"({_OVERFLOW_BUNDLE_FILE_BYTES}-byte cap)."
+            )
+            retry_result = await hack_check(truncated, primary, task_id)
+            attempts.append((primary, retry_result))
+            primary_result = retry_result
+
+    if (
+        fallback is not None
+        and fallback.model != primary.model
+        and should_fallback(primary_result)
+    ):
+        fallback_result = await hack_check(test_bundle, fallback, task_id)
+        attempts.append((fallback, fallback_result))
+        return fallback, fallback_result, attempts
+    return primary, primary_result, attempts
 
 
 def _iter_instances(input_dir: Path):
@@ -783,6 +986,7 @@ async def run(
                     "is_hacking": res.is_hacking,
                     "test_framework": res.test_framework,
                     "reason": res.reason,
+                    "error": res.error,
                 }
                 for cfg, res in pairs
             ]

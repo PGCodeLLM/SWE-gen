@@ -41,6 +41,7 @@ def test_generate_shards_is_balanced_disjoint_and_deterministic(tmp_path) -> Non
         "minimum_entries": 3,
         "maximum_entries": 5,
         "entry_spread": 2,
+        "worker_counts": [4, 4, 4],
     }
 
     repo_owner = {}
@@ -96,3 +97,22 @@ def test_r4_de_layout_uses_de_proxy_and_revision_paths(tmp_path) -> None:
     assert shard["session"] == "swegen-de-a-r4"
     assert shard["log_dir"].endswith("orchestrator-logs-de-a-r4-4w")
     assert shard["progress_jsonl"].endswith("orchestrator-progress-de-a-r4.jsonl")
+
+
+def test_generate_shards_supports_per_shard_worker_counts(tmp_path) -> None:
+    source = tmp_path / "source.jsonl"
+    write_jsonl(
+        source,
+        [{"repo": f"owner/{index}", "pull_number": index} for index in range(12)],
+    )
+
+    manifest = generator.generate_shards(
+        source,
+        tmp_path / "out",
+        names=("r10-sg-a", "r10-hk-a"),
+        workers=(4, 2),
+    )
+
+    assert [shard["workers"] for shard in manifest["shards"]] == [4, 2]
+    assert manifest["shards"][1]["log_dir"].endswith("r10-2w")
+    assert [shard["entries"] for shard in manifest["shards"]] == [8, 4]

@@ -93,3 +93,6 @@ swegen.toml
 data_cache/
 boyuan_graphing/
 boyuan_hack_example/
+slurm-candidate-runtime/
+.claude-tmp/
+.env.ats
