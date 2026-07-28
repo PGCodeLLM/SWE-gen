@@ -6,20 +6,32 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from shutil import rmtree
 from threading import Event, Lock
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
 import pytest
 
 from swegen.pipeline.models import PipelineTask, StageExecution, TaskFile
-from swegen.pipeline.worker import ClaimHeartbeat, PipelineWorker, WorkerSettings
+from swegen.pipeline.worker import (
+    ClaimHeartbeat,
+    PipelineWorker,
+    WorkerSettings,
+    _safe_error_text,
+)
 from swegen.queueing.models import (
     ClaimedMessage,
     PipelineStage,
     QueueMessage,
     RetryDisposition,
     queue_for_stage,
+)
+from swegen.queueing.pgmq import (
+    MAX_DELIVERIES,
+    MAX_POLL_SECONDS,
+    MAX_VISIBILITY_TIMEOUT_SECONDS,
 )
 
 EVENT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -303,9 +315,10 @@ class FakeAction:
 
 
 class FakeHeartbeat:
-    def __init__(self) -> None:
+    def __init__(self, failure: str | None = None) -> None:
         self.entered = False
         self.exited = False
+        self.failure = failure
 
     def __enter__(self) -> FakeHeartbeat:
         self.entered = True
@@ -321,13 +334,14 @@ class FakeHeartbeat:
 
 
 class FakeHeartbeatFactory:
-    def __init__(self) -> None:
+    def __init__(self, failure: str | None = None) -> None:
         self.instances: list[FakeHeartbeat] = []
         self.calls: list[dict[str, Any]] = []
+        self.failure = failure
 
     def __call__(self, **kwargs: Any) -> FakeHeartbeat:
         self.calls.append(kwargs)
-        heartbeat = FakeHeartbeat()
+        heartbeat = FakeHeartbeat(self.failure)
         self.instances.append(heartbeat)
         return heartbeat
 
@@ -354,9 +368,11 @@ def make_worker(
     clock: Callable[[], datetime] | None = None,
     stop_event: Event | None = None,
     heartbeat_factory: Callable[..., AbstractContextManager[object]] | None = None,
+    queue: FakeQueue | None = None,
+    workspace_factory: Callable[..., AbstractContextManager[Path]] | None = None,
 ) -> PipelineWorker:
     selected_claims = list(claims or ([] if claim is None else [claim]))
-    queue = FakeQueue(selected_claims)
+    queue = queue or FakeQueue(selected_claims)
     store = FakeStore(task or pipeline_task(stage), files)
     return PipelineWorker(
         stage=stage,
@@ -371,6 +387,7 @@ def make_worker(
         uuid_factory=lambda: NEXT_EVENT_ID,
         stop_event=stop_event,
         heartbeat_factory=heartbeat_factory or FakeHeartbeatFactory(),
+        workspace_factory=workspace_factory,
     )
 
 
@@ -413,6 +430,67 @@ def test_worker_settings_require_heartbeat_before_visibility_expiry(tmp_path: Pa
             visibility_timeout_seconds=60,
             heartbeat_interval_seconds=60,
         )
+
+
+def test_worker_settings_enforce_the_single_claim_mvp(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="claim_quantity"):
+        WorkerSettings(workspace_root=tmp_path, claim_quantity=2)
+
+
+def test_worker_settings_reject_a_non_finite_heartbeat_interval(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="heartbeat_interval_seconds"):
+        WorkerSettings(workspace_root=tmp_path, heartbeat_interval_seconds=float("nan"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("visibility_timeout_seconds", MAX_VISIBILITY_TIMEOUT_SECONDS + 1),
+        ("poll_seconds", MAX_POLL_SECONDS + 1),
+        ("max_deliveries", MAX_DELIVERIES + 1),
+        ("retry_visibility_timeout_seconds", MAX_VISIBILITY_TIMEOUT_SECONDS + 1),
+    ],
+)
+def test_worker_settings_reject_values_above_pgmq_bounds(
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        WorkerSettings(workspace_root=tmp_path, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "credential_text",
+    [
+        "SWEGEN_PG_PASSWORD=hunter2",
+        "password=hunter2",
+        "AWS_SECRET_ACCESS_KEY=hunter2",
+        "client_secret=hunter2",
+        "access_key=hunter2",
+        "token=hunter2",
+        '{"password": "hunter2"}',
+        "postgresql://root:hunter2@db.example/swegen",
+        "host=db user=root password=hunter2 dbname=swegen",
+    ],
+)
+def test_safe_error_text_redacts_worker_local_credential_forms(
+    credential_text: str,
+) -> None:
+    safe_error = _safe_error_text(RuntimeError(f"failed with {credential_text}"))
+
+    assert "hunter2" not in safe_error
+    assert "<REDACTED>" in safe_error
+
+
+def test_safe_error_text_normalizes_controls_before_logging_and_persistence() -> None:
+    safe_error = _safe_error_text(
+        RuntimeError("first line\npassword=hunter2\rsecond\x00\tthird" + "x" * 5_000)
+    )
+
+    assert "hunter2" not in safe_error
+    assert all(ord(character) >= 32 and ord(character) != 127 for character in safe_error)
+    assert len(safe_error) <= 4_000
 
 
 def test_empty_poll_returns_false_without_loading_a_task(tmp_path: Path) -> None:
@@ -489,6 +567,107 @@ def test_claim_heartbeat_uses_short_independent_connections_and_stops() -> None:
     assert queue.heartbeat_calls
     assert all(connection.exited for connection in connection_factory.connections)
     assert all(call[2] == 300 for call in queue.heartbeat_calls)
+
+
+def test_claim_heartbeat_exit_is_bounded_when_the_database_call_remains_blocked() -> None:
+    heartbeat_started = Event()
+    release_heartbeat = Event()
+    heartbeat_finished = Event()
+    connection_factory = RecordingConnectionFactory()
+    claim = reward_claim()
+
+    class BlockingHeartbeatQueue(FakeQueue):
+        def heartbeat(
+            self,
+            connection: FakeConnection,
+            current: ClaimedMessage,
+            *,
+            visibility_timeout_seconds: int,
+        ) -> ClaimedMessage:
+            heartbeat_started.set()
+            release_heartbeat.wait(timeout=2)
+            heartbeat_finished.set()
+            return current
+
+    heartbeat = ClaimHeartbeat(
+        connection_factory=connection_factory,
+        queue=BlockingHeartbeatQueue(),
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+        join_timeout_seconds=0.01,
+    )
+
+    started = monotonic()
+    with heartbeat:
+        assert heartbeat_started.wait(timeout=1)
+    elapsed = monotonic() - started
+
+    assert elapsed < 0.5
+    assert heartbeat.lease_lost is True
+    assert heartbeat.failure is not None
+    assert "stop" in heartbeat.failure
+
+    release_heartbeat.set()
+    assert heartbeat_finished.wait(timeout=1)
+
+
+def test_claim_heartbeat_detects_changed_delivery_ownership() -> None:
+    heartbeat_seen = Event()
+    claim = reward_claim(read_count=1)
+
+    class ReclaimedHeartbeatQueue(FakeQueue):
+        def heartbeat(
+            self,
+            connection: FakeConnection,
+            current: ClaimedMessage,
+            *,
+            visibility_timeout_seconds: int,
+        ) -> ClaimedMessage:
+            heartbeat_seen.set()
+            return current.model_copy(update={"read_count": current.read_count + 1})
+
+    heartbeat = ClaimHeartbeat(
+        connection_factory=RecordingConnectionFactory(),
+        queue=ReclaimedHeartbeatQueue(),
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+    )
+
+    with heartbeat:
+        assert heartbeat_seen.wait(timeout=1)
+
+    assert heartbeat.lease_lost is True
+    assert heartbeat.failure is not None
+    assert "ownership" in heartbeat.failure
+
+
+@pytest.mark.parametrize("action_raises", [False, True])
+def test_worker_leaves_a_failed_heartbeat_for_pgmq_recovery_without_stale_mutation(
+    tmp_path: Path,
+    action_raises: bool,
+) -> None:
+    action = (
+        FakeAction(error=RuntimeError("action also failed"))
+        if action_raises
+        else FakeAction(StageExecution.succeeded({"score": 1}))
+    )
+    worker = make_worker(
+        tmp_path,
+        action=action,
+        claim=reward_claim(),
+        heartbeat_factory=FakeHeartbeatFactory("lease ownership was lost"),
+    )
+
+    assert worker.run_once() is True
+
+    assert worker.queue.handoffs == []
+    assert worker.queue.completed_terminal == []
+    assert worker.queue.retries == []
+    assert worker.queue.dead_letters == []
+    assert worker.store.stage_results == []
+    assert worker.store.terminal_failures == []
 
 
 def test_success_records_result_and_constructs_the_exact_sole_successor(
@@ -624,6 +803,52 @@ def test_stop_request_during_action_allows_completion_but_prevents_future_claims
     assert len(worker.queue.claim_calls) == 1
 
 
+def test_stop_request_during_long_poll_releases_claim_without_starting_action(
+    tmp_path: Path,
+) -> None:
+    stop_event = Event()
+    claim = reward_claim()
+
+    class StopBeforeReturningClaimQueue(FakeQueue):
+        def claim(
+            self,
+            connection: FakeConnection,
+            stage: PipelineStage,
+            *,
+            visibility_timeout_seconds: int,
+            quantity: int,
+            max_poll_seconds: int,
+        ) -> list[ClaimedMessage]:
+            claims = super().claim(
+                connection,
+                stage,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                quantity=quantity,
+                max_poll_seconds=max_poll_seconds,
+            )
+            stop_event.set()
+            return claims
+
+    queue = StopBeforeReturningClaimQueue([claim])
+    action = FakeAction(StageExecution.succeeded({"score": 1}))
+    worker = make_worker(
+        tmp_path,
+        action=action,
+        stop_event=stop_event,
+        queue=queue,
+    )
+
+    assert worker.run_once() is False
+
+    assert action.calls == []
+    assert queue.heartbeat_calls == [(worker.connection_factory.connections[1], claim, 1)]
+    assert worker.connection_factory.connections[0].exited is True
+    assert worker.connection_factory.connections[1].exited is True
+    assert queue.handoffs == []
+    assert queue.retries == []
+    assert queue.dead_letters == []
+
+
 def test_each_delivery_uses_and_cleans_a_fresh_materialized_workspace(
     tmp_path: Path,
 ) -> None:
@@ -675,3 +900,52 @@ def test_generate_starts_without_loading_or_materializing_stored_files(
     assert worker.run_once() is True
 
     assert worker.store.load_files_calls == []
+
+
+def test_cleanup_failure_after_durable_completion_does_not_retry_or_dead_letter(
+    tmp_path: Path,
+) -> None:
+    claim = reward_claim()
+
+    class CleanupFailureWorkspaceFactory:
+        def __init__(self) -> None:
+            self.path: Path | None = None
+
+        def __call__(self, *, root: Path, prefix: str) -> AbstractContextManager[Path]:
+            factory = self
+
+            class CleanupFailureWorkspace:
+                def __enter__(self) -> Path:
+                    factory.path = root / f"{prefix}workspace"
+                    factory.path.mkdir()
+                    return factory.path
+
+                def __exit__(
+                    self,
+                    exc_type: type[BaseException] | None,
+                    exc: BaseException | None,
+                    traceback: object | None,
+                ) -> None:
+                    assert factory.path is not None
+                    rmtree(factory.path)
+                    raise RuntimeError("workspace cleanup failed")
+
+            return CleanupFailureWorkspace()
+
+    workspace_factory = CleanupFailureWorkspaceFactory()
+    worker = make_worker(
+        tmp_path,
+        action=FakeAction(StageExecution.succeeded({"score": 1})),
+        claim=claim,
+        workspace_factory=workspace_factory,
+    )
+
+    assert worker.run_once() is True
+
+    assert len(worker.queue.handoffs) == 1
+    assert worker.queue.handoffs[0][0] == claim
+    assert worker.queue.retries == []
+    assert worker.queue.dead_letters == []
+    assert len(worker.store.stage_results) == 1
+    assert workspace_factory.path is not None
+    assert workspace_factory.path.exists() is False

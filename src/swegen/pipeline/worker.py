@@ -5,15 +5,17 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import signal
 import socket
 import tempfile
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from types import FrameType
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -22,10 +24,45 @@ from swegen.create.claude_code_utils import redact_sensitive_text
 from swegen.pipeline.models import PipelineTask, StageExecution, TaskFile
 from swegen.pipeline.task_store import TaskStore, materialize_task_files
 from swegen.queueing.models import ClaimedMessage, PipelineStage, QueueMessage
-from swegen.queueing.pgmq import PgmqQueue
+from swegen.queueing.pgmq import (
+    MAX_DELIVERIES,
+    MAX_POLL_SECONDS,
+    MAX_VISIBILITY_TIMEOUT_SECONDS,
+    PgmqQueue,
+)
 
 LOGGER = logging.getLogger(__name__)
 MAX_WORKER_ERROR_CHARS = 4_000
+
+_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_WHITESPACE_RE = re.compile(r"\s+")
+_URI_CREDENTIAL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_CREDENTIAL_KEY_PATTERN = (
+    r"[A-Z0-9_.-]*(?:PASSWORD|PASSWD|SECRET|ACCESS_KEY|API_KEY|AUTH_TOKEN|ACCESS_TOKEN|TOKEN)"
+)
+_QUOTED_CREDENTIAL_RE = re.compile(
+    rf"""(?ix)
+    (?P<prefix>
+        (?<![A-Z0-9_])
+        ["']?{_CREDENTIAL_KEY_PATTERN}["']?
+        \s*[:=]\s*
+        (?P<quote>["'])
+    )
+    [^"']*
+    (?P=quote)
+    """
+)
+_UNQUOTED_CREDENTIAL_RE = re.compile(
+    rf"""(?ix)
+    (?P<prefix>
+        (?<![A-Z0-9_])
+        ["']?{_CREDENTIAL_KEY_PATTERN}["']?
+        \s*[:=]\s*
+    )
+    (?!["'])
+    [^\s,;}}\]]+
+    """
+)
 
 type ConnectionFactory = Callable[[], AbstractContextManager[Any]]
 
@@ -34,6 +71,22 @@ class StageAction(Protocol):
     """Execute one pipeline stage inside a per-delivery workspace."""
 
     def __call__(self, task: PipelineTask, workspace: Path, /) -> StageExecution: ...
+
+
+class HeartbeatContext(Protocol):
+    """Observable state for one active visibility heartbeat."""
+
+    @property
+    def failure(self) -> str | None: ...
+
+    def __enter__(self) -> HeartbeatContext: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> None: ...
 
 
 class HeartbeatFactory(Protocol):
@@ -47,7 +100,22 @@ class HeartbeatFactory(Protocol):
         claim: ClaimedMessage,
         visibility_timeout_seconds: int,
         interval_seconds: float,
-    ) -> AbstractContextManager[object]: ...
+    ) -> HeartbeatContext: ...
+
+
+class WorkspaceFactory(Protocol):
+    """Create one disposable workspace context for a claimed delivery."""
+
+    def __call__(
+        self,
+        *,
+        root: Path,
+        prefix: str,
+    ) -> AbstractContextManager[Path]: ...
+
+
+class LeaseOwnershipError(RuntimeError):
+    """Raised when a heartbeat can no longer prove delivery ownership."""
 
 
 def _positive_integer(name: str, value: object) -> int:
@@ -56,8 +124,20 @@ def _positive_integer(name: str, value: object) -> int:
     return value
 
 
+def _bounded_positive_integer(name: str, value: object, maximum: int) -> int:
+    value = _positive_integer(name, value)
+    if value > maximum:
+        raise ValueError(f"{name} must not exceed {maximum}")
+    return value
+
+
 def _positive_interval(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value <= 0
+    ):
         raise ValueError(f"{name} must be a positive number")
     return float(value)
 
@@ -67,7 +147,18 @@ def _safe_error_text(error: BaseException) -> str:
 
     detail = str(error).strip()
     summary = type(error).__name__ if not detail else f"{type(error).__name__}: {detail}"
-    return redact_sensitive_text(summary)[:MAX_WORKER_ERROR_CHARS]
+    summary = _WHITESPACE_RE.sub(" ", _CONTROL_CHARACTER_RE.sub(" ", summary)).strip()
+    summary = _URI_CREDENTIAL_RE.sub(r"\1<REDACTED>@", summary)
+    summary = redact_sensitive_text(summary)
+    summary = _QUOTED_CREDENTIAL_RE.sub(
+        lambda match: f"{match.group('prefix')}<REDACTED>{match.group('quote')}",
+        summary,
+    )
+    summary = _UNQUOTED_CREDENTIAL_RE.sub(
+        lambda match: f"{match.group('prefix')}<REDACTED>",
+        summary,
+    )
+    return summary[:MAX_WORKER_ERROR_CHARS]
 
 
 def _first_identity(*environment_names: str) -> str:
@@ -84,6 +175,12 @@ def _default_workspace_root() -> Path:
     return Path(configured) if configured else Path(tempfile.gettempdir()) / "swegen-worker"
 
 
+@contextmanager
+def _temporary_workspace(*, root: Path, prefix: str):
+    with tempfile.TemporaryDirectory(dir=root, prefix=prefix) as temporary_directory:
+        yield Path(temporary_directory)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerSettings:
     """Timing, retry, and workspace settings for one stage worker."""
@@ -98,17 +195,26 @@ class WorkerSettings:
 
     def __post_init__(self) -> None:
         claim_quantity = _positive_integer("claim_quantity", self.claim_quantity)
-        visibility = _positive_integer(
-            "visibility_timeout_seconds", self.visibility_timeout_seconds
+        if claim_quantity != 1:
+            raise ValueError("claim_quantity must be exactly 1 until batching is implemented")
+        visibility = _bounded_positive_integer(
+            "visibility_timeout_seconds",
+            self.visibility_timeout_seconds,
+            MAX_VISIBILITY_TIMEOUT_SECONDS,
         )
         heartbeat = _positive_interval(
             "heartbeat_interval_seconds", self.heartbeat_interval_seconds
         )
-        poll_seconds = _positive_integer("poll_seconds", self.poll_seconds)
-        max_deliveries = _positive_integer("max_deliveries", self.max_deliveries)
-        retry_visibility = _positive_integer(
+        poll_seconds = _bounded_positive_integer(
+            "poll_seconds", self.poll_seconds, MAX_POLL_SECONDS
+        )
+        max_deliveries = _bounded_positive_integer(
+            "max_deliveries", self.max_deliveries, MAX_DELIVERIES
+        )
+        retry_visibility = _bounded_positive_integer(
             "retry_visibility_timeout_seconds",
             self.retry_visibility_timeout_seconds,
+            MAX_VISIBILITY_TIMEOUT_SECONDS,
         )
         if heartbeat >= visibility:
             raise ValueError(
@@ -143,6 +249,7 @@ class ClaimHeartbeat:
         claim: ClaimedMessage,
         visibility_timeout_seconds: int,
         interval_seconds: float,
+        join_timeout_seconds: float = 1.0,
     ) -> None:
         self._connection_factory = connection_factory
         self._queue = queue
@@ -151,7 +258,12 @@ class ClaimHeartbeat:
             "visibility_timeout_seconds", visibility_timeout_seconds
         )
         self._interval_seconds = _positive_interval("interval_seconds", interval_seconds)
+        self._join_timeout_seconds = _positive_interval(
+            "join_timeout_seconds", join_timeout_seconds
+        )
         self._stopped = Event()
+        self._state_lock = Lock()
+        self._failure: str | None = None
         self._thread: Thread | None = None
 
     @property
@@ -159,6 +271,19 @@ class ClaimHeartbeat:
         """Return whether the background heartbeat thread is alive."""
 
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def failure(self) -> str | None:
+        """Return a safe failure summary when the lease can no longer be trusted."""
+
+        with self._state_lock:
+            return self._failure
+
+    @property
+    def lease_lost(self) -> bool:
+        """Return whether heartbeat failure made delivery ownership uncertain."""
+
+        return self.failure is not None
 
     def __enter__(self) -> ClaimHeartbeat:
         if self._thread is not None:
@@ -179,25 +304,55 @@ class ClaimHeartbeat:
     ) -> None:
         self._stopped.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(self._join_timeout_seconds)
+            if self._thread.is_alive():
+                self._record_failure("visibility heartbeat did not stop before the join timeout")
 
     def _run(self) -> None:
         current = self._claim
         while not self._stopped.wait(self._interval_seconds):
             try:
                 with self._connection_factory() as connection:
-                    current = self._queue.heartbeat(
+                    updated = self._queue.heartbeat(
                         connection,
                         current,
                         visibility_timeout_seconds=self._visibility_timeout_seconds,
                     )
+                    self._validate_heartbeat_claim(current, updated)
+                    current = updated
             except Exception as error:  # keep stage work alive; PGMQ remains crash recovery
+                safe_error = self._record_failure(error)
                 LOGGER.error(
                     "visibility heartbeat failed for %s/%s: %s",
                     current.queue.value,
                     current.msg_id,
-                    _safe_error_text(error),
+                    safe_error,
                 )
+                return
+
+    def _record_failure(self, error: BaseException | str) -> str:
+        safe_error = (
+            _safe_error_text(error)
+            if isinstance(error, BaseException)
+            else _safe_error_text(LeaseOwnershipError(error))
+        )
+        with self._state_lock:
+            if self._failure is None:
+                self._failure = safe_error
+            return self._failure
+
+    @staticmethod
+    def _validate_heartbeat_claim(
+        current: ClaimedMessage,
+        updated: ClaimedMessage,
+    ) -> None:
+        if (
+            updated.queue is not current.queue
+            or updated.msg_id != current.msg_id
+            or updated.read_count != current.read_count
+            or updated.message != current.message
+        ):
+            raise LeaseOwnershipError("heartbeat changed delivery ownership or message identity")
 
 
 class PipelineWorker:
@@ -218,6 +373,7 @@ class PipelineWorker:
         uuid_factory: Callable[[], UUID] | None = None,
         stop_event: Event | None = None,
         heartbeat_factory: HeartbeatFactory | None = None,
+        workspace_factory: WorkspaceFactory | None = None,
     ) -> None:
         self.stage = PipelineStage(stage)
         self.connection_factory = connection_factory
@@ -237,6 +393,7 @@ class PipelineWorker:
         self._uuid_factory = uuid_factory or uuid4
         self.stop_event = stop_event or Event()
         self._heartbeat_factory = heartbeat_factory or ClaimHeartbeat
+        self._workspace_factory = workspace_factory or _temporary_workspace
 
     def request_stop(
         self,
@@ -263,11 +420,34 @@ class PipelineWorker:
                 max_poll_seconds=self.settings.poll_seconds,
             )
 
+        if self.stop_event.is_set():
+            for claim in claims:
+                self._release_claim(claim)
+            return False
         if not claims:
             return False
         for claim in claims:
+            if self.stop_event.is_set():
+                self._release_claim(claim)
+                continue
             self._process_claim(claim)
         return True
+
+    def _release_claim(self, claim: ClaimedMessage) -> None:
+        try:
+            with self.connection_factory() as connection:
+                self.queue.heartbeat(
+                    connection,
+                    claim,
+                    visibility_timeout_seconds=1,
+                )
+        except Exception as error:
+            LOGGER.error(
+                "could not release %s/%s during shutdown: %s",
+                claim.queue.value,
+                claim.msg_id,
+                _safe_error_text(error),
+            )
 
     def run_forever(self) -> None:
         """Poll until a stop request arrives, allowing any active action to finish."""
@@ -281,30 +461,61 @@ class PipelineWorker:
 
     def _process_claim(self, claim: ClaimedMessage) -> None:
         started_at = self._now()
+        stale_claim = False
+        durably_completed = False
         try:
             self.settings.workspace_root.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(
-                dir=self.settings.workspace_root,
+            with self._workspace_factory(
+                root=self.settings.workspace_root,
                 prefix=f"{self.stage.value}-{claim.msg_id}-",
-            ) as temporary_directory:
-                workspace = Path(temporary_directory)
+            ) as workspace:
+                action_error: Exception | None = None
+                execution: StageExecution | None = None
                 with self._heartbeat_factory(
                     connection_factory=self.connection_factory,
                     queue=self.queue,
                     claim=claim,
                     visibility_timeout_seconds=self.settings.visibility_timeout_seconds,
                     interval_seconds=self.settings.heartbeat_interval_seconds,
-                ):
-                    task, files = self._load_task(claim)
-                    tasks_directory = workspace / "tasks"
-                    tasks_directory.mkdir()
-                    if claim.message.stage is not PipelineStage.GENERATE:
-                        materialize_task_files(files, tasks_directory / task.task_id)
-                    execution = self.action(task, workspace)
-                    if not isinstance(execution, StageExecution):
-                        raise TypeError("stage action must return a StageExecution")
+                ) as heartbeat:
+                    try:
+                        task, files = self._load_task(claim)
+                        tasks_directory = workspace / "tasks"
+                        tasks_directory.mkdir()
+                        if claim.message.stage is not PipelineStage.GENERATE:
+                            materialize_task_files(files, tasks_directory / task.task_id)
+                        execution = self.action(task, workspace)
+                        if not isinstance(execution, StageExecution):
+                            raise TypeError("stage action must return a StageExecution")
+                    except Exception as error:
+                        action_error = error
+                if heartbeat.failure is not None:
+                    stale_claim = True
+                    raise LeaseOwnershipError(heartbeat.failure)
+                if action_error is not None:
+                    raise action_error
+                if execution is None:
+                    raise RuntimeError("stage action finished without an execution result")
                 self._complete(claim, execution, started_at=started_at)
+                durably_completed = True
         except Exception as error:
+            if durably_completed:
+                LOGGER.error(
+                    "workspace cleanup failed after durable completion for %s/%s: %s",
+                    claim.queue.value,
+                    claim.msg_id,
+                    _safe_error_text(error),
+                )
+                return
+            if stale_claim or isinstance(error, LeaseOwnershipError):
+                LOGGER.error(
+                    "stage %s delivery %s/%s lost its lease; leaving it for PGMQ recovery: %s",
+                    self.stage.value,
+                    claim.queue.value,
+                    claim.msg_id,
+                    _safe_error_text(error),
+                )
+                return
             self._retry_or_dead_letter(claim, error, started_at=started_at)
 
     def _load_task(self, claim: ClaimedMessage) -> tuple[PipelineTask, tuple[TaskFile, ...]]:
