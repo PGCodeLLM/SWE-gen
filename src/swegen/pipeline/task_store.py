@@ -126,7 +126,13 @@ def _require_positive_limit(name: str, value: object) -> int:
 
 
 def _safe_relative_path(path: object) -> str:
-    if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path:
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith("/")
+        or "\\" in path
+        or "\x00" in path
+    ):
         raise TaskFileError("task file path must be a non-empty relative POSIX path")
     parts = path.split("/")
     if any(part in {"", ".", ".."} for part in parts):

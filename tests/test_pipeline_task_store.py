@@ -280,6 +280,39 @@ def test_capture_task_files_discards_special_mode_bits(tmp_path: Path) -> None:
     assert captured.mode == 0o755
 
 
+def test_capture_task_files_rejects_metadata_changes_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swegen.pipeline import task_store
+
+    root = tmp_path / "task"
+    root.mkdir()
+    target = root / "instruction.md"
+    target.write_bytes(b"bug description\n")
+    real_read = task_store.os.read
+    changed = False
+
+    def read_then_change_metadata(file_descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        content = real_read(file_descriptor, size)
+        if content and not changed:
+            metadata = target.stat()
+            os.utime(
+                target,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+            )
+            changed = True
+        return content
+
+    monkeypatch.setattr(task_store.os, "read", read_then_change_metadata)
+
+    with pytest.raises(task_store.TaskFileError, match="changed.*captur"):
+        task_store.capture_task_files(root)
+
+    assert changed is True
+
+
 @pytest.mark.parametrize("root_kind", ["missing", "file", "symlink"])
 def test_capture_task_files_requires_a_real_directory(tmp_path: Path, root_kind: str) -> None:
     from swegen.pipeline.task_store import TaskFileError, capture_task_files
@@ -407,6 +440,20 @@ def test_materialize_task_files_rejects_unsafe_paths(tmp_path: Path, task_file: 
 
     assert not (tmp_path / "out").exists()
     assert not (tmp_path / "escape").exists()
+
+
+def test_materialize_task_files_rejects_nul_path_before_creating_destination(
+    tmp_path: Path,
+) -> None:
+    from swegen.pipeline.task_store import TaskFileError, materialize_task_files
+
+    destination = tmp_path / "out"
+    task_file = make_task_file("unsafe\x00name")
+
+    with pytest.raises(TaskFileError, match="path"):
+        materialize_task_files((task_file,), destination)
+
+    assert not destination.exists()
 
 
 def test_materialize_task_files_rejects_duplicate_paths_before_writing(tmp_path: Path) -> None:
