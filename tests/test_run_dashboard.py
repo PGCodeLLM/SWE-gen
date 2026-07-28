@@ -313,6 +313,55 @@ def test_unprocessed_tombstone_resets_failure_and_beats_older_ledger(
     assert status["recent"][0]["status"] == "unprocessed"
 
 
+def test_recent_success_keeps_postcheck_evidence_alongside_visible_tombstone(
+    tmp_path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_jsonl = tmp_path / "input.jsonl"
+    input_jsonl.write_text("{}\n" * 2)
+    write_jsonl(
+        run_dir / "orchestrator-instance-status.jsonl",
+        [
+            {"instance": "accepted", "status": "success", "timestamp": "2"},
+            {"instance": "retry", "status": "failure", "timestamp": "1"},
+        ],
+    )
+    write_jsonl(
+        run_dir / "orchestrator-instance-status-reset-r9.jsonl",
+        [{"instance": "retry", "status": "unprocessed", "timestamp": "3"}],
+    )
+    worker_dir = run_dir / ".validation-worker"
+    worker_dir.mkdir()
+    write_jsonl(
+        worker_dir / "postcheck-status.jsonl",
+        [
+            {
+                "instance": "accepted",
+                "attempt": 1,
+                "status": "accepted",
+                "timestamp": "4",
+                "nop": {"state": "pass", "reward": 0},
+                "oracle": {"state": "pass", "reward": 1},
+                "reward_hack": {
+                    "state": "pass",
+                    "is_hacking": False,
+                    "reason": "clean",
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr("run_dashboard.active_instances", lambda _run_dir: [])
+
+    status = calculate_status(run_dir, input_jsonl)
+
+    recent = {record["instance"]: record for record in status["recent"]}
+    assert status["recent"][0]["instance"] == "retry"
+    assert recent["retry"]["status"] == "unprocessed"
+    assert recent["accepted"]["validation_outcome"] == "baseline_valid"
+    assert status["postcheck"]["accepted"] == 1
+
+
 def test_calculate_status_merges_journals_and_success_ledger(tmp_path, monkeypatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()

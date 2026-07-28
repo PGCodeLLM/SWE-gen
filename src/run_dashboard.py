@@ -1769,6 +1769,7 @@ def calculate_status(
     reward_backfills = load_latest_reward_backfills(run_dir)
     postchecks = merge_reward_backfill_evidence(postchecks, reward_backfills)
     apply_postcheck_evidence(latest, postchecks)
+    apply_postcheck_evidence(throughput_latest, postchecks)
     postcheck_worker_status = load_postcheck_worker_status(run_dir)
     node_baseline_worker_status = load_node_baseline_worker_status()
     reward_backfill_worker_status = load_reward_backfill_worker_status(run_dir)
