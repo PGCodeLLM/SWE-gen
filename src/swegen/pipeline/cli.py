@@ -136,10 +136,11 @@ def enqueue_pipeline_task(
     """Insert one queued task and its first PGMQ delivery atomically."""
 
     trace_id = uuid_factory()
+    canonical_repo = repo.lower()
     task = PipelineTask(
-        task_id=f"{repo.replace('/', '__')}-{pr}",
+        task_id=f"{canonical_repo.replace('/', '__')}-{pr}",
         task_version=task_version,
-        repo=repo,
+        repo=canonical_repo,
         pr=pr,
         trace_id=trace_id,
     )

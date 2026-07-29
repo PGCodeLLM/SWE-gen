@@ -68,6 +68,23 @@ class RecordingConnection:
             self.events.append("transaction-exit")
 
 
+class EchoingEnqueueConnection(RecordingConnection):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def execute(self, query: str, params: Sequence[object] | None = None) -> FakeCursor:
+        normalized_query = normalize_sql(query)
+        parameters = tuple(params or ())
+        self.calls.append((normalized_query, parameters))
+        if normalized_query.startswith("INSERT INTO pipeline_tasks"):
+            self.events.append("insert-task")
+            return FakeCursor(({"task_id": parameters[0], "task_version": parameters[1]},))
+        if "pgmq.send" in normalized_query:
+            self.events.append("send")
+            return FakeCursor(({"send": 71},))
+        raise AssertionError(f"Unexpected SQL: {normalized_query}")
+
+
 def uuid_factory() -> Iterator[UUID]:
     yield TRACE_ID
     yield EVENT_ID
@@ -146,6 +163,25 @@ def test_enqueue_inserts_task_and_sends_generate_message_in_one_transaction() ->
         "trace_id": str(TRACE_ID),
         "enqueued_at": ENQUEUED_AT.isoformat().replace("+00:00", "Z"),
     }
+
+
+def test_enqueue_canonicalizes_mixed_case_repository_identity() -> None:
+    connection = EchoingEnqueueConnection()
+    generated_uuids = uuid_factory()
+
+    result = enqueue_pipeline_task(
+        connection,
+        repo="TicketMaster/Aurora",
+        pr=13,
+        uuid_factory=lambda: next(generated_uuids),
+        now_factory=lambda: ENQUEUED_AT,
+    )
+
+    assert result.task.repo == "ticketmaster/aurora"
+    assert result.task.task_id == "ticketmaster__aurora-13"
+    assert connection.calls[0][1][2] == "ticketmaster/aurora"
+    payload = json.loads(str(connection.calls[1][1][1]))
+    assert payload["task_id"] == "ticketmaster__aurora-13"
 
 
 def test_enqueue_duplicate_rolls_back_without_sending() -> None:
