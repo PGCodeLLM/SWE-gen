@@ -5,10 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
-import subprocess
-import threading
-import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import isfinite
@@ -28,10 +24,12 @@ from reward_hacking_detector.hacking import (
     build_test_bundle,
     check_instance_with_fallback,
 )
+from swegen.create.claude_code_utils import redact_sensitive_text
 from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
 from swegen.tools.harbor_runner import parse_harbor_outcome, run_harbor_agent
+from swegen.tools.subprocess_utils import run_bounded_command
 
 if TYPE_CHECKING:
     from swegen.pipeline.worker import StageAction
@@ -57,7 +55,6 @@ _PROXY_ENVIRONMENT_NAMES = (
     "no_proxy",
     "NO_PROXY",
 )
-_COMMAND_READ_BYTES = 64 * 1024
 _COMMAND_STOP_GRACE_SECONDS = 10.0
 
 
@@ -66,6 +63,7 @@ class _CommandSummary:
     duration_seconds: float
     log_bytes: int
     output_truncated: bool
+    tail: str
 
 
 def _environment_timeout(name: str, default: float) -> float:
@@ -96,25 +94,23 @@ def _environment_positive_integer(name: str, default: int) -> int:
     return value
 
 
+def _environment_boolean(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name, "").strip().lower()
+    if not raw_value:
+        return default
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _compact_text(value: object, max_chars: int = 1000) -> str:
     return " ".join(str(value).split())[:max_chars]
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=_COMMAND_STOP_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    process.wait()
+def _compact_safe_text(value: object, max_chars: int = 1000) -> str:
+    return _compact_text(redact_sensitive_text(str(value)), max_chars)
 
 
 def _run_logged_command(
@@ -126,67 +122,24 @@ def _run_logged_command(
 ) -> _CommandSummary:
     """Run a command while streaming output into a size-bounded log file."""
 
-    if not command:
-        raise ValueError("command must not be empty")
-    if not isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be a positive finite number")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    started_at = time.monotonic()
-    process = subprocess.Popen(
-        list(command),
+    result = run_bounded_command(
+        command,
         cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+        log_path=log_path,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        redactor=redact_sensitive_text,
+        stop_grace_seconds=_COMMAND_STOP_GRACE_SECONDS,
     )
-    if process.stdout is None:  # pragma: no cover - guaranteed by stdout=PIPE
-        raise RuntimeError("command output pipe was not created")
-
-    output_bytes = 0
-    written_bytes = 0
-    reader_error: OSError | None = None
-
-    with log_path.open("wb") as log_stream:
-
-        def drain_output() -> None:
-            nonlocal output_bytes, written_bytes, reader_error
-            try:
-                while chunk := process.stdout.read(_COMMAND_READ_BYTES):
-                    output_bytes += len(chunk)
-                    remaining = MAX_COMMAND_LOG_BYTES - written_bytes
-                    if remaining > 0:
-                        kept = chunk[:remaining]
-                        log_stream.write(kept)
-                        written_bytes += len(kept)
-            except OSError as error:
-                reader_error = error
-
-        reader = threading.Thread(target=drain_output, name="swegen-command-log", daemon=True)
-        reader.start()
-        try:
-            return_code = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            _terminate_process_group(process)
-            reader.join(timeout=_COMMAND_STOP_GRACE_SECONDS)
-            if reader.is_alive():
-                process.stdout.close()
-                reader.join(timeout=_COMMAND_STOP_GRACE_SECONDS)
-            raise TimeoutError(f"command timed out after {timeout_seconds:g} seconds") from error
-        reader.join(timeout=_COMMAND_STOP_GRACE_SECONDS)
-        if reader.is_alive():
-            process.stdout.close()
-            reader.join(timeout=_COMMAND_STOP_GRACE_SECONDS)
-            output_bytes = max(output_bytes, MAX_COMMAND_LOG_BYTES + 1)
-
-    duration_seconds = round(time.monotonic() - started_at, 3)
-    if reader_error is not None:
-        raise RuntimeError("failed while streaming command output") from reader_error
-    if return_code != 0:
-        raise RuntimeError(f"command exited with status {return_code}")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"command exited with status {result.returncode}; tail: {result.tail or '<empty>'}"
+        )
     return _CommandSummary(
-        duration_seconds=duration_seconds,
-        log_bytes=written_bytes,
-        output_truncated=output_bytes > written_bytes,
+        duration_seconds=result.duration_seconds,
+        log_bytes=result.log_bytes,
+        output_truncated=result.output_truncated,
+        tail=result.tail,
     )
 
 
@@ -264,7 +217,7 @@ def _validation_reward(
         workspace / ".swegen" / "harbor-jobs",
         agent,
         capture_output=False,
-        delete_after=False,
+        delete_after=agent == "oracle",
         wall_timeout_seconds=_environment_timeout(
             "SWEGEN_HARBOR_TIMEOUT_SECONDS",
             DEFAULT_HARBOR_TIMEOUT_SECONDS,
@@ -289,21 +242,32 @@ def _validation_reward(
 def validate_action(task: PipelineTask, workspace: Path) -> StageExecution:
     """Require Harbor's NOP baseline to fail and Oracle solution to pass."""
 
-    nop_reward = _validation_reward(task, workspace, "nop")
-    if nop_reward != 0:
-        return StageExecution.rejected(
-            {"reason": "unexpected_nop_reward", "nop_reward": nop_reward}
-        )
-    oracle_reward = _validation_reward(task, workspace, "oracle")
-    if oracle_reward != 1:
-        return StageExecution.rejected(
-            {
-                "reason": "unexpected_oracle_reward",
-                "nop_reward": nop_reward,
-                "oracle_reward": oracle_reward,
-            }
-        )
-    return StageExecution.succeeded({"nop_reward": nop_reward, "oracle_reward": oracle_reward})
+    local_tag = local_image_tag(task.task_id)
+    try:
+        nop_reward = _validation_reward(task, workspace, "nop")
+        if nop_reward != 0:
+            return StageExecution.rejected(
+                {"reason": "unexpected_nop_reward", "nop_reward": nop_reward}
+            )
+        oracle_reward = _validation_reward(task, workspace, "oracle")
+        if oracle_reward != 1:
+            return StageExecution.rejected(
+                {
+                    "reason": "unexpected_oracle_reward",
+                    "nop_reward": nop_reward,
+                    "oracle_reward": oracle_reward,
+                }
+            )
+        return StageExecution.succeeded({"nop_reward": nop_reward, "oracle_reward": oracle_reward})
+    finally:
+        try:
+            remove_local_image(local_tag)
+        except Exception as error:
+            LOGGER.warning(
+                "failed to remove validation image %s: %s",
+                local_tag,
+                _compact_safe_text(error),
+            )
 
 
 def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
@@ -313,11 +277,17 @@ def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
     test_bundle = build_test_bundle(task_dir)
     if not test_bundle.strip():
         raise RuntimeError("reward test bundle is empty or unreadable")
-    api_key = (
-        os.environ.get("SWEGEN_REWARD_API_KEY", "").strip()
-        or os.environ.get("OPENAI_API_KEY", "").strip()
-        or os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    )
+    api_key = os.environ.get("SWEGEN_REWARD_API_KEY", "").strip()
+    if not api_key and _environment_boolean("SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK"):
+        api_key = (
+            os.environ.get("OPENAI_API_KEY", "").strip()
+            or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        )
+    if not api_key:
+        raise RuntimeError(
+            "SWEGEN_REWARD_API_KEY is required; provider-key fallback requires "
+            "SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK=true"
+        )
     endpoint = _environment_value("SWEGEN_REWARD_ENDPOINT", DEFAULT_REWARD_ENDPOINT)
     primary = LLMConfig(
         name="primary",
@@ -347,7 +317,11 @@ def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
         )
     )
     if verdict.error:
-        raise RuntimeError("reward-hacking checker returned an infrastructure error")
+        raise RuntimeError(
+            "reward-hacking checker infrastructure error "
+            f"(model={_compact_safe_text(selected.model, 200)}): "
+            f"{_compact_safe_text(verdict.error, 500)}"
+        )
     evidence = {
         "selected_model": _compact_text(selected.model, 200),
         "attempted_models": [_compact_text(config.model, 200) for config, _result in attempts],
@@ -371,25 +345,25 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
     registry = _environment_value("SWEGEN_SWR_REGISTRY", DEFAULT_SWR_REGISTRY)
     suffix = _environment_value("SWEGEN_SWR_SUFFIX", DEFAULT_SWR_SUFFIX)
     remote_tag = f"{host}/{repository}:{task.task_id}"
-    if image_exists_in_registry(remote_tag):
-        return StageExecution.succeeded(
-            {
-                "remote_tag": remote_tag,
-                "registry": registry,
-                "suffix": suffix,
-                "skipped": True,
-                "already_present": True,
-            }
-        )
-    task_dir = workspace / "tasks" / task.task_id
-    if not task_dir.is_dir():
-        raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
-    proxy_environment = {
-        name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
-    }
     expected_local_tag = local_image_tag(task.task_id)
-    cleanup_tag = expected_local_tag
+    cleanup_tags = [expected_local_tag, remote_tag]
     try:
+        if image_exists_in_registry(remote_tag):
+            return StageExecution.succeeded(
+                {
+                    "remote_tag": remote_tag,
+                    "registry": registry,
+                    "suffix": suffix,
+                    "skipped": True,
+                    "already_present": True,
+                }
+            )
+        task_dir = workspace / "tasks" / task.task_id
+        if not task_dir.is_dir():
+            raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+        proxy_environment = {
+            name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
+        }
         built_tag = build_image_direct(
             task.task_id,
             task_dir,
@@ -398,7 +372,8 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
         )
         if not isinstance(built_tag, str) or not built_tag.strip():
             raise RuntimeError(f"image build failed for {task.task_id}")
-        cleanup_tag = built_tag
+        if built_tag not in cleanup_tags:
+            cleanup_tags.insert(1, built_tag)
         if not push_to_registry(built_tag, remote_tag, log=LOGGER.info):
             raise RuntimeError(f"image push failed for {task.task_id}")
         return StageExecution.succeeded(
@@ -411,10 +386,15 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
             }
         )
     finally:
-        try:
-            remove_local_image(cleanup_tag)
-        except Exception:
-            LOGGER.warning("failed to remove local image %s", cleanup_tag, exc_info=True)
+        for cleanup_tag in cleanup_tags:
+            try:
+                remove_local_image(cleanup_tag)
+            except Exception as error:
+                LOGGER.warning(
+                    "failed to remove local image alias %s: %s",
+                    cleanup_tag,
+                    _compact_safe_text(error),
+                )
 
 
 def action_for_stage(stage: PipelineStage) -> StageAction:

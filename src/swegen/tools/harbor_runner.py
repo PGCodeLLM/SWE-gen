@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 from harbor.models.environment_type import EnvironmentType
@@ -83,7 +84,7 @@ def _reap_harbor_containers(task_id: str, environment: EnvironmentType | str) ->
                 "ps",
                 "-a",
                 "--format",
-                "{{.ID}} {{.Label \"com.docker.compose.project\"}}",
+                '{{.ID}} {{.Label "com.docker.compose.project"}}',
             ],
             capture_output=True,
             text=True,
@@ -235,8 +236,16 @@ def run_harbor_agent(
 
 @dataclass(frozen=True)
 class HarborOutcome:
-    reward: int | None
+    reward: int | float | None
     error: str | None
+
+
+def _finite_numeric_reward(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not isfinite(float(value)):
+        return None
+    return value
 
 
 def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
@@ -250,7 +259,7 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
 
     Returns:
         HarborOutcome with:
-        - reward: 0 or 1 (or None if unavailable)
+        - reward: exact finite numeric reward (or None if unavailable)
         - error: best-effort exception message (or None)
     """
     if not job_result_path or not job_result_path.exists():
@@ -258,7 +267,7 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
 
     try:
         # Use Harbor's JobResult model for type-safe parsing
-        job_result = JobResult.model_validate_json(job_result_path.read_text())
+        job_result = JobResult.model_validate_json(job_result_path.read_text(), strict=True)
 
         # Prefer structured exception info from typed trial results.
         error: str | None = None
@@ -287,13 +296,20 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
                 # Then check for reward=0 (nop success)
                 if 0 in reward_map or 0.0 in reward_map:
                     return HarborOutcome(reward=0, error=error)
+                for reward_value in reward_map:
+                    reward = _finite_numeric_reward(reward_value)
+                    if reward is not None:
+                        return HarborOutcome(reward=reward, error=error)
 
         # Method 2: Check trial results directly
         for trial_result in job_result.trial_results:
             if trial_result.verifier_result and trial_result.verifier_result.rewards:
                 reward_value = trial_result.verifier_result.rewards.get("reward")
                 if reward_value is not None:
-                    return HarborOutcome(reward=int(float(reward_value)), error=error)
+                    return HarborOutcome(
+                        reward=_finite_numeric_reward(reward_value),
+                        error=error,
+                    )
 
         # Method 3: Fallback - scan trial directories using TrialPaths
         job_root = job_result_path.parent
@@ -302,7 +318,9 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
                 trial_paths = TrialPaths(trial_dir)
                 if not trial_paths.result_path.exists():
                     continue
-                trial_result = TrialResult.model_validate_json(trial_paths.result_path.read_text())
+                trial_result = TrialResult.model_validate_json(
+                    trial_paths.result_path.read_text(), strict=True
+                )
 
                 if error is None and getattr(trial_result, "exception_info", None):
                     exc = trial_result.exception_info
@@ -315,7 +333,10 @@ def parse_harbor_outcome(job_result_path: Path | None) -> HarborOutcome:
                 if trial_result.verifier_result and trial_result.verifier_result.rewards:
                     reward_value = trial_result.verifier_result.rewards.get("reward")
                     if reward_value is not None:
-                        return HarborOutcome(reward=int(float(reward_value)), error=error)
+                        return HarborOutcome(
+                            reward=_finite_numeric_reward(reward_value),
+                            error=error,
+                        )
             except Exception:
                 # Not a valid trial directory, continue searching
                 continue

@@ -48,9 +48,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from swegen.create.claude_code_utils import redact_sensitive_text
 from swegen.ledger_repo import LedgerRepo
+from swegen.tools.subprocess_utils import BoundedCommandResult, run_bounded_command
 
 SWEGEN_IMAGE_SUFFIX = "-swegenimage"
+MAX_DOCKER_OUTPUT_BYTES = 64 * 1024
+REQUIRED_NO_PROXY_ENTRIES = (
+    ".myhuaweicloud.com",
+    ".huaweicloud.com",
+    ".huawei.com",
+    "127.0.0.1",
+    "localhost",
+    "100.*",
+    "10.*",
+)
 
 # ── Registry definitions ────────────────────────────────────────────
 
@@ -59,10 +71,10 @@ SWEGEN_IMAGE_SUFFIX = "-swegenimage"
 class Registry:
     """A target SWR registry with its own JSONL bookkeeping."""
 
-    name: str            # short label, e.g. "trajectory"
-    registry: str        # host, e.g. swr-...myhuaweicloud.com
-    repository: str      # repo path, e.g. aifm.coder.exp/swegen/generated
-    file_suffix: str     # suffix for all_images<suffix>.jsonl (e.g. "" or "_platform")
+    name: str  # short label, e.g. "trajectory"
+    registry: str  # host, e.g. swr-...myhuaweicloud.com
+    repository: str  # repo path, e.g. aifm.coder.exp/swegen/generated
+    file_suffix: str  # suffix for all_images<suffix>.jsonl (e.g. "" or "_platform")
 
     # populated at runtime
     all_images_path: Path = field(default=None, init=False)
@@ -114,8 +126,8 @@ def _docker_image_name(name: str) -> str:
     # delimiter, but rejects a ``-`` adjacent to another separator (e.g.
     # ``amol-__dukpy`` -> ``-__``).  Fix only those illegal adjacencies without
     # disturbing the standard ``hb__<org>__<repo>`` shape.
-    name = re.sub(r"-+_", "_", name)   # "-_" / "--_" -> "_"
-    name = re.sub(r"_-+", "_", name)   # "_-" / "_--" -> "_"
+    name = re.sub(r"-+_", "_", name)  # "-_" / "--_" -> "_"
+    name = re.sub(r"_-+", "_", name)  # "_-" / "_--" -> "_"
     name = re.sub(r"-{2,}", "-", name)  # collapse runs of dashes
     name = re.sub(r"\.{2,}", ".", name)  # collapse runs of dots
     name = name.strip("._-") or "0"
@@ -156,10 +168,7 @@ def load_accepted_instances(ledger_path: Path) -> list[str]:
             ts = rec.get("timestamp", "")
             if inst not in latest or ts >= latest[inst].get("timestamp", ""):
                 latest[inst] = rec
-    return sorted(
-        inst for inst, rec in latest.items()
-        if rec.get("status") == "accepted"
-    )
+    return sorted(inst for inst, rec in latest.items() if rec.get("status") == "accepted")
 
 
 # ── JSONL helpers (thread-safe) ─────────────────────────────────────
@@ -178,7 +187,7 @@ def load_jsonl_set(path: Path, key: str = "instance_id") -> set[str]:
         stem = path.stem  # e.g. "all_images_platform" or "pushed_images"
         only_pushed = stem.startswith("pushed_images")
         prefix = "pushed_images" if only_pushed else "all_images"
-        suffix = stem[len(prefix):]  # e.g. "_platform" or ""
+        suffix = stem[len(prefix) :]  # e.g. "_platform" or ""
         sql = "SELECT DISTINCT instance FROM pushed_images WHERE suffix = %s"
         params: tuple = (suffix,)
         if only_pushed:
@@ -213,7 +222,7 @@ def append_jsonl(path: Path, record: dict) -> None:
             f.flush()
 
 
-def _append_image_record(repo: LedgerRepo, record: dict, *, reg: "Registry", pushed: bool) -> None:
+def _append_image_record(repo: LedgerRepo, record: dict, *, reg: Registry, pushed: bool) -> None:
     """Append an image ledger record via the repo, stamping the indexed
     columns (instance/registry/suffix/pushed) used for set-membership reads.
     The full record (with instance_id, swr_url, timestamps) is kept in payload."""
@@ -297,6 +306,27 @@ def find_task_dir(instance: str, search_dirs: list[Path]) -> Path | None:
     return fallback
 
 
+def _merged_no_proxy(proxy_env: dict[str, str]) -> str:
+    entries: list[str] = []
+    seen: set[str] = set()
+    for raw_value in (proxy_env.get("no_proxy", ""), proxy_env.get("NO_PROXY", "")):
+        for entry in raw_value.split(","):
+            normalized = entry.strip()
+            if normalized and normalized not in seen:
+                entries.append(normalized)
+                seen.add(normalized)
+    for entry in REQUIRED_NO_PROXY_ENTRIES:
+        if entry not in seen:
+            entries.append(entry)
+            seen.add(entry)
+    return ",".join(entries)
+
+
+def _command_failure_tail(result: BoundedCommandResult) -> str:
+    suffix = " (truncated)" if result.output_truncated else ""
+    return f"{result.tail or '<empty>'}{suffix}"
+
+
 def build_image_direct(
     instance: str,
     task_dir: Path,
@@ -321,22 +351,28 @@ def build_image_direct(
             value = proxy_env.get(key)
             if value:
                 cmd += ["--build-arg", f"{key}={value}"]
-        no_proxy = ".myhuaweicloud.com,.huaweicloud.com,100.*,10.*,.huawei.com,127.0.0.1"
+        no_proxy = _merged_no_proxy(proxy_env)
         cmd += [
-            "--build-arg", f"no_proxy={no_proxy}",
-            "--build-arg", f"NO_PROXY={no_proxy}",
+            "--build-arg",
+            f"no_proxy={no_proxy}",
+            "--build-arg",
+            f"NO_PROXY={no_proxy}",
         ]
 
     cmd += ["-t", local_tag, str(env_dir)]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    except subprocess.TimeoutExpired:
-        log(f"  [BUILD] docker build timed out for {instance}")
+        proc = run_bounded_command(
+            cmd,
+            timeout_seconds=3600,
+            max_output_bytes=MAX_DOCKER_OUTPUT_BYTES,
+            redactor=redact_sensitive_text,
+        )
+    except (OSError, RuntimeError, TimeoutError) as error:
+        log(f"  [BUILD] docker build failed for {instance}: {error}")
         return None
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()[-500:]
-        log(f"  [BUILD] docker build failed for {instance}: {stderr}")
+        log(f"  [BUILD] docker build failed for {instance}: {_command_failure_tail(proc)}")
         return None
 
     if not image_exists_locally(local_tag):
@@ -356,33 +392,39 @@ def _safe_rmi(tag: str, force: bool = True, timeout: int = 120) -> None:
 
 def push_to_registry(local_tag: str, remote_tag: str, log=print) -> bool:
     """Tag ``local_tag`` as ``remote_tag`` and push it.  Removes remote tag after."""
-    tag_proc = subprocess.run(
-        ["docker", "tag", local_tag, remote_tag],
-        capture_output=True, text=True, timeout=60,
-    )
-    if tag_proc.returncode != 0:
-        log(f"  [TAG] Failed: {tag_proc.stderr.strip()[-200:]}")
-        return False
-
-    log(f"  [PUSH] Pushing {remote_tag} ...")
+    pushed = False
     try:
-        push_proc = subprocess.run(
-            ["docker", "push", remote_tag],
-            capture_output=True, text=True, timeout=1800,
+        tag_proc = run_bounded_command(
+            ["docker", "tag", local_tag, remote_tag],
+            timeout_seconds=60,
+            max_output_bytes=MAX_DOCKER_OUTPUT_BYTES,
+            redactor=redact_sensitive_text,
         )
-    except subprocess.TimeoutExpired:
-        log(f"  [PUSH] Timed out: {remote_tag}")
-        _safe_rmi(remote_tag)
-        return False
-    if push_proc.returncode != 0:
-        log(f"  [PUSH] Failed: {push_proc.stderr.strip()[-200:]}")
-        _safe_rmi(remote_tag)
-        return False
+        if tag_proc.returncode != 0:
+            log(f"  [TAG] Failed: {_command_failure_tail(tag_proc)}")
+            return False
 
-    log(f"  [PUSH] Success: {remote_tag}")
-    # Remove the remote tag locally (layers stay via the source tag until we drop it).
-    _safe_rmi(remote_tag, force=False)
-    return True
+        log(f"  [PUSH] Pushing {remote_tag} ...")
+        push_proc = run_bounded_command(
+            ["docker", "push", remote_tag],
+            timeout_seconds=1800,
+            max_output_bytes=MAX_DOCKER_OUTPUT_BYTES,
+            redactor=redact_sensitive_text,
+        )
+        if push_proc.returncode != 0:
+            log(f"  [PUSH] Failed: {_command_failure_tail(push_proc)}")
+            return False
+
+        pushed = True
+        log(f"  [PUSH] Success: {remote_tag}")
+        return True
+    except (OSError, RuntimeError, TimeoutError) as error:
+        log(f"  [PUSH] Failed: {error}")
+        return False
+    finally:
+        # Remove the remote alias locally on every exit. Layers remain through
+        # the source tag until the caller performs its source-image cleanup.
+        _safe_rmi(remote_tag, force=not pushed)
 
 
 def remove_local_image(local_tag: str) -> None:
@@ -401,9 +443,9 @@ def remove_local_image(local_tag: str) -> None:
 @dataclass
 class InstanceResult:
     instance: str
-    pushed: list[str] = field(default_factory=list)   # registry names newly pushed
+    pushed: list[str] = field(default_factory=list)  # registry names newly pushed
     skipped: list[str] = field(default_factory=list)  # registry names already present
-    failed: list[str] = field(default_factory=list)   # registry names that failed
+    failed: list[str] = field(default_factory=list)  # registry names that failed
     build_failed: bool = False
     no_task_dir: bool = False
 
@@ -477,21 +519,23 @@ def process_instance(
     if not have_local:
         task_dir = find_task_dir(instance, search_dirs)
         if task_dir is None:
-            log(f"  [SKIP] Task directory not found")
+            log("  [SKIP] Task directory not found")
             result.no_task_dir = True
             for reg in pending:
                 result.failed.append(reg.name)
             _flush(lines)
             return result
         if args.dry_run:
-            log(f"  [DRY-RUN] Would build from {task_dir} and push to: "
-                f"{', '.join(r.name for r in pending)}")
+            log(
+                f"  [DRY-RUN] Would build from {task_dir} and push to: "
+                f"{', '.join(r.name for r in pending)}"
+            )
             _flush(lines)
             return result
         log(f"  [BUILD] Rebuilding from {task_dir} ...")
         local_tag = build_image_direct(instance, task_dir, proxy_env=proxy_env, log=log)
         if local_tag is None:
-            log(f"  [FAIL] Could not build image")
+            log("  [FAIL] Could not build image")
             result.build_failed = True
             for reg in pending:
                 result.failed.append(reg.name)
@@ -499,7 +543,7 @@ def process_instance(
             return result
         built_here = True
     else:
-        log(f"  [CACHE] Local image exists")
+        log("  [CACHE] Local image exists")
 
     if args.dry_run:
         log(f"  [DRY-RUN] Would push to: {', '.join(r.name for r in pending)}")
@@ -552,28 +596,54 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--instance", help="Restrict to one specific instance ID.")
-    parser.add_argument("--instance-list", type=Path, default=None,
-                        help="File with one instance ID per line. When given, this "
-                             "is the authoritative target set (the local postcheck "
-                             "ledger is NOT consulted for the accepted list).")
-    parser.add_argument("--extra-task-dir", type=Path, action="append", default=[],
-                        help="Additional root dir to search for <instance>/environment/"
-                             "Dockerfile (repeatable). Searched after the default roots.")
-    parser.add_argument("--max-instances", type=int, default=0,
-                        help="Max instances to process (0 = all).")
-    parser.add_argument("--workers", type=int, default=32,
-                        help="Number of concurrent build+push workers (default: 32).")
+    parser.add_argument(
+        "--instance-list",
+        type=Path,
+        default=None,
+        help="File with one instance ID per line. When given, this "
+        "is the authoritative target set (the local postcheck "
+        "ledger is NOT consulted for the accepted list).",
+    )
+    parser.add_argument(
+        "--extra-task-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional root dir to search for <instance>/environment/"
+        "Dockerfile (repeatable). Searched after the default roots.",
+    )
+    parser.add_argument(
+        "--max-instances", type=int, default=0, help="Max instances to process (0 = all)."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=32,
+        help="Number of concurrent build+push workers (default: 32).",
+    )
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--proxy-env", type=Path, default=Path(".env"),
-                        help="Proxy environment file for docker build args (default: .env).")
-    parser.add_argument("--skip-registry-check", action="store_true",
-                        help="Skip 'docker manifest inspect' existence check (faster).")
-    parser.add_argument("--registries", default="trajectory,platform",
-                        help="Comma-separated registry names to push to "
-                             "(subset of: trajectory, platform).")
-    parser.add_argument("--output-dir", type=Path, default=None,
-                        help="Directory for the JSONL files "
-                             "(default: <run-dir>/.validation-worker)")
+    parser.add_argument(
+        "--proxy-env",
+        type=Path,
+        default=Path(".env"),
+        help="Proxy environment file for docker build args (default: .env).",
+    )
+    parser.add_argument(
+        "--skip-registry-check",
+        action="store_true",
+        help="Skip 'docker manifest inspect' existence check (faster).",
+    )
+    parser.add_argument(
+        "--registries",
+        default="trajectory,platform",
+        help="Comma-separated registry names to push to (subset of: trajectory, platform).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for the JSONL files (default: <run-dir>/.validation-worker)",
+    )
     args = parser.parse_args(argv)
 
     run_dir = args.run_dir.resolve()
@@ -608,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     proxy_env_path = args.proxy_env.resolve()
     if proxy_env_path.is_file():
         from dotenv import dotenv_values
+
         proxy_env = {k: v for k, v in dotenv_values(proxy_env_path).items() if v}
         print(f"Loaded proxy env from {proxy_env_path}", flush=True)
 
@@ -615,11 +686,9 @@ def main(argv: list[str] | None = None) -> int:
         if not args.instance_list.is_file():
             print(f"Instance list not found: {args.instance_list}", file=sys.stderr)
             return 1
-        accepted = sorted({
-            line.strip()
-            for line in args.instance_list.read_text().splitlines()
-            if line.strip()
-        })
+        accepted = sorted(
+            {line.strip() for line in args.instance_list.read_text().splitlines() if line.strip()}
+        )
         print(f"Loaded {len(accepted)} instances from {args.instance_list}", flush=True)
     else:
         if not ledger_path.is_file():
@@ -639,9 +708,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Registries: {', '.join(r.name for r in registries)}", flush=True)
     for reg in registries:
-        print(f"  [{reg.name}] recorded={len(reg.already_recorded)} "
-              f"pushed={len(reg.already_pushed)} -> {reg.registry}/{reg.repository}",
-              flush=True)
+        print(
+            f"  [{reg.name}] recorded={len(reg.already_recorded)} "
+            f"pushed={len(reg.already_pushed)} -> {reg.registry}/{reg.repository}",
+            flush=True,
+        )
     print(f"Processing {len(accepted)} instance(s) with {args.workers} workers", flush=True)
 
     total = len(accepted)
@@ -650,8 +721,14 @@ def main(argv: list[str] | None = None) -> int:
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(
-                process_instance, i + 1, total, inst, registries,
-                search_dirs, proxy_env, args,
+                process_instance,
+                i + 1,
+                total,
+                inst,
+                registries,
+                search_dirs,
+                proxy_env,
+                args,
             ): inst
             for i, inst in enumerate(accepted)
         }
@@ -683,11 +760,13 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n=== Done ===", flush=True)
     for reg in registries:
-        print(f"  [{reg.name}] pushed={per_reg_pushed[reg.name]} "
-              f"skipped={per_reg_skipped[reg.name]} failed={per_reg_failed[reg.name]}  "
-              f"({reg.pushed_images_path})", flush=True)
-    print(f"  build failures: {build_failures}  (missing task dir: {missing_task})",
-          flush=True)
+        print(
+            f"  [{reg.name}] pushed={per_reg_pushed[reg.name]} "
+            f"skipped={per_reg_skipped[reg.name]} failed={per_reg_failed[reg.name]}  "
+            f"({reg.pushed_images_path})",
+            flush=True,
+        )
+    print(f"  build failures: {build_failures}  (missing task dir: {missing_task})", flush=True)
 
     total_failed = sum(per_reg_failed.values())
     return 0 if total_failed == 0 else 1

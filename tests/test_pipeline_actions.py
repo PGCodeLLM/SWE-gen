@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import signal
 import sys
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -20,6 +23,7 @@ _ACTION_ENVIRONMENT_NAMES = (
     "SWEGEN_REWARD_PRIMARY_MODEL",
     "SWEGEN_REWARD_FALLBACK_MODEL",
     "SWEGEN_REWARD_API_KEY",
+    "SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK",
     "SWEGEN_SWR_HOST",
     "SWEGEN_SWR_REPOSITORY",
     "SWEGEN_SWR_REGISTRY",
@@ -43,6 +47,14 @@ def make_task() -> PipelineTask:
         pr=42,
         trace_id=UUID("12345678-1234-5678-1234-567812345678"),
     )
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        stat_fields = Path(f"/proc/{pid}/stat").read_text().split()
+    except FileNotFoundError:
+        return False
+    return len(stat_fields) > 2 and stat_fields[2] != "Z"
 
 
 def test_build_generate_command_uses_relay_flags_and_workspace_paths(
@@ -155,9 +167,14 @@ def test_generate_action_captures_generated_task_files(
     assert result["duration_seconds"] >= 0
     assert result["file_count"] == 1
     assert result["total_bytes"] == 5
-    assert result["log_bytes"] == 16
+    log_path = tmp_path / ".swegen" / "logs" / "generate.log"
+    log_text = log_path.read_text()
+    assert 0 < result["log_bytes"] <= 16
+    assert result["log_bytes"] == log_path.stat().st_size
+    assert log_text
+    assert set(log_text) == {"x"}
+    assert log_text == log_text.strip()
     assert result["output_truncated"] is True
-    assert (tmp_path / ".swegen" / "logs" / "generate.log").stat().st_size == 16
 
 
 def test_generate_action_raises_when_create_command_fails(
@@ -192,6 +209,151 @@ def test_generate_action_raises_when_expected_task_directory_is_missing(
         actions.generate_action(make_task(), tmp_path)
 
 
+def test_logged_command_timeout_includes_redacted_tail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setattr(actions, "_COMMAND_STOP_GRACE_SECONDS", 0.2)
+
+    with pytest.raises(TimeoutError) as raised:
+        actions._run_logged_command(
+            [
+                sys.executable,
+                "-c",
+                (f"import time; print('OPENAI_API_KEY={secret}', flush=True); time.sleep(60)"),
+            ],
+            cwd=tmp_path,
+            log_path=tmp_path / "timeout.log",
+            timeout_seconds=0.1,
+        )
+
+    message = str(raised.value)
+    assert "<REDACTED>" in message
+    assert secret not in message
+
+
+def test_logged_command_terminates_background_descendant_after_parent_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    monkeypatch.setattr(actions, "_COMMAND_STOP_GRACE_SECONDS", 0.2)
+    log_path = tmp_path / "background.log"
+    child_pid = 0
+    try:
+        actions._run_logged_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys; "
+                    "child=subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(60)']); "
+                    "print(child.pid, flush=True)"
+                ),
+            ],
+            cwd=tmp_path,
+            log_path=log_path,
+            timeout_seconds=2,
+        )
+        child_pid = int(log_path.read_text().strip())
+        deadline = time.monotonic() + 2
+        while process_is_running(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not process_is_running(child_pid)
+    finally:
+        if child_pid and process_is_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+def test_logged_command_keeps_bounded_redacted_tail_on_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    log_path = tmp_path / "failure.log"
+    monkeypatch.setattr(actions, "MAX_COMMAND_LOG_BYTES", 128)
+
+    with pytest.raises(RuntimeError) as raised:
+        actions._run_logged_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "print('A' * 4096); "
+                    f"print('OPENAI_API_KEY={secret}'); "
+                    "print('TAIL-END'); raise SystemExit(7)"
+                ),
+            ],
+            cwd=tmp_path,
+            log_path=log_path,
+            timeout_seconds=2,
+        )
+
+    message = str(raised.value)
+    logged = log_path.read_text()
+    assert "TAIL-END" in message
+    assert "<REDACTED>" in message
+    assert secret not in message
+    assert logged.rstrip().endswith("TAIL-END")
+    assert secret not in logged
+    assert log_path.stat().st_size <= 128
+
+
+def test_logged_command_opens_log_before_spawning(tmp_path: Path) -> None:
+    from swegen.pipeline import actions
+
+    marker = tmp_path / "spawned"
+    log_path = tmp_path / "log-directory"
+    log_path.mkdir()
+
+    with pytest.raises(RuntimeError, match="open command log"):
+        actions._run_logged_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib, time; "
+                    f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid())); "
+                    "time.sleep(60)"
+                ),
+            ],
+            cwd=tmp_path,
+            log_path=log_path,
+            timeout_seconds=2,
+        )
+
+    time.sleep(0.2)
+    try:
+        assert not marker.exists()
+    finally:
+        if marker.exists():
+            os.killpg(int(marker.read_text()), signal.SIGKILL)
+
+
+def test_logged_command_spawn_failure_leaves_closed_log(tmp_path: Path) -> None:
+    from swegen.pipeline import actions
+
+    log_path = tmp_path / "spawn.log"
+
+    with pytest.raises(RuntimeError, match="start command"):
+        actions._run_logged_command(
+            [str(tmp_path / "missing-executable")],
+            cwd=tmp_path,
+            log_path=log_path,
+            timeout_seconds=2,
+        )
+
+    assert log_path.is_file()
+    log_path.write_text("closed")
+
+
 def test_validate_action_accepts_exact_nop_zero_and_oracle_one(
     tmp_path: Path,
     monkeypatch,
@@ -200,7 +362,8 @@ def test_validate_action_accepts_exact_nop_zero_and_oracle_one(
 
     task = make_task()
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
-    calls: list[str] = []
+    calls: list[tuple[str, bool]] = []
+    removed: list[str] = []
 
     def fake_run_harbor_agent(
         task_id,
@@ -213,9 +376,9 @@ def test_validate_action_accepts_exact_nop_zero_and_oracle_one(
         assert dataset_path == tmp_path / "tasks"
         assert jobs_dir == tmp_path / ".swegen" / "harbor-jobs"
         assert kwargs["capture_output"] is False
-        assert kwargs["delete_after"] is False
+        assert kwargs["delete_after"] is (agent == "oracle")
         assert kwargs["wall_timeout_seconds"] > 0
-        calls.append(agent)
+        calls.append((agent, kwargs["delete_after"]))
         result_path = tmp_path / f"{agent}.json"
         result_path.write_text("{}")
         return 0, result_path
@@ -232,10 +395,12 @@ def test_validate_action_accepts_exact_nop_zero_and_oracle_one(
         lambda path: HarborOutcome(reward=0 if path.name == "nop.json" else 1, error=None),
         raising=False,
     )
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
     execution = actions.validate_action(task, tmp_path)
 
-    assert calls == ["nop", "oracle"]
+    assert calls == [("nop", False), ("oracle", True)]
+    assert removed == [actions.local_image_tag(task.task_id)]
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json() == {"nop_reward": 0, "oracle_reward": 1}
 
@@ -248,10 +413,11 @@ def test_validate_action_rejects_unexpected_nop_reward_without_oracle(
 
     task = make_task()
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
-    calls: list[str] = []
+    calls: list[tuple[str, bool]] = []
+    removed: list[str] = []
 
     def fake_run_harbor_agent(task_id, dataset_path, jobs_dir, agent, **kwargs):
-        calls.append(agent)
+        calls.append((agent, kwargs["delete_after"]))
         return 0, tmp_path / f"{agent}.json"
 
     monkeypatch.setattr(actions, "run_harbor_agent", fake_run_harbor_agent)
@@ -260,10 +426,12 @@ def test_validate_action_rejects_unexpected_nop_reward_without_oracle(
         "parse_harbor_outcome",
         lambda path: HarborOutcome(reward=1, error=None),
     )
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
     execution = actions.validate_action(task, tmp_path)
 
-    assert calls == ["nop"]
+    assert calls == [("nop", False)]
+    assert removed == [actions.local_image_tag(task.task_id)]
     assert execution.status is StageResultStatus.REJECTED
     assert execution.result_json() == {
         "reason": "unexpected_nop_reward",
@@ -289,6 +457,8 @@ def test_validate_action_rejects_unexpected_oracle_reward(
         "parse_harbor_outcome",
         lambda path: HarborOutcome(reward=0, error=None),
     )
+    removed: list[str] = []
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
     execution = actions.validate_action(task, tmp_path)
 
@@ -298,6 +468,7 @@ def test_validate_action_rejects_unexpected_oracle_reward(
         "nop_reward": 0,
         "oracle_reward": 0,
     }
+    assert removed == [actions.local_image_tag(task.task_id)]
 
 
 @pytest.mark.parametrize(
@@ -319,6 +490,7 @@ def test_validate_action_raises_for_harbor_infrastructure_failures(
     task = make_task()
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
     calls: list[str] = []
+    removed: list[str] = []
 
     def fake_run_harbor_agent(task_id, dataset_path, jobs_dir, agent, **kwargs):
         calls.append(agent)
@@ -326,11 +498,13 @@ def test_validate_action_raises_for_harbor_infrastructure_failures(
 
     monkeypatch.setattr(actions, "run_harbor_agent", fake_run_harbor_agent)
     monkeypatch.setattr(actions, "parse_harbor_outcome", lambda path: outcome)
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
     with pytest.raises(RuntimeError, match="Harbor nop"):
         actions.validate_action(task, tmp_path)
 
     assert calls == ["nop"]
+    assert removed == [actions.local_image_tag(task.task_id)]
 
 
 def test_reward_action_raises_when_test_bundle_is_empty(
@@ -384,8 +558,52 @@ def test_reward_action_raises_when_detector_returns_infrastructure_error(
         raising=False,
     )
 
-    with pytest.raises(RuntimeError, match="reward-hacking checker"):
+    with pytest.raises(RuntimeError, match="network unavailable") as raised:
         actions.reward_action(task, tmp_path)
+
+    assert "dedicated-secret" not in str(raised.value)
+
+
+def test_reward_action_requires_dedicated_key_by_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
+    monkeypatch.setattr(
+        actions,
+        "check_instance_with_fallback",
+        lambda *args, **kwargs: pytest.fail("checker must not run without an approved key"),
+    )
+
+    with pytest.raises(RuntimeError, match="SWEGEN_REWARD_API_KEY"):
+        actions.reward_action(task, tmp_path)
+
+
+def test_reward_action_allows_provider_key_only_with_explicit_opt_in(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK", "true")
+    monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
+
+    async def fake_check(test_bundle, primary, fallback, **kwargs):
+        assert primary.api_key == fallback.api_key == "provider-secret"
+        verdict = HackCheckResult(is_hacking=False, reason="clean")
+        return primary, verdict, [(primary, verdict)]
+
+    monkeypatch.setattr(actions, "check_instance_with_fallback", fake_check)
+
+    assert actions.reward_action(task, tmp_path).status is StageResultStatus.SUCCEEDED
 
 
 def test_reward_action_rejects_hacking_with_compact_evidence(
@@ -438,6 +656,7 @@ def test_reward_action_succeeds_with_clean_fallback_verdict(
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
     monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
     monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
+    monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")
     monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
 
     async def fake_check(test_bundle, primary, fallback, **kwargs):
@@ -498,12 +717,8 @@ def test_push_action_skips_build_when_remote_manifest_exists(
         lambda *args, **kwargs: pytest.fail("build must be skipped"),
         raising=False,
     )
-    monkeypatch.setattr(
-        actions,
-        "remove_local_image",
-        lambda tag: pytest.fail("no local image should be removed"),
-        raising=False,
-    )
+    removed: list[str] = []
+    monkeypatch.setattr(actions, "remove_local_image", removed.append, raising=False)
 
     execution = actions.push_action(task, tmp_path)
 
@@ -520,6 +735,7 @@ def test_push_action_skips_build_when_remote_manifest_exists(
         "skipped": True,
         "already_present": True,
     }
+    assert removed == [actions.local_image_tag(task.task_id), remote_tag]
 
 
 def test_push_action_builds_pushes_and_removes_local_image(
@@ -573,7 +789,7 @@ def test_push_action_builds_pushes_and_removes_local_image(
 
     remote_tag = "registry.example/team/generated:owner__repo-42"
     assert pushed == [("local-source:latest", remote_tag)]
-    assert removed == ["local-source:latest"]
+    assert removed == ["local-source:latest", remote_tag]
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json() == {
         "remote_tag": remote_tag,
@@ -606,7 +822,39 @@ def test_push_action_removes_local_image_when_push_fails(
     with pytest.raises(RuntimeError, match="image push failed"):
         actions.push_action(task, tmp_path)
 
-    assert removed == ["local-source:latest"]
+    remote_tag = (
+        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
+        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
+    )
+    assert removed == ["local-source:latest", remote_tag]
+
+
+def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
+    removed: list[str] = []
+    monkeypatch.setattr(actions, "image_exists_in_registry", lambda remote_tag: False)
+    monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+    monkeypatch.setattr(
+        actions,
+        "build_image_direct",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("build crashed")),
+    )
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
+
+    with pytest.raises(RuntimeError, match="build crashed"):
+        actions.push_action(task, tmp_path)
+
+    remote_tag = (
+        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
+        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
+    )
+    assert removed == ["local-source:latest", remote_tag]
 
 
 def test_action_for_stage_maps_all_pipeline_stages_and_rejects_unknown() -> None:
