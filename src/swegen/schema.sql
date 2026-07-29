@@ -286,3 +286,33 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_results (
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_stage_results_status
     ON pipeline_stage_results (status, finished_at DESC);
+
+CREATE TABLE IF NOT EXISTS pipeline_stage_activity (
+    task_id          TEXT        NOT NULL,
+    task_version     INTEGER     NOT NULL,
+    stage            TEXT        NOT NULL,
+    attempt          INTEGER     NOT NULL,
+    pgmq_msg_id      BIGINT      NOT NULL,
+    pgmq_read_count  INTEGER     NOT NULL,
+    worker_id        TEXT        NOT NULL,
+    node_name        TEXT        NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL,
+    heartbeat_at     TIMESTAMPTZ NOT NULL,
+    CONSTRAINT pk_pipeline_stage_activity
+        PRIMARY KEY (task_id, task_version, stage),
+    CONSTRAINT fk_pipeline_stage_activity_task FOREIGN KEY (task_id, task_version)
+        REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
+    CONSTRAINT ck_pipeline_stage_activity_stage CHECK (
+        stage IN ('generate', 'validate', 'reward', 'push')
+    ),
+    CONSTRAINT ck_pipeline_stage_activity_attempt_positive CHECK (attempt > 0),
+    CONSTRAINT ck_pipeline_stage_activity_pgmq_msg_id_positive CHECK (pgmq_msg_id > 0),
+    CONSTRAINT ck_pipeline_stage_activity_pgmq_read_count_positive CHECK (
+        pgmq_read_count > 0
+    ),
+    CONSTRAINT ck_pipeline_stage_activity_worker_nonblank CHECK (btrim(worker_id) <> ''),
+    CONSTRAINT ck_pipeline_stage_activity_node_nonblank CHECK (btrim(node_name) <> ''),
+    CONSTRAINT ck_pipeline_stage_activity_timestamps CHECK (heartbeat_at >= started_at)
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_stage_activity_heartbeat
+    ON pipeline_stage_activity (heartbeat_at DESC);

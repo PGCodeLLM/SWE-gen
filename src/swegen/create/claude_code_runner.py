@@ -609,12 +609,52 @@ and both Harbor validations have actually finished.
 - `{task_dir}/tests/test.sh` - Remove TODOs and all example templates, keep only test-specific comments
 """
 
+CC_GENERATE_ONLY_PROMPT = """
+## Your Task: Complete This Harbor Task Skeleton
+
+Analyze the repository and finish the generated task files, but defer all Docker
+builds and Harbor validation to the downstream validation stage.
+
+**Repository**: {repo} (cloned at `{repo_path}`)
+**PR**: #{pr_number}
+**Task Directory**: `{task_dir}`
+
+{dockerfile_hint_section}
+
+Complete these files:
+- `{task_dir}/environment/Dockerfile`
+- `{task_dir}/tests/test.sh`
+
+The extracted PR tests are:
+{test_files_list}
+
+Requirements:
+1. Inspect the repository's package metadata, version files, CI configuration,
+   and the extracted tests to determine the runtime, dependencies, build steps,
+   and exact test command.
+2. Keep the Ubuntu 24.04 base image and the deterministic clone, checkout,
+   bug.patch, and fix.patch handling already present in the skeleton.
+3. Make `test.sh` run only the extracted PR tests, not the entire test suite.
+4. Remove every TODO and irrelevant template/example comment from both files.
+5. Do not run Harbor, Docker, NOP, or Oracle. Those checks belong to the next
+   pipeline stage. Stop once both task files are complete and saved.
+
+Work synchronously in this session. Do not delegate to Task/subagents or launch
+background agents.
+"""
+
 CC_CONTINUATION_PROMPT = """
 Continue the same task now. The prior turn ended before both Harbor validations
 passed. Do not provide a progress-only response, delegate to subagents, or stop
 while work is still in progress. Inspect the current files and Harbor job state,
 finish the Dockerfile and test runner, run NOP and Oracle, iterate as needed, and
 end only after NOP has reward 0 and Oracle has reward 1 with no template TODOs.
+"""
+
+CC_GENERATE_ONLY_CONTINUATION_PROMPT = """
+Continue completing the Dockerfile and test.sh. Do not run Harbor or Docker;
+remove the remaining TODO/template content and stop only after both files are
+complete and saved for the downstream validation stage.
 """
 
 MAX_INCOMPLETE_CONTINUATIONS = 3
@@ -635,6 +675,7 @@ def run_claude_code_session(
     head_sha: str | None = None,
     environment: str = "docker",
     jobs_dir: Path | None = None,
+    validate: bool = True,
 ) -> ClaudeCodeResult:
     """
     Run Claude Code session to complete skeleton and make harbor pass.
@@ -655,6 +696,8 @@ def run_claude_code_session(
         environment: Environment type for Harbor runs (docker, daytona, etc.)
         jobs_dir: Directory for Harbor job output. Defaults to
             dataset_path.parent/.swegen/harbor-jobs.
+        validate: Run Harbor NOP/Oracle inside the Claude session. When false,
+            stop after the Dockerfile and test.sh are complete.
 
     Returns:
         MakeItWorkResult with success status
@@ -687,6 +730,7 @@ def run_claude_code_session(
                 head_sha=head_sha,
                 environment=environment,
                 jobs_dir=jobs_dir,
+                validate=validate,
             )
         )
     finally:
@@ -716,6 +760,7 @@ async def _run_claude_code_session_async(
     head_sha: str | None = None,
     environment: str = "docker",
     jobs_dir: Path | None = None,
+    validate: bool = True,
 ) -> ClaudeCodeResult:
     """Async implementation of Claude Code session."""
     logger = logging.getLogger("swegen")
@@ -733,9 +778,11 @@ async def _run_claude_code_session_async(
         jobs_dir = Path(jobs_dir)
     jobs_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir = jobs_dir.resolve()
-    validation_baseline = _snapshot_job_results(jobs_dir, task_id)
+    validation_baseline = _snapshot_job_results(jobs_dir, task_id) if validate else None
 
-    harbor_config_args = " ".join(suffixed_docker_config_args(jobs_dir, environment))
+    harbor_config_args = (
+        " ".join(suffixed_docker_config_args(jobs_dir, environment)) if validate else ""
+    )
 
     # Format test files list
     if test_files:
@@ -749,7 +796,8 @@ async def _run_claude_code_session_async(
         dataset_path=dataset_path,
         logger=logger,
     )
-    prompt_text = CC_PROMPT.format(
+    prompt_template = CC_PROMPT if validate else CC_GENERATE_ONLY_PROMPT
+    prompt_text = prompt_template.format(
         repo=repo,
         pr_number=pr_number,
         repo_path=repo_path,
@@ -762,14 +810,16 @@ async def _run_claude_code_session_async(
         harbor_config_args=harbor_config_args,
         dockerfile_hint_section=dockerfile_hint_section,
     )
+    prompt_kind = "full" if validate else "generation-only"
     if dockerfile_hint_section:
         logger.info(
-            "Using full prompt with Dockerfile hint from %s, PR #%s",
+            "Using %s prompt with Dockerfile hint from %s, PR #%s",
+            prompt_kind,
             reference_task_id,
             reference_pr,
         )
     else:
-        logger.info("Using full prompt (generating from skeleton)")
+        logger.info("Using %s prompt (generating from skeleton)", prompt_kind)
 
     # Create hook for logging Harbor validation attempts
     harbor_runs: list[str] = []
@@ -875,7 +925,10 @@ async def _run_claude_code_session_async(
         options = ClaudeAgentOptions(
             allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "LS", "Bash"],
             disallowed_tools=["Task"],
-            permission_mode="bypassPermissions",  # Auto-approve actions
+            # The worker image currently runs as root, and Claude Code rejects
+            # --dangerously-skip-permissions for root. The explicit allow-list
+            # still authorizes the tools required by the noninteractive agent.
+            permission_mode="default",
             cwd=os.getcwd(),  # Run from project root
             model=model_settings.model,
             env=session_env,
@@ -910,12 +963,15 @@ async def _run_claude_code_session_async(
                                 if verbose:
                                     print_sdk_message(message)
 
-                            state = _check_validation_state(
-                                jobs_dir,
-                                task_id,
-                                logger,
-                                baseline=validation_baseline,
-                            )
+                            if validate:
+                                state = _check_validation_state(
+                                    jobs_dir,
+                                    task_id,
+                                    logger,
+                                    baseline=validation_baseline,
+                                )
+                            else:
+                                state = _check_generation_state(task_dir)
                             if state.success:
                                 if verbose:
                                     print("-" * 60, flush=True)
@@ -924,55 +980,101 @@ async def _run_claude_code_session_async(
 
                             if turn >= MAX_INCOMPLETE_CONTINUATIONS:
                                 logger.warning(
-                                    "Claude Code ended %d turn(s) without completing validation",
+                                    "Claude Code ended %d turn(s) without completing %s",
                                     turn + 1,
+                                    "validation" if validate else "task files",
                                 )
                                 return state
 
                             logger.warning(
-                                "Claude Code turn %d ended with validation incomplete; "
+                                "Claude Code turn %d ended with %s incomplete; "
                                 "sending continuation %d/%d",
                                 turn + 1,
+                                "validation" if validate else "task files",
                                 turn + 1,
                                 MAX_INCOMPLETE_CONTINUATIONS,
                             )
                             if verbose:
                                 print(
-                                    f"[SDK] Validation incomplete; continuing turn {turn + 2}",
+                                    f"[SDK] {'Validation' if validate else 'Task files'} "
+                                    f"incomplete; continuing turn {turn + 2}",
                                     flush=True,
                                 )
-                            next_prompt = CC_CONTINUATION_PROMPT
+                            next_prompt = (
+                                CC_CONTINUATION_PROMPT
+                                if validate
+                                else CC_GENERATE_ONLY_CONTINUATION_PROMPT
+                            )
 
             except TimeoutError:
                 logger.warning("Claude Code session timed out after %ds", timeout)
                 if verbose:
                     print(f"\n[SDK] Timed out after {timeout}s", flush=True)
-                return _check_validation_state(
-                    jobs_dir,
-                    task_id,
-                    logger,
-                    timed_out=True,
-                    baseline=validation_baseline,
-                )
+                if validate:
+                    return _check_validation_state(
+                        jobs_dir,
+                        task_id,
+                        logger,
+                        timed_out=True,
+                        baseline=validation_baseline,
+                    )
+                return _check_generation_state(task_dir, timed_out=True)
         finally:
             os.environ.update(hidden_env)
 
-        return _check_validation_state(jobs_dir, task_id, logger, baseline=validation_baseline)
+        if validate:
+            return _check_validation_state(
+                jobs_dir,
+                task_id,
+                logger,
+                baseline=validation_baseline,
+            )
+        return _check_generation_state(task_dir)
 
     except Exception as e:
         safe_error = redact_sensitive_text(str(e))
         logger.error("Claude Code session failed: %s", safe_error)
-        state = _check_validation_state(
-            jobs_dir,
-            task_id,
-            logger,
-            baseline=validation_baseline,
-        )
+        if validate:
+            state = _check_validation_state(
+                jobs_dir,
+                task_id,
+                logger,
+                baseline=validation_baseline,
+            )
+        else:
+            state = _check_generation_state(task_dir)
         if not state.success:
             state.error_message = "; ".join(
                 part for part in (f"SDK failed: {safe_error}", state.error_message) if part
             )
         return state
+
+
+def _check_generation_state(task_dir: Path, timed_out: bool = False) -> ClaudeCodeResult:
+    """Require the two generated task files to exist without template TODOs."""
+
+    incomplete: list[str] = []
+    for relative_path in (Path("environment/Dockerfile"), Path("tests/test.sh")):
+        path = task_dir / relative_path
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            incomplete.append(f"missing {relative_path}")
+            continue
+        if "TODO" in content.upper():
+            incomplete.append(f"unfinished {relative_path}")
+
+    success = not incomplete
+    parts: list[str] = []
+    if timed_out and not success:
+        parts.append("CC timed out")
+    parts.extend(incomplete)
+    return ClaudeCodeResult(
+        success=success,
+        nop_passed=False,
+        oracle_passed=False,
+        error_message="; ".join(parts) if parts else None,
+    )
 
 
 def _check_validation_state(

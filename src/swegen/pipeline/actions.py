@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from math import isfinite
 from numbers import Real
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING
 
 from push_all_verified import (
@@ -25,6 +27,7 @@ from reward_hacking_detector.hacking import (
     check_instance_with_fallback,
 )
 from swegen.create.claude_code_utils import redact_sensitive_text
+from swegen.model_settings import load_github_tokens
 from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
@@ -56,6 +59,20 @@ _PROXY_ENVIRONMENT_NAMES = (
     "NO_PROXY",
 )
 _COMMAND_STOP_GRACE_SECONDS = 10.0
+_PROXY_CA_FILENAME = "swegen-proxy-ca.crt"
+_PROXY_CA_TRUST_PATH = f"/usr/local/share/ca-certificates/{_PROXY_CA_FILENAME}"
+_PROXY_PACKAGE_MANAGER_ENVIRONMENT = (
+    ("NODE_EXTRA_CA_CERTS", _PROXY_CA_TRUST_PATH),
+    ("NPM_CONFIG_CAFILE", _PROXY_CA_TRUST_PATH),
+    ("NPM_CONFIG_FETCH_RETRIES", "5"),
+    ("NPM_CONFIG_FETCH_RETRY_FACTOR", "2"),
+    ("NPM_CONFIG_FETCH_RETRY_MINTIMEOUT", "20000"),
+    ("NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT", "120000"),
+    ("NPM_CONFIG_MAXSOCKETS", "4"),
+    ("YARN_NETWORK_TIMEOUT", "600000"),
+    ("YARN_HTTP_TIMEOUT", "600000"),
+    ("YARN_NETWORK_CONCURRENCY", "4"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,12 +130,25 @@ def _compact_safe_text(value: object, max_chars: int = 1000) -> str:
     return _compact_text(redact_sensitive_text(str(value)), max_chars)
 
 
+def _compact_safe_error_detail(value: object, max_chars: int = 1000) -> str:
+    """Keep the actionable tail of a long, credential-redacted error."""
+
+    text = " ".join(redact_sensitive_text(str(value)).split())
+    if len(text) <= max_chars:
+        return text
+    separator = " ... "
+    head_chars = min(240, (max_chars - len(separator)) // 2)
+    tail_chars = max_chars - head_chars - len(separator)
+    return text[:head_chars] + separator + text[-tail_chars:]
+
+
 def _run_logged_command(
     command: Sequence[str],
     *,
     cwd: Path,
     log_path: Path,
     timeout_seconds: float,
+    env: Mapping[str, str] | None = None,
 ) -> _CommandSummary:
     """Run a command while streaming output into a size-bounded log file."""
 
@@ -128,6 +158,7 @@ def _run_logged_command(
         log_path=log_path,
         timeout_seconds=timeout_seconds,
         max_output_bytes=MAX_COMMAND_LOG_BYTES,
+        env=env,
         redactor=redact_sensitive_text,
         stop_grace_seconds=_COMMAND_STOP_GRACE_SECONDS,
     )
@@ -175,6 +206,60 @@ def build_generate_command(task: PipelineTask, workspace: Path) -> list[str]:
     ]
 
 
+def _generate_environment(task: PipelineTask) -> dict[str, str]:
+    """Return a subprocess environment with a stable legacy GitHub token."""
+
+    environment = dict(os.environ)
+    if environment.get("GITHUB_TOKEN", "").strip():
+        return environment
+    tokens = load_github_tokens()
+    if tokens:
+        environment["GITHUB_TOKEN"] = tokens[task.trace_id.int % len(tokens)]
+    return environment
+
+
+def _ensure_proxy_ca_runtime_environment(task_dir: Path) -> bool:
+    """Teach legacy task Dockerfiles to trust the injected CA in Node/npm."""
+
+    environment_dir = task_dir / "environment"
+    dockerfile = environment_dir / "Dockerfile"
+    proxy_ca = environment_dir / _PROXY_CA_FILENAME
+    if not dockerfile.is_file() or not proxy_ca.is_file():
+        return False
+
+    text = dockerfile.read_text()
+    lines = text.splitlines(keepends=True)
+    ca_update_line = next(
+        (index for index, line in enumerate(lines) if "update-ca-certificates" in line),
+        None,
+    )
+    if ca_update_line is not None:
+        instruction_start = ca_update_line
+        while instruction_start > 0 and lines[instruction_start - 1].rstrip().endswith("\\"):
+            instruction_start -= 1
+        insertion_index = sum(len(line) for line in lines[:instruction_start])
+    else:
+        workdir_index = text.find("WORKDIR ")
+        if workdir_index < 0:
+            insertion_index = len(text.rstrip()) + 1
+        else:
+            insertion_index = workdir_index
+
+    effective_prefix = text[:insertion_index]
+    assignments = [
+        f"{name}={value}"
+        for name, value in _PROXY_PACKAGE_MANAGER_ENVIRONMENT
+        if f"{name}=" not in effective_prefix
+    ]
+    if not assignments:
+        return False
+
+    environment = "ENV " + " \\\n    ".join(assignments) + "\n\n"
+    updated = text[:insertion_index] + environment + text[insertion_index:]
+    dockerfile.write_text(updated)
+    return True
+
+
 def generate_action(task: PipelineTask, workspace: Path) -> StageExecution:
     """Generate and capture one Harbor task inside the delivery workspace."""
 
@@ -187,10 +272,12 @@ def generate_action(task: PipelineTask, workspace: Path) -> StageExecution:
             "SWEGEN_GENERATE_TIMEOUT_SECONDS",
             DEFAULT_GENERATE_TIMEOUT_SECONDS,
         ),
+        env=_generate_environment(task),
     )
     task_dir = workspace / "tasks" / task.task_id
     if not task_dir.is_dir():
         raise RuntimeError(f"expected generated task directory is missing: {task.task_id}")
+    _ensure_proxy_ca_runtime_environment(task_dir)
     files = capture_task_files(task_dir)
     if not files:
         raise RuntimeError(f"generated task directory is empty: {task.task_id}")
@@ -210,6 +297,8 @@ def _validation_reward(
     task: PipelineTask,
     workspace: Path,
     agent: str,
+    *,
+    cancel_event: Event | None = None,
 ) -> int | float:
     exit_code, result_path = run_harbor_agent(
         task.task_id,
@@ -222,12 +311,14 @@ def _validation_reward(
             "SWEGEN_HARBOR_TIMEOUT_SECONDS",
             DEFAULT_HARBOR_TIMEOUT_SECONDS,
         ),
+        cancel_event=cancel_event,
     )
     if exit_code != 0:
         raise RuntimeError(f"Harbor {agent} exited with status {exit_code}")
     outcome = parse_harbor_outcome(result_path)
     if outcome.error:
-        raise RuntimeError(f"Harbor {agent} reported an execution error")
+        detail = _compact_safe_error_detail(outcome.error, 1000)
+        raise RuntimeError(f"Harbor {agent} reported an execution error: {detail or '<unknown>'}")
     reward = outcome.reward
     if (
         reward is None
@@ -239,17 +330,33 @@ def _validation_reward(
     return reward
 
 
-def validate_action(task: PipelineTask, workspace: Path) -> StageExecution:
+def validate_action(
+    task: PipelineTask,
+    workspace: Path,
+    *,
+    cancel_event: Event | None = None,
+) -> StageExecution:
     """Require Harbor's NOP baseline to fail and Oracle solution to pass."""
 
+    _ensure_proxy_ca_runtime_environment(workspace / "tasks" / task.task_id)
     local_tag = local_image_tag(task.task_id)
     try:
-        nop_reward = _validation_reward(task, workspace, "nop")
+        nop_reward = _validation_reward(
+            task,
+            workspace,
+            "nop",
+            cancel_event=cancel_event,
+        )
         if nop_reward != 0:
             return StageExecution.rejected(
                 {"reason": "unexpected_nop_reward", "nop_reward": nop_reward}
             )
-        oracle_reward = _validation_reward(task, workspace, "oracle")
+        oracle_reward = _validation_reward(
+            task,
+            workspace,
+            "oracle",
+            cancel_event=cancel_event,
+        )
         if oracle_reward != 1:
             return StageExecution.rejected(
                 {
@@ -361,6 +468,7 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
         task_dir = workspace / "tasks" / task.task_id
         if not task_dir.is_dir():
             raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+        _ensure_proxy_ca_runtime_environment(task_dir)
         proxy_environment = {
             name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
         }
@@ -397,16 +505,25 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
                 )
 
 
-def action_for_stage(stage: PipelineStage) -> StageAction:
+def action_for_stage(
+    stage: PipelineStage,
+    *,
+    cancel_event: Event | None = None,
+) -> StageAction:
     """Return the concrete action registered for a pipeline stage."""
 
     try:
         normalized_stage = PipelineStage(stage)
     except (TypeError, ValueError) as error:
         raise ValueError(f"unsupported pipeline stage: {stage!r}") from error
+    validation_action: StageAction = (
+        validate_action
+        if cancel_event is None
+        else partial(validate_action, cancel_event=cancel_event)
+    )
     actions = {
         PipelineStage.GENERATE: generate_action,
-        PipelineStage.VALIDATE: validate_action,
+        PipelineStage.VALIDATE: validation_action,
         PipelineStage.REWARD: reward_action,
         PipelineStage.PUSH: push_action,
     }

@@ -28,6 +28,7 @@ _ACTION_ENVIRONMENT_NAMES = (
     "SWEGEN_SWR_REPOSITORY",
     "SWEGEN_SWR_REGISTRY",
     "SWEGEN_SWR_SUFFIX",
+    "GITHUB_TOKEN",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
 )
@@ -127,6 +128,119 @@ def test_generate_outer_timeout_default_exceeds_claude_timeout_default() -> None
     from swegen.pipeline import actions
 
     assert actions.DEFAULT_GENERATE_TIMEOUT_SECONDS > actions.DEFAULT_CC_TIMEOUT_SECONDS
+
+
+def test_generate_environment_selects_stable_token_from_config_pool(monkeypatch) -> None:
+    from swegen.pipeline import actions
+
+    tokens = ["github-token-a", "github-token-b", "github-token-c"]
+    monkeypatch.setattr(actions, "load_github_tokens", lambda: tokens)
+
+    environment = actions._generate_environment(make_task())
+
+    assert environment["GITHUB_TOKEN"] == tokens[make_task().trace_id.int % len(tokens)]
+    assert "GITHUB_TOKEN" not in os.environ
+
+
+def test_generate_environment_preserves_explicit_github_token(monkeypatch) -> None:
+    from swegen.pipeline import actions
+
+    monkeypatch.setenv("GITHUB_TOKEN", "explicit-token")
+    monkeypatch.setattr(
+        actions,
+        "load_github_tokens",
+        lambda: pytest.fail("config token pool must not be loaded"),
+    )
+
+    environment = actions._generate_environment(make_task())
+
+    assert environment["GITHUB_TOKEN"] == "explicit-token"
+
+
+def test_proxy_ca_environment_is_injected_into_legacy_task_dockerfile(
+    tmp_path: Path,
+) -> None:
+    from swegen.pipeline import actions
+
+    task_dir = tmp_path / "tasks" / make_task().task_id
+    environment_dir = task_dir / "environment"
+    environment_dir.mkdir(parents=True)
+    (environment_dir / "swegen-proxy-ca.crt").write_text("proxy-ca")
+    dockerfile = environment_dir / "Dockerfile"
+    dockerfile.write_text(
+        "FROM ubuntu:24.04\n\n"
+        "COPY swegen-proxy-ca.crt /tmp/swegen-proxy-ca.crt\n\n"
+        "RUN apt-get update \\\n"
+        "    && update-ca-certificates \\\n"
+        "    && rm /tmp/swegen-proxy-ca.crt\n\n"
+        "RUN npm install --global yarn@1.22.22\n\n"
+        "WORKDIR /app\n"
+    )
+
+    assert actions._ensure_proxy_ca_runtime_environment(task_dir) is True
+    assert actions._ensure_proxy_ca_runtime_environment(task_dir) is False
+
+    rendered = dockerfile.read_text()
+    trusted_ca = "/usr/local/share/ca-certificates/swegen-proxy-ca.crt"
+    assert f"NODE_EXTRA_CA_CERTS={trusted_ca}" in rendered
+    assert f"NPM_CONFIG_CAFILE={trusted_ca}" in rendered
+    assert "NPM_CONFIG_FETCH_RETRIES=5" in rendered
+    assert "NPM_CONFIG_MAXSOCKETS=4" in rendered
+    assert "YARN_NETWORK_TIMEOUT=600000" in rendered
+    assert "YARN_NETWORK_CONCURRENCY=4" in rendered
+    assert rendered.count("NODE_EXTRA_CA_CERTS=") == 1
+    assert rendered.index("NODE_EXTRA_CA_CERTS=") < rendered.index("update-ca-certificates")
+    assert rendered.index("NODE_EXTRA_CA_CERTS=") < rendered.index("npm install --global yarn")
+
+
+def test_proxy_ca_environment_precedes_npm_in_ca_install_instruction(
+    tmp_path: Path,
+) -> None:
+    from swegen.pipeline import actions
+
+    task_dir = tmp_path / "tasks" / make_task().task_id
+    environment_dir = task_dir / "environment"
+    environment_dir.mkdir(parents=True)
+    (environment_dir / "swegen-proxy-ca.crt").write_text("proxy-ca")
+    dockerfile = environment_dir / "Dockerfile"
+    dockerfile.write_text(
+        "FROM ubuntu:24.04\n\n"
+        "COPY swegen-proxy-ca.crt /tmp/swegen-proxy-ca.crt\n\n"
+        "RUN update-ca-certificates \\\n"
+        "    && npm install --global npm@6.14.18\n\n"
+        "WORKDIR /app\n"
+    )
+
+    assert actions._ensure_proxy_ca_runtime_environment(task_dir) is True
+
+    rendered = dockerfile.read_text()
+    assert rendered.index("NODE_EXTRA_CA_CERTS=") < rendered.index("RUN update-ca-certificates")
+    assert rendered.index("NPM_CONFIG_CAFILE=") < rendered.index("npm install --global npm")
+
+
+def test_proxy_ca_environment_duplicates_late_assignments_before_ca_install(
+    tmp_path: Path,
+) -> None:
+    from swegen.pipeline import actions
+
+    task_dir = tmp_path / "tasks" / make_task().task_id
+    environment_dir = task_dir / "environment"
+    environment_dir.mkdir(parents=True)
+    (environment_dir / "swegen-proxy-ca.crt").write_text("proxy-ca")
+    dockerfile = environment_dir / "Dockerfile"
+    dockerfile.write_text(
+        "FROM ubuntu:24.04\n\n"
+        "RUN update-ca-certificates && npm install --global npm@6.14.18\n\n"
+        "ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/swegen-proxy-ca.crt \\\n"
+        "    NPM_CONFIG_CAFILE=/usr/local/share/ca-certificates/swegen-proxy-ca.crt\n"
+    )
+
+    assert actions._ensure_proxy_ca_runtime_environment(task_dir) is True
+    assert actions._ensure_proxy_ca_runtime_environment(task_dir) is False
+
+    rendered = dockerfile.read_text()
+    assert rendered.index("NODE_EXTRA_CA_CERTS=") < rendered.index("RUN update-ca-certificates")
+    assert rendered.index("NPM_CONFIG_CAFILE=") < rendered.index("npm install --global npm")
 
 
 def test_generate_action_captures_generated_task_files(
@@ -472,11 +586,26 @@ def test_validate_action_rejects_unexpected_oracle_reward(
 
 
 @pytest.mark.parametrize(
-    ("exit_code", "outcome"),
+    ("exit_code", "outcome", "expected_error"),
     [
-        pytest.param(2, HarborOutcome(reward=0, error=None), id="nonzero-exit"),
-        pytest.param(0, HarborOutcome(reward=None, error=None), id="missing-outcome"),
-        pytest.param(0, HarborOutcome(reward=0, error="docker failed"), id="execution-error"),
+        pytest.param(
+            2,
+            HarborOutcome(reward=0, error=None),
+            "Harbor nop exited with status 2",
+            id="nonzero-exit",
+        ),
+        pytest.param(
+            0,
+            HarborOutcome(reward=None, error=None),
+            "Harbor nop produced no parseable reward",
+            id="missing-outcome",
+        ),
+        pytest.param(
+            0,
+            HarborOutcome(reward=0, error="docker failed"),
+            "Harbor nop reported an execution error: docker failed",
+            id="execution-error",
+        ),
     ],
 )
 def test_validate_action_raises_for_harbor_infrastructure_failures(
@@ -484,6 +613,7 @@ def test_validate_action_raises_for_harbor_infrastructure_failures(
     monkeypatch,
     exit_code: int,
     outcome: HarborOutcome,
+    expected_error: str,
 ) -> None:
     from swegen.pipeline import actions
 
@@ -500,11 +630,43 @@ def test_validate_action_raises_for_harbor_infrastructure_failures(
     monkeypatch.setattr(actions, "parse_harbor_outcome", lambda path: outcome)
     monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
-    with pytest.raises(RuntimeError, match="Harbor nop"):
+    with pytest.raises(RuntimeError, match=expected_error):
         actions.validate_action(task, tmp_path)
 
     assert calls == ["nop"]
     assert removed == [actions.local_image_tag(task.task_id)]
+
+
+def test_validate_action_preserves_actionable_tail_of_long_harbor_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
+    long_error = (
+        "Docker compose build started " + ("build output " * 200) + ("npm ERR! code EMISSINGARG")
+    )
+    monkeypatch.setattr(
+        actions,
+        "run_harbor_agent",
+        lambda *args, **kwargs: (0, tmp_path / "result.json"),
+    )
+    monkeypatch.setattr(
+        actions,
+        "parse_harbor_outcome",
+        lambda path: HarborOutcome(reward=0, error=long_error),
+    )
+    monkeypatch.setattr(actions, "remove_local_image", lambda tag: None)
+
+    with pytest.raises(RuntimeError) as raised:
+        actions.validate_action(task, tmp_path)
+
+    message = str(raised.value)
+    assert "Docker compose build started" in message
+    assert "npm ERR! code EMISSINGARG" in message
+    assert len(message) <= 1100
 
 
 def test_reward_action_raises_when_test_bundle_is_empty(

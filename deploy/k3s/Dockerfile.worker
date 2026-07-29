@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim AS node-runtime
+
+RUN --mount=type=secret,id=combined_ca,target=/run/secrets/combined_ca,mode=0444 \
+    NODE_EXTRA_CA_CERTS=/run/secrets/combined_ca \
+    npm install --global --omit=dev @anthropic-ai/claude-code@2.1.206 \
+    && npm cache clean --force
+
+FROM python:3.12-slim-bookworm
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN --mount=type=secret,id=combined_ca,target=/run/secrets/combined_ca,mode=0444 \
+    apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        openssh-client \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl --cacert /run/secrets/combined_ca -fsSL \
+        https://download.docker.com/linux/debian/gpg \
+        -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && . /etc/os-release \
+    && printf '%s\n' \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get -o Acquire::https::CaInfo=/run/secrets/combined_ca update \
+    && apt-get -o Acquire::https::CaInfo=/run/secrets/combined_ca \
+        install --yes --no-install-recommends \
+        docker-buildx-plugin \
+        docker-ce-cli \
+        docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=node-runtime /usr/local /usr/local
+
+RUN --mount=type=secret,id=combined_ca,target=/run/secrets/combined_ca \
+    SSL_CERT_FILE=/run/secrets/combined_ca \
+    PIP_CERT=/run/secrets/combined_ca \
+    pip install --no-cache-dir uv==0.11.28
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+
+RUN --mount=type=secret,id=combined_ca,target=/run/secrets/combined_ca \
+    SSL_CERT_FILE=/run/secrets/combined_ca \
+    uv sync --frozen --no-dev
+
+ENV PATH="/app/.venv/bin:/usr/local/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/root
+
+ENTRYPOINT ["python", "-m", "swegen.pipeline.worker"]

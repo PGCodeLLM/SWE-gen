@@ -63,6 +63,9 @@ export ANTHROPIC_API_KEY=<api-key>  # or CLAUDE_CODE_OAUTH_TOKEN
 
 **Note:** Cloud sandbox environments (Daytona, E2B, Modal, etc.) require additional API keys.
 
+For the PostgreSQL/PGMQ distributed worker pipeline, see the
+[K3s deployment and migration guide](deploy/k3s/README.md).
+
 ## Usage
 
 **Commands:**

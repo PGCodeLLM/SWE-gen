@@ -269,10 +269,15 @@ def test_pipeline_schema_has_named_tables_and_idempotent_stage_key() -> None:
     assert "CREATE TABLE IF NOT EXISTS pipeline_tasks" in sql
     assert "CREATE TABLE IF NOT EXISTS pipeline_task_files" in sql
     assert "CREATE TABLE IF NOT EXISTS pipeline_stage_results" in sql
+    assert "CREATE TABLE IF NOT EXISTS pipeline_stage_activity" in sql
     assert "CONSTRAINT pk_pipeline_tasks PRIMARY KEY (task_id, task_version)" in sql
     assert (
         "CONSTRAINT pk_pipeline_stage_results PRIMARY KEY (task_id, task_version, stage, attempt)"
     ) in sql
+    assert (
+        "CONSTRAINT pk_pipeline_stage_activity PRIMARY KEY (task_id, task_version, stage)"
+        in sql
+    )
 
 
 def test_pipeline_schema_has_named_identity_and_file_constraints() -> None:
@@ -317,6 +322,24 @@ def test_pipeline_schema_has_named_stage_result_constraints_and_indexes() -> Non
     assert "error TEXT" in sql
     assert "CREATE INDEX IF NOT EXISTS idx_pipeline_tasks_state_stage" in sql
     assert "CREATE INDEX IF NOT EXISTS idx_pipeline_stage_results_status" in sql
+
+
+def test_pipeline_schema_has_live_activity_constraints_and_index() -> None:
+    sql = schema_sql()
+
+    assert "CONSTRAINT fk_pipeline_stage_activity_task" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_stage" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_attempt_positive" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_pgmq_msg_id_positive" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_pgmq_read_count_positive" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_worker_nonblank" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_node_nonblank" in sql
+    assert "CONSTRAINT ck_pipeline_stage_activity_timestamps" in sql
+    assert "pgmq_msg_id BIGINT NOT NULL" in sql
+    assert "pgmq_read_count INTEGER NOT NULL" in sql
+    assert "started_at TIMESTAMPTZ NOT NULL" in sql
+    assert "heartbeat_at TIMESTAMPTZ NOT NULL" in sql
+    assert "CREATE INDEX IF NOT EXISTS idx_pipeline_stage_activity_heartbeat" in sql
 
 
 def test_pipeline_schema_uses_the_fixed_state_stage_and_result_values() -> None:

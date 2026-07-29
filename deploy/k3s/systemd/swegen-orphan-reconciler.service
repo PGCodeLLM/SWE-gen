@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile orphaned SWEgen k3s worker containers
+After=k3s.service k3s-agent.service
+
+[Service]
+Type=oneshot
+Environment=KUBECONFIG=/etc/swegen/kubeconfig
+ExecStart=/usr/local/sbin/swegen-reconcile-orphaned-workers --min-age-seconds 300
+User=root
+Group=root

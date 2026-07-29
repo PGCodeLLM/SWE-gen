@@ -248,6 +248,46 @@ class FakeStore:
         self.terminal_failures: list[
             tuple[FakeConnection, ClaimedMessage, str, datetime, str, str]
         ] = []
+        self.stage_activities: list[
+            tuple[FakeConnection, ClaimedMessage, datetime, str, str]
+        ] = []
+        self.activity_heartbeats: list[
+            tuple[FakeConnection, ClaimedMessage, datetime, str]
+        ] = []
+        self.cleared_activities: list[tuple[FakeConnection, ClaimedMessage]] = []
+
+    def record_stage_activity(
+        self,
+        connection: FakeConnection,
+        claim: ClaimedMessage,
+        *,
+        started_at: datetime,
+        worker_id: str,
+        node_name: str,
+    ) -> None:
+        self.stage_activities.append(
+            (connection, claim, started_at, worker_id, node_name)
+        )
+
+    def heartbeat_stage_activity(
+        self,
+        connection: FakeConnection,
+        claim: ClaimedMessage,
+        *,
+        heartbeat_at: datetime,
+        worker_id: str,
+    ) -> None:
+        self.activity_heartbeats.append(
+            (connection, claim, heartbeat_at, worker_id)
+        )
+
+    def clear_stage_activity(
+        self,
+        connection: FakeConnection,
+        claim: ClaimedMessage,
+    ) -> bool:
+        self.cleared_activities.append((connection, claim))
+        return True
 
     def get_task(
         self,
@@ -535,7 +575,7 @@ def test_claim_and_load_connections_close_before_stage_execution(tmp_path: Path)
     def assert_short_transactions_closed(task: PipelineTask, workspace: Path) -> None:
         assert task.current_stage is PipelineStage.REWARD
         assert workspace.is_dir()
-        assert len(worker.connection_factory.connections) == 2
+        assert len(worker.connection_factory.connections) == 3
         assert all(
             connection.exited and not connection.active
             for connection in worker.connection_factory.connections
@@ -588,6 +628,39 @@ def test_claim_heartbeat_uses_short_independent_connections_and_stops() -> None:
     assert queue.heartbeat_calls
     assert all(connection.exited for connection in connection_factory.connections)
     assert all(call[2] == 300 for call in queue.heartbeat_calls)
+
+
+def test_claim_heartbeat_runs_the_activity_callback_in_the_same_transaction() -> None:
+    callback_seen = Event()
+    connection_factory = RecordingConnectionFactory()
+    claim = reward_claim()
+    callback_calls: list[tuple[FakeConnection, ClaimedMessage]] = []
+
+    def on_heartbeat(
+        connection: FakeConnection,
+        updated: ClaimedMessage,
+        _heartbeat_at: datetime,
+    ) -> None:
+        callback_calls.append((connection, updated))
+        callback_seen.set()
+
+    heartbeat = ClaimHeartbeat(
+        connection_factory=connection_factory,
+        queue=FakeQueue(),
+        claim=claim,
+        visibility_timeout_seconds=300,
+        interval_seconds=0.01,
+        on_heartbeat=on_heartbeat,
+    )
+
+    with heartbeat:
+        assert callback_seen.wait(timeout=1)
+
+    assert len(callback_calls) == 1
+    callback_connection, callback_claim = callback_calls[0]
+    assert callback_claim == claim
+    assert callback_connection is connection_factory.connections[0]
+    assert callback_connection.exited is True
 
 
 def test_claim_heartbeat_exit_is_bounded_when_the_database_call_remains_blocked() -> None:
@@ -1021,6 +1094,53 @@ def test_success_records_result_and_constructs_the_exact_sole_successor(
     ]
 
 
+def test_worker_records_activity_before_action_and_clears_it_on_success(
+    tmp_path: Path,
+) -> None:
+    claim = reward_claim()
+
+    def assert_activity_is_visible_before_action(
+        _task: PipelineTask,
+        _workspace: Path,
+    ) -> None:
+        assert len(worker.store.stage_activities) == 1
+
+    worker = make_worker(
+        tmp_path,
+        action=FakeAction(side_effect=assert_activity_is_visible_before_action),
+        claim=claim,
+    )
+
+    assert worker.run_once() is True
+
+    activity = worker.store.stage_activities[0]
+    assert activity[1:] == (claim, STARTED_AT, "worker-1", "node-a")
+    assert worker.store.cleared_activities == [
+        (worker.store.stage_results[0][0], claim)
+    ]
+
+
+def test_worker_passes_an_activity_heartbeat_callback_to_the_lease_guard(
+    tmp_path: Path,
+) -> None:
+    heartbeat_factory = FakeHeartbeatFactory()
+    worker = make_worker(
+        tmp_path,
+        claim=reward_claim(),
+        heartbeat_factory=heartbeat_factory,
+        clock=SequenceClock(STARTED_AT, HANDOFF_AT),
+    )
+
+    assert worker.run_once() is True
+
+    on_heartbeat = heartbeat_factory.calls[0]["on_heartbeat"]
+    connection = FakeConnection("heartbeat", [])
+    on_heartbeat(connection, reward_claim(), HANDOFF_AT)
+    assert worker.store.activity_heartbeats == [
+        (connection, reward_claim(), HANDOFF_AT, "worker-1")
+    ]
+
+
 def test_final_push_success_completes_without_a_successor(tmp_path: Path) -> None:
     claim = pipeline_claim(PipelineStage.PUSH)
     worker = make_worker(
@@ -1042,6 +1162,9 @@ def test_rejected_execution_archives_without_handoff(tmp_path: Path) -> None:
     assert worker.run_once() is True
     assert worker.queue.completed_terminal == [reward_claim()]
     assert worker.queue.handoffs == []
+    assert worker.store.cleared_activities == [
+        (worker.store.stage_results[0][0], reward_claim())
+    ]
 
 
 def test_action_exception_retries_in_place_before_the_delivery_limit(tmp_path: Path) -> None:
@@ -1057,6 +1180,9 @@ def test_action_exception_retries_in_place_before_the_delivery_limit(tmp_path: P
     assert worker.queue.retries == [claim]
     assert worker.queue.dead_letters == []
     assert worker.store.terminal_failures == []
+    assert len(worker.store.stage_activities) == 1
+    assert len(worker.store.cleared_activities) == 1
+    assert worker.store.cleared_activities[0][1] == claim
 
 
 def test_exhausted_action_exception_records_redacted_failure_and_dead_letters(
@@ -1079,6 +1205,9 @@ def test_exhausted_action_exception_records_redacted_failure_and_dead_letters(
     assert secret not in stored_error
     assert "<REDACTED>" in stored_error
     assert len(stored_error) <= 4_000
+    assert worker.store.cleared_activities == [
+        (worker.store.terminal_failures[0][0], claim)
+    ]
 
 
 def test_stop_request_during_action_allows_completion_but_prevents_future_claims(
@@ -1109,6 +1238,37 @@ def test_stop_request_during_action_allows_completion_but_prevents_future_claims
     assert len(worker.queue.claim_calls) == 1
     assert worker.run_once() is False
     assert len(worker.queue.claim_calls) == 1
+
+
+def test_stop_request_that_interrupts_action_releases_claim_without_failure(
+    tmp_path: Path,
+) -> None:
+    stop_event = Event()
+
+    def interrupt_action(task: PipelineTask, workspace: Path) -> None:
+        assert task.current_stage is PipelineStage.REWARD
+        assert workspace.is_dir()
+        stop_event.set()
+        raise RuntimeError("Harbor cancelled during worker shutdown")
+
+    action = FakeAction(side_effect=interrupt_action)
+    claim = reward_claim(read_count=3)
+    worker = make_worker(
+        tmp_path,
+        action=action,
+        claim=claim,
+        stop_event=stop_event,
+    )
+
+    worker.run_forever()
+
+    assert worker.queue.heartbeat_calls[-1][1:] == (claim, 1)
+    assert worker.queue.handoffs == []
+    assert worker.queue.completed_terminal == []
+    assert worker.queue.retries == []
+    assert worker.queue.dead_letters == []
+    assert worker.store.terminal_failures == []
+    assert worker.store.cleared_activities[-1][1] == claim
 
 
 def test_stop_request_during_long_poll_releases_claim_without_starting_action(
@@ -1227,7 +1387,11 @@ def test_runtime_worker_uses_one_explicitly_bounded_pool_factory(
 
     monkeypatch.setattr(db_module, "get_pool", lambda: FakePool())
     monkeypatch.setattr(db_module, "connection", generic_connection)
-    monkeypatch.setattr(worker_module, "_load_stage_action", lambda stage: FakeAction())
+    monkeypatch.setattr(
+        worker_module,
+        "_load_stage_action",
+        lambda stage, **_kwargs: FakeAction(),
+    )
 
     worker = worker_module._build_runtime_worker(PipelineStage.REWARD)
     first_context = worker.connection_factory()

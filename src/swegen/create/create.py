@@ -540,13 +540,17 @@ def run_reversal(config: CreateConfig) -> None:
                 head_sha=metadata.get("head_sha"),
                 environment=config.environment.value,
                 jobs_dir=config.state_dir / "harbor-jobs",
+                validate=config.validate,
             )
 
             gen_secs = time.perf_counter() - t0
 
-            if cc_result and cc_result.success:
+            if cc_result and cc_result.success and config.validate:
                 console.print()
                 console.print(f"[green]✓ Task generated and validated in {gen_secs:.1f}s[/green]")
+            elif cc_result and cc_result.success:
+                console.print()
+                console.print(f"[green]✓ Task generated in {gen_secs:.1f}s[/green]")
             elif cc_result:
                 console.print()
                 console.print(
@@ -596,7 +600,7 @@ def run_reversal(config: CreateConfig) -> None:
         harbor_nop_job_dir = harbor_oracle_job_dir = None
 
         # If CC ran, add its results to the summary
-        if cc_result:
+        if cc_result and config.validate:
             results_rows.append(
                 [
                     "CC NOP",
@@ -646,7 +650,9 @@ def run_reversal(config: CreateConfig) -> None:
             console, harbor_validation_failed, cc_validation_failed, harbor_actually_ran
         )
 
-        task_was_validated = bool(cc_result and cc_result.success) or harbor_actually_ran
+        task_was_validated = bool(cc_result and cc_result.success and config.validate) or (
+            harbor_actually_ran
+        )
         if config.use_cache and task_was_validated:
             reference_file = state_dir / "task_references.json"
             TaskReferenceStore(reference_file=reference_file).save(

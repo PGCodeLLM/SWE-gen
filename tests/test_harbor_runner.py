@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from uuid import UUID
 
 import pytest
@@ -11,7 +13,8 @@ from harbor.models.trial.config import TaskConfig, TrialConfig
 from harbor.models.trial.result import AgentInfo, TrialResult
 from harbor.models.verifier.result import VerifierResult
 
-from swegen.tools.harbor_runner import parse_harbor_outcome
+from swegen.tools import harbor_runner
+from swegen.tools.harbor_runner import HarborRunCancelled, parse_harbor_outcome
 
 
 def write_job_result(path: Path, reward: int | float) -> None:
@@ -76,3 +79,36 @@ def test_parse_harbor_outcome_rejects_unparseable_reward(tmp_path: Path) -> None
     outcome = parse_harbor_outcome(result_path)
 
     assert outcome.reward is None
+
+
+def test_run_harbor_agent_cancels_process_group_and_reaps_containers(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    cancel_event = Event()
+    cancel_event.set()
+    reaped: list[str] = []
+    monkeypatch.setattr(
+        harbor_runner,
+        "harbor_cmd_base",
+        lambda: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    monkeypatch.setattr(harbor_runner, "suffixed_docker_config_args", lambda *_: [])
+    monkeypatch.setattr(
+        harbor_runner,
+        "_reap_harbor_containers",
+        lambda task_id, _environment: reaped.append(task_id),
+    )
+
+    with pytest.raises(HarborRunCancelled, match="worker shutdown"):
+        harbor_runner.run_harbor_agent(
+            "owner__repo-1",
+            tmp_path / "tasks",
+            tmp_path / "jobs",
+            "nop",
+            capture_output=True,
+            wall_timeout_seconds=60,
+            cancel_event=cancel_event,
+        )
+
+    assert reaped == ["owner__repo-1"]

@@ -40,7 +40,7 @@ def generate_dockerfile(
     - Dependency installation
     - Build steps (if needed)
     - Post-patch rebuild (if needed)
-    
+
     Git clone strategy:
     - Simple + robust: clone, then fetch the exact commit SHA.
     - NOTE: `head_sha` currently comes from the PR's HEAD branch tip (GitHub API).
@@ -49,12 +49,18 @@ def generate_dockerfile(
     """
     proxy_ca_copy = ""
     proxy_ca_install = ""
+    proxy_ca_environment = ""
     if proxy_ca_filename:
+        trusted_ca_path = f"/usr/local/share/ca-certificates/{proxy_ca_filename}"
         proxy_ca_copy = f"COPY {proxy_ca_filename} /tmp/{proxy_ca_filename}\n\n"
         proxy_ca_install = f"""    && mkdir -p /usr/local/share/ca-certificates \\
     && cp /tmp/{proxy_ca_filename} /usr/local/share/ca-certificates/{proxy_ca_filename} \\
     && update-ca-certificates \\
     && rm /tmp/{proxy_ca_filename} \\
+"""
+        proxy_ca_environment = f"""ENV NODE_EXTRA_CA_CERTS={trusted_ca_path} \\
+    NPM_CONFIG_CAFILE={trusted_ca_path}
+
 """
 
     return f"""FROM ubuntu:24.04
@@ -68,7 +74,7 @@ def generate_dockerfile(
     build-essential \\
 {proxy_ca_install}    && rm -rf /var/lib/apt/lists/*
 
-# TODO: Install language runtime
+{proxy_ca_environment}# TODO: Install language runtime
 # Analyze the repo to determine what's needed. Examples:
 #   Python: apt-get install python3 python3-pip python3-venv python3-dev
 #   Node.js: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs

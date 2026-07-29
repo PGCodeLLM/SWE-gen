@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
+from threading import Event
 
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.result import JobResult
@@ -17,6 +18,12 @@ from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
 SUFFIXED_DOCKER_ENV_IMPORT_PATH = "swegen.tools.suffixed_docker:SwegenDockerEnvironment"
+HARBOR_CANCEL_POLL_SECONDS = 1.0
+HARBOR_STOP_GRACE_SECONDS = 10.0
+
+
+class HarborRunCancelled(RuntimeError):
+    """Raised when a worker shutdown interrupts an active Harbor run."""
 
 
 def harbor_cmd_base() -> list[str]:
@@ -109,6 +116,25 @@ def _reap_harbor_containers(task_id: str, environment: EnvironmentType | str) ->
             pass
 
 
+def _stop_harbor_process_group(child: subprocess.Popen[str]) -> None:
+    """Boundedly terminate Harbor and every Compose/Buildx client it spawned."""
+
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.communicate(timeout=HARBOR_STOP_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    child.communicate()
+
+
 def run_harbor_agent(
     task_id: str,
     dataset_path: Path,
@@ -119,6 +145,7 @@ def run_harbor_agent(
     delete_after: bool = True,
     environment: EnvironmentType = EnvironmentType.DOCKER,
     wall_timeout_seconds: float | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[int, Path | None]:
     """Run a Harbor agent and return (exit_code, job_result_path).
 
@@ -135,6 +162,9 @@ def run_harbor_agent(
         wall_timeout_seconds: Optional outer wall-clock limit. When exceeded,
             terminate the complete Harbor/Compose client process group so a
             timed-out Docker build cannot orphan clients and block a worker.
+        cancel_event: Optional worker-shutdown event. When set, terminate the
+            Harbor process group promptly and raise ``HarborRunCancelled`` so
+            the caller can release the PGMQ claim without counting a failure.
 
     Returns:
         Tuple of (exit_code, path_to_result_json or None)
@@ -185,28 +215,39 @@ def run_harbor_agent(
         start_new_session=True,
         env=child_env,
     )
-    try:
-        stdout, stderr = child.communicate(timeout=wall_timeout_seconds)
-    except subprocess.TimeoutExpired as error:
+    deadline = (
+        None if wall_timeout_seconds is None else time.monotonic() + wall_timeout_seconds
+    )
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _stop_harbor_process_group(child)
+            _reap_harbor_containers(task_id, environment)
+            raise HarborRunCancelled(f"Harbor {agent} cancelled during worker shutdown")
+
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            _stop_harbor_process_group(child)
+            _reap_harbor_containers(task_id, environment)
+            raise TimeoutError(
+                f"Harbor {agent} timed out after {wall_timeout_seconds:g} seconds"
+            )
+
+        poll_timeout = remaining
+        if cancel_event is not None:
+            poll_timeout = HARBOR_CANCEL_POLL_SECONDS
+            if remaining is not None:
+                poll_timeout = min(poll_timeout, remaining)
         try:
-            os.killpg(child.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            child.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.communicate()
-        # Killing the Harbor process group skips its compose teardown, so the
-        # container is orphaned. Reap it explicitly (images preserved) before
-        # surfacing the timeout, or leaked containers pile up and wedge Docker.
-        _reap_harbor_containers(task_id, environment)
-        raise TimeoutError(
-            f"Harbor {agent} timed out after {wall_timeout_seconds:g} seconds"
-        ) from error
+            stdout, stderr = child.communicate(timeout=poll_timeout)
+            break
+        except subprocess.TimeoutExpired as error:
+            if cancel_event is None:
+                _stop_harbor_process_group(child)
+                _reap_harbor_containers(task_id, environment)
+                raise TimeoutError(
+                    f"Harbor {agent} timed out after {wall_timeout_seconds:g} seconds"
+                ) from error
+            continue
 
     # Normal completion: Harbor's own teardown may still have failed silently
     # under daemon load (it swallows compose-down errors), so reap defensively.

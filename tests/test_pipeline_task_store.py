@@ -91,6 +91,36 @@ INSERT_PUSHED_IMAGE_SQL = normalize_sql(
     ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
     """
 )
+UPSERT_STAGE_ACTIVITY_SQL = normalize_sql(
+    """
+    INSERT INTO pipeline_stage_activity (
+        task_id, task_version, stage, attempt, pgmq_msg_id, pgmq_read_count,
+        worker_id, node_name, started_at, heartbeat_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (task_id, task_version, stage) DO UPDATE SET
+        attempt = EXCLUDED.attempt,
+        pgmq_msg_id = EXCLUDED.pgmq_msg_id,
+        pgmq_read_count = EXCLUDED.pgmq_read_count,
+        worker_id = EXCLUDED.worker_id,
+        node_name = EXCLUDED.node_name,
+        started_at = EXCLUDED.started_at,
+        heartbeat_at = EXCLUDED.heartbeat_at
+    """
+)
+HEARTBEAT_STAGE_ACTIVITY_SQL = normalize_sql(
+    """
+    UPDATE pipeline_stage_activity
+    SET pgmq_read_count = %s, heartbeat_at = %s
+    WHERE task_id = %s AND task_version = %s AND stage = %s
+      AND pgmq_msg_id = %s AND worker_id = %s
+    """
+)
+CLEAR_STAGE_ACTIVITY_SQL = normalize_sql(
+    """
+    DELETE FROM pipeline_stage_activity
+    WHERE task_id = %s AND task_version = %s AND stage = %s AND pgmq_msg_id = %s
+    """
+)
 
 
 @dataclass(frozen=True)
@@ -239,6 +269,143 @@ def stage_result_params(
         json_payload(execution.result_json()),
         error,
     )
+
+
+def test_record_stage_activity_upserts_the_exact_claim_identity() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.REWARD, attempt=2, read_count=3)
+    connection = RecordingConnection(CursorResult(rowcount=1))
+
+    TaskStore().record_stage_activity(
+        connection,
+        claim,
+        started_at=STARTED_AT,
+        worker_id="worker-1",
+        node_name="node-a",
+    )
+
+    assert connection.calls == [
+        (
+            UPSERT_STAGE_ACTIVITY_SQL,
+            (
+                claim.message.task_id,
+                claim.message.task_version,
+                "reward",
+                2,
+                claim.msg_id,
+                3,
+                "worker-1",
+                "node-a",
+                STARTED_AT,
+                STARTED_AT,
+            ),
+        )
+    ]
+
+
+def test_heartbeat_stage_activity_updates_only_the_current_worker_claim() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.VALIDATE, read_count=2)
+    connection = RecordingConnection(CursorResult(rowcount=1))
+
+    TaskStore().heartbeat_stage_activity(
+        connection,
+        claim,
+        heartbeat_at=FINISHED_AT,
+        worker_id="worker-1",
+    )
+
+    assert connection.calls == [
+        (
+            HEARTBEAT_STAGE_ACTIVITY_SQL,
+            (
+                2,
+                FINISHED_AT,
+                claim.message.task_id,
+                claim.message.task_version,
+                "validate",
+                claim.msg_id,
+                "worker-1",
+            ),
+        )
+    ]
+
+
+def test_heartbeat_stage_activity_rejects_lost_activity_ownership() -> None:
+    from swegen.pipeline.task_store import TaskStore, TaskStoreError
+
+    connection = RecordingConnection(CursorResult(rowcount=0))
+
+    with pytest.raises(TaskStoreError, match="activity ownership"):
+        TaskStore().heartbeat_stage_activity(
+            connection,
+            make_claim(PipelineStage.VALIDATE),
+            heartbeat_at=FINISHED_AT,
+            worker_id="worker-1",
+        )
+
+
+def test_clear_stage_activity_targets_only_the_claim_message() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.PUSH)
+    connection = RecordingConnection(CursorResult(rowcount=1))
+
+    assert TaskStore().clear_stage_activity(connection, claim) is True
+    assert connection.calls == [
+        (
+            CLEAR_STAGE_ACTIVITY_SQL,
+            (
+                claim.message.task_id,
+                claim.message.task_version,
+                "push",
+                claim.msg_id,
+            ),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation", "timestamp", "worker_id", "node_name"),
+    [
+        ("record", datetime(2026, 7, 28, 12, 0), "worker-1", "node-a"),
+        ("record", STARTED_AT, " ", "node-a"),
+        ("record", STARTED_AT, "worker-1", ""),
+        ("heartbeat", datetime(2026, 7, 28, 12, 5), "worker-1", "node-a"),
+        ("heartbeat", FINISHED_AT, " ", "node-a"),
+    ],
+)
+def test_stage_activity_validates_inputs_before_sql(
+    operation: str,
+    timestamp: datetime,
+    worker_id: str,
+    node_name: str,
+) -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    connection = RecordingConnection()
+    store = TaskStore()
+
+    with pytest.raises(ValueError, match="started_at|heartbeat_at|worker_id|node_name"):
+        if operation == "record":
+            store.record_stage_activity(
+                connection,
+                make_claim(),
+                started_at=timestamp,
+                worker_id=worker_id,
+                node_name=node_name,
+            )
+        else:
+            store.heartbeat_stage_activity(
+                connection,
+                make_claim(),
+                heartbeat_at=timestamp,
+                worker_id=worker_id,
+            )
+
+    assert connection.calls == []
 
 
 def test_capture_task_files_preserves_nested_binary_files_and_modes(tmp_path: Path) -> None:

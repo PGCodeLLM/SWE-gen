@@ -64,6 +64,7 @@ def test_incomplete_sdk_turn_is_continued_in_same_client(tmp_path, monkeypatch) 
     assert "Work synchronously" in prompts[0]
     assert prompts[1] == runner.CC_CONTINUATION_PROMPT
     assert options_seen[0].disallowed_tools == ["Task"]
+    assert options_seen[0].permission_mode == "default"
     assert runner.os.environ["GITHUB_TOKEN"] == "test-github-token"
     assert runner.os.environ["SWEGEN_CONFIG"] == "/private/swegen.toml"
 
@@ -90,3 +91,66 @@ def test_preexisting_harbor_results_are_not_accepted(tmp_path, monkeypatch) -> N
         True,
         False,
     )
+
+
+def test_generate_only_session_completes_files_without_harbor(tmp_path, monkeypatch) -> None:
+    prompts: list[str] = []
+
+    repo_path = tmp_path / "repo"
+    task_dir = tmp_path / "tasks" / "owner__repo-1"
+    environment_dir = task_dir / "environment"
+    tests_dir = task_dir / "tests"
+    repo_path.mkdir()
+    environment_dir.mkdir(parents=True)
+    tests_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("# TODO: fill runtime\n")
+    (tests_dir / "test.sh").write_text("# TODO: run tests\n")
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def query(self, prompt):
+            prompts.append(prompt)
+            (environment_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            (tests_dir / "test.sh").write_text("#!/bin/sh\nnpm test -- grid.spec.js\n")
+
+        async def receive_response(self):
+            if False:
+                yield None
+
+    monkeypatch.setattr(runner, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(runner, "load_model_settings", lambda: ModelSettings(model="test-model"))
+    monkeypatch.setattr(
+        runner,
+        "_check_validation_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generate-only mode must not inspect Harbor results")
+        ),
+    )
+
+    result = asyncio.run(
+        runner._run_claude_code_session_async(
+            repo="owner/repo",
+            pr_number=1,
+            repo_path=repo_path,
+            task_dir=task_dir,
+            task_id="owner__repo-1",
+            dataset_path=task_dir.parent,
+            test_files=["grid.spec.js"],
+            timeout=5,
+            jobs_dir=tmp_path / "jobs",
+            validate=False,
+        )
+    )
+
+    assert result == runner.ClaudeCodeResult(True, False, False)
+    assert len(prompts) == 1
+    assert "Do not run Harbor" in prompts[0]
+    assert "--agent nop" not in prompts[0]

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+namespace="${SWEGEN_K3S_NAMESPACE:-swegen-pipeline}"
+runtime_root="${SWEGEN_RUNTIME_ROOT:-/data/work/slurm-swegen/slurm-runtime/20260716-sol-max-full-16w/workspace}"
+secret_root="${SWEGEN_SECRET_ROOT:-${runtime_root}/.slurm-secrets}"
+proxy_env="${SWEGEN_PROXY_ENV:-/data/work/slurm-swegen/.env}"
+docker_config="${SWEGEN_DOCKER_CONFIG:-/root/.docker/config.json}"
+
+credentials_env="${secret_root}/credentials.env"
+reward_env="${secret_root}/reward-credentials.env"
+swegen_config="${secret_root}/swegen.toml"
+combined_ca="${secret_root}/combined-ca.crt"
+
+for required_file in \
+    "${credentials_env}" \
+    "${reward_env}" \
+    "${swegen_config}" \
+    "${combined_ca}" \
+    "${proxy_env}" \
+    "${docker_config}"
+do
+    if [[ ! -r "${required_file}" ]]; then
+        printf 'Required secret source is not readable: %s\n' "${required_file}" >&2
+        exit 1
+    fi
+done
+
+umask 077
+temporary_directory="$(mktemp -d)"
+cleanup() {
+    rm -rf -- "${temporary_directory}"
+}
+trap cleanup EXIT
+
+normalize_env_file() {
+    local source_file="$1"
+    local destination_file="$2"
+    sed -E 's/^export[[:space:]]+//' "${source_file}" > "${destination_file}"
+    chmod 0600 "${destination_file}"
+}
+
+normalized_credentials="${temporary_directory}/credentials.env"
+normalized_proxy="${temporary_directory}/proxy.env"
+normalized_reward="${temporary_directory}/reward.env"
+merged_docker_config="${temporary_directory}/docker-config.json"
+normalize_env_file "${credentials_env}" "${normalized_credentials}"
+normalize_env_file "${proxy_env}" "${normalized_proxy}"
+normalize_env_file "${reward_env}" "${normalized_reward}"
+
+python3 - "${docker_config}" "${normalized_proxy}" "${merged_docker_config}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+docker_config_path, proxy_env_path, destination_path = map(Path, sys.argv[1:])
+config = json.loads(docker_config_path.read_text(encoding="utf-8"))
+if not isinstance(config, dict):
+    raise SystemExit("Docker config must contain a JSON object")
+
+proxy_env: dict[str, str] = {}
+for raw_line in proxy_env_path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    proxy_env[key.strip()] = value.strip()
+
+
+def first_value(*names: str) -> str:
+    return next((proxy_env[name] for name in names if proxy_env.get(name)), "")
+
+
+http_proxy = first_value("HTTP_PROXY", "http_proxy")
+https_proxy = first_value("HTTPS_PROXY", "https_proxy")
+no_proxy = first_value("NO_PROXY", "no_proxy")
+if not http_proxy or not https_proxy:
+    raise SystemExit("Proxy env must define both HTTP_PROXY and HTTPS_PROXY")
+
+default_proxy = {
+    "httpProxy": http_proxy,
+    "httpsProxy": https_proxy,
+}
+if no_proxy:
+    default_proxy["noProxy"] = no_proxy
+proxies = config.setdefault("proxies", {})
+if not isinstance(proxies, dict):
+    raise SystemExit("Docker config proxies entry must contain a JSON object")
+proxies["default"] = default_proxy
+destination_path.write_text(
+    json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+chmod 0600 "${merged_docker_config}"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+    kubectl=(k3s kubectl)
+else
+    kubectl=(sudo k3s kubectl)
+fi
+
+"${kubectl[@]}" create namespace "${namespace}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-model-credentials \
+    --from-env-file="${normalized_credentials}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-runtime-proxy \
+    --from-env-file="${normalized_proxy}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-reward-credentials \
+    --from-env-file="${normalized_reward}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-private-files \
+    --from-file=swegen.toml="${swegen_config}" \
+    --from-file=combined-ca.crt="${combined_ca}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-docker-config \
+    --from-file=config.json="${merged_docker_config}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+postgres_password="${SWEGEN_PG_PASSWORD:-}"
+if [[ -z "${postgres_password}" ]]; then
+    read -r -s -p "PostgreSQL password: " postgres_password
+    printf '\n' >&2
+fi
+if [[ -z "${postgres_password}" ]]; then
+    printf 'PostgreSQL password must not be empty.\n' >&2
+    exit 1
+fi
+
+password_file="${temporary_directory}/database.env"
+printf 'SWEGEN_PG_PASSWORD=%s\n' "${postgres_password}" > "${password_file}"
+unset postgres_password
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-database \
+    --from-env-file="${password_file}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" get secret \
+    swegen-model-credentials \
+    swegen-runtime-proxy \
+    swegen-reward-credentials \
+    swegen-private-files \
+    swegen-docker-config \
+    swegen-database \
+    -o name

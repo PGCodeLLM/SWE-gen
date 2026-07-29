@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically reconcile orphaned SWEgen k3s worker containers
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

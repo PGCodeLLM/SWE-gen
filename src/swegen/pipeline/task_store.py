@@ -90,6 +90,30 @@ _INSERT_PUSHED_IMAGE_SQL = """
         instance, registry, suffix, swr_url, pushed, event, payload
     ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
 """
+_UPSERT_STAGE_ACTIVITY_SQL = """
+    INSERT INTO pipeline_stage_activity (
+        task_id, task_version, stage, attempt, pgmq_msg_id, pgmq_read_count,
+        worker_id, node_name, started_at, heartbeat_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (task_id, task_version, stage) DO UPDATE SET
+        attempt = EXCLUDED.attempt,
+        pgmq_msg_id = EXCLUDED.pgmq_msg_id,
+        pgmq_read_count = EXCLUDED.pgmq_read_count,
+        worker_id = EXCLUDED.worker_id,
+        node_name = EXCLUDED.node_name,
+        started_at = EXCLUDED.started_at,
+        heartbeat_at = EXCLUDED.heartbeat_at
+"""
+_HEARTBEAT_STAGE_ACTIVITY_SQL = """
+    UPDATE pipeline_stage_activity
+    SET pgmq_read_count = %s, heartbeat_at = %s
+    WHERE task_id = %s AND task_version = %s AND stage = %s
+      AND pgmq_msg_id = %s AND worker_id = %s
+"""
+_CLEAR_STAGE_ACTIVITY_SQL = """
+    DELETE FROM pipeline_stage_activity
+    WHERE task_id = %s AND task_version = %s AND stage = %s AND pgmq_msg_id = %s
+"""
 
 
 class CursorLike(Protocol):
@@ -917,6 +941,89 @@ class TaskStore:
                     task_file.sha256,
                 ),
             )
+
+    def record_stage_activity(
+        self,
+        connection: ConnectionLike,
+        claim: ClaimedMessage,
+        *,
+        started_at: datetime,
+        worker_id: str,
+        node_name: str,
+    ) -> None:
+        """Upsert the worker currently executing one claimed stage delivery."""
+
+        _validate_claim(claim)
+        started_at = _require_aware_datetime("started_at", started_at).astimezone(UTC)
+        worker_id = _require_nonblank("worker_id", worker_id)
+        node_name = _require_nonblank("node_name", node_name)
+        message = claim.message
+        cursor = connection.execute(
+            _UPSERT_STAGE_ACTIVITY_SQL,
+            (
+                message.task_id,
+                message.task_version,
+                message.stage.value,
+                message.attempt,
+                claim.msg_id,
+                claim.read_count,
+                worker_id,
+                node_name,
+                started_at,
+                started_at,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise TaskStoreError("stage activity upsert must affect exactly one row")
+
+    def heartbeat_stage_activity(
+        self,
+        connection: ConnectionLike,
+        claim: ClaimedMessage,
+        *,
+        heartbeat_at: datetime,
+        worker_id: str,
+    ) -> None:
+        """Refresh one active stage only while the same worker owns its claim."""
+
+        _validate_claim(claim)
+        heartbeat_at = _require_aware_datetime("heartbeat_at", heartbeat_at).astimezone(UTC)
+        worker_id = _require_nonblank("worker_id", worker_id)
+        message = claim.message
+        cursor = connection.execute(
+            _HEARTBEAT_STAGE_ACTIVITY_SQL,
+            (
+                claim.read_count,
+                heartbeat_at,
+                message.task_id,
+                message.task_version,
+                message.stage.value,
+                claim.msg_id,
+                worker_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise TaskStoreError("stage activity ownership was lost")
+
+    def clear_stage_activity(
+        self,
+        connection: ConnectionLike,
+        claim: ClaimedMessage,
+    ) -> bool:
+        """Remove live activity for exactly one terminal claimed message."""
+
+        _validate_claim(claim)
+        message = claim.message
+        cursor = connection.execute(
+            _CLEAR_STAGE_ACTIVITY_SQL,
+            (
+                message.task_id,
+                message.task_version,
+                message.stage.value,
+                claim.msg_id,
+            ),
+        )
+        return cursor.rowcount == 1
 
     def record_stage_result(
         self,

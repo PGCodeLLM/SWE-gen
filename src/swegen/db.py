@@ -39,6 +39,14 @@ except Exception:  # pragma: no cover - dotenv is a declared dep, but stay safe
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
+# Schema bootstrap runs once per worker process, so a deployment scale-up can
+# otherwise execute the same DDL from dozens of sessions at once. PostgreSQL's
+# idempotent DDL is still lock-taking DDL and concurrent CREATE/ALTER/INDEX
+# statements can deadlock. A transaction-scoped advisory lock serializes only
+# SWEgen schema bootstraps while leaving normal ledger traffic unaffected.
+_SCHEMA_ADVISORY_LOCK_KEYS = (0x53574547, 1)  # "SWEG", schema generation 1
+_SCHEMA_ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(%s, %s)"
+
 # Dev defaults — host/db match the provisioned swegen_distributed instance. The
 # password is NEVER defaulted here; it must come from the environment / .env.
 _DEFAULTS = {
@@ -73,6 +81,7 @@ def apply_schema(conn: psycopg.Connection) -> None:
     """Apply schema.sql idempotently (CREATE TABLE IF NOT EXISTS ...)."""
     sql = _SCHEMA_PATH.read_text(encoding="utf-8")
     with conn.transaction():
+        conn.execute(_SCHEMA_ADVISORY_LOCK_SQL, _SCHEMA_ADVISORY_LOCK_KEYS)
         conn.execute(sql)
 
 

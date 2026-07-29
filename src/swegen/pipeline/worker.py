@@ -23,7 +23,12 @@ from uuid import UUID, uuid4
 from swegen.create.claude_code_utils import redact_sensitive_text
 from swegen.pipeline.models import PipelineTask, StageExecution, TaskFile
 from swegen.pipeline.task_store import TaskStore, materialize_task_files
-from swegen.queueing.models import ClaimedMessage, PipelineStage, QueueMessage
+from swegen.queueing.models import (
+    ClaimedMessage,
+    PipelineStage,
+    QueueMessage,
+    RetryDisposition,
+)
 from swegen.queueing.pgmq import (
     MAX_DELIVERIES,
     MAX_POLL_SECONDS,
@@ -68,6 +73,7 @@ _UNQUOTED_CREDENTIAL_RE = re.compile(
 )
 
 type ConnectionFactory = Callable[[], AbstractContextManager[Any]]
+type ActivityHeartbeat = Callable[[Any, ClaimedMessage, datetime], None]
 
 
 class StageAction(Protocol):
@@ -106,6 +112,7 @@ class HeartbeatFactory(Protocol):
         claim: ClaimedMessage,
         visibility_timeout_seconds: int,
         interval_seconds: float,
+        on_heartbeat: ActivityHeartbeat | None = None,
     ) -> HeartbeatContext: ...
 
 
@@ -255,6 +262,8 @@ class ClaimHeartbeat:
         claim: ClaimedMessage,
         visibility_timeout_seconds: int,
         interval_seconds: float,
+        on_heartbeat: ActivityHeartbeat | None = None,
+        clock: Callable[[], datetime] | None = None,
         join_timeout_seconds: float = HEARTBEAT_JOIN_TIMEOUT_SECONDS,
         cancel_timeout_seconds: float = HEARTBEAT_CANCEL_TIMEOUT_SECONDS,
     ) -> None:
@@ -265,6 +274,8 @@ class ClaimHeartbeat:
             "visibility_timeout_seconds", visibility_timeout_seconds
         )
         self._interval_seconds = _positive_interval("interval_seconds", interval_seconds)
+        self._on_heartbeat = on_heartbeat
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._join_timeout_seconds = _positive_interval(
             "join_timeout_seconds", join_timeout_seconds
         )
@@ -341,6 +352,17 @@ class ClaimHeartbeat:
                         if self._stopped.is_set():
                             raise LeaseOwnershipError("heartbeat completed after its stop request")
                         self._validate_heartbeat_claim(current, updated)
+                        if self._on_heartbeat is not None:
+                            heartbeat_at = self._clock()
+                            if (
+                                not isinstance(heartbeat_at, datetime)
+                                or heartbeat_at.tzinfo is None
+                                or heartbeat_at.utcoffset() is None
+                            ):
+                                raise ValueError(
+                                    "heartbeat clock must return a timezone-aware datetime"
+                                )
+                            self._on_heartbeat(connection, updated, heartbeat_at)
                         current = updated
                     finally:
                         with self._state_lock:
@@ -470,9 +492,11 @@ class PipelineWorker:
             self._process_claim(claim)
         return True
 
-    def _release_claim(self, claim: ClaimedMessage) -> None:
+    def _release_claim(self, claim: ClaimedMessage, *, clear_activity: bool = False) -> None:
         try:
             with self.connection_factory() as connection:
+                if clear_activity:
+                    self.store.clear_stage_activity(connection, claim)
                 self.queue.heartbeat(
                     connection,
                     claim,
@@ -501,6 +525,14 @@ class PipelineWorker:
         stale_claim = False
         durably_completed = False
         try:
+            with self.connection_factory() as connection:
+                self.store.record_stage_activity(
+                    connection,
+                    claim,
+                    started_at=started_at,
+                    worker_id=self.worker_id,
+                    node_name=self.node_name,
+                )
             self.settings.workspace_root.mkdir(parents=True, exist_ok=True)
             with self._workspace_factory(
                 root=self.settings.workspace_root,
@@ -514,6 +546,7 @@ class PipelineWorker:
                     claim=claim,
                     visibility_timeout_seconds=self.settings.visibility_timeout_seconds,
                     interval_seconds=self.settings.heartbeat_interval_seconds,
+                    on_heartbeat=self._heartbeat_activity,
                 ) as heartbeat:
                     try:
                         task, files = self._load_task(claim)
@@ -537,6 +570,9 @@ class PipelineWorker:
                     stale_claim = True
                     raise LeaseOwnershipError(heartbeat.failure)
                 if action_error is not None:
+                    if self.stop_event.is_set():
+                        self._release_claim(claim, clear_activity=True)
+                        return
                     raise action_error
                 if execution is None:
                     raise RuntimeError("stage action finished without an execution result")
@@ -597,7 +633,7 @@ class PipelineWorker:
         started_at: datetime,
     ) -> None:
         def record_stage_result(connection: Any, current: ClaimedMessage) -> bool:
-            return self.store.record_stage_result(
+            inserted = self.store.record_stage_result(
                 connection,
                 current,
                 execution,
@@ -605,6 +641,8 @@ class PipelineWorker:
                 worker_id=self.worker_id,
                 node_name=self.node_name,
             )
+            self.store.clear_stage_activity(connection, current)
+            return inserted
 
         with self.connection_factory() as connection:
             if execution.should_handoff:
@@ -654,7 +692,7 @@ class PipelineWorker:
         )
 
         def record_terminal_failure(connection: Any, current: ClaimedMessage) -> bool:
-            return self.store.record_terminal_failure(
+            inserted = self.store.record_terminal_failure(
                 connection,
                 current,
                 safe_error,
@@ -662,15 +700,32 @@ class PipelineWorker:
                 worker_id=self.worker_id,
                 node_name=self.node_name,
             )
+            self.store.clear_stage_activity(connection, current)
+            return inserted
 
         with self.connection_factory() as connection:
-            self.queue.retry_or_dead_letter(
+            disposition = self.queue.retry_or_dead_letter(
                 connection,
                 claim,
                 max_deliveries=self.settings.max_deliveries,
                 retry_visibility_timeout_seconds=(self.settings.retry_visibility_timeout_seconds),
                 record_terminal_failure=record_terminal_failure,
             )
+            if disposition is RetryDisposition.RETRY:
+                self.store.clear_stage_activity(connection, claim)
+
+    def _heartbeat_activity(
+        self,
+        connection: Any,
+        claim: ClaimedMessage,
+        heartbeat_at: datetime,
+    ) -> None:
+        self.store.heartbeat_stage_activity(
+            connection,
+            claim,
+            heartbeat_at=heartbeat_at,
+            worker_id=self.worker_id,
+        )
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -687,17 +742,22 @@ def _parse_stage(value: str) -> PipelineStage:
         raise argparse.ArgumentTypeError(f"stage must be one of: {choices}") from error
 
 
-def _load_stage_action(stage: PipelineStage) -> StageAction:
+def _load_stage_action(
+    stage: PipelineStage,
+    *,
+    cancel_event: Event | None = None,
+) -> StageAction:
     # Task 5 supplies this module. Keep the import lazy so Task 4 remains importable.
     from swegen.pipeline.actions import action_for_stage
 
-    return action_for_stage(stage)
+    return action_for_stage(stage, cancel_event=cancel_event)
 
 
 def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
     from swegen.db import get_pool
 
     pool = get_pool()
+    stop_event = Event()
 
     def connection_factory():
         return pool.connection(timeout=POOL_ACQUIRE_TIMEOUT_SECONDS)
@@ -707,7 +767,8 @@ def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
         connection_factory=connection_factory,
         queue=PgmqQueue(),
         store=TaskStore(),
-        action=_load_stage_action(stage),
+        action=_load_stage_action(stage, cancel_event=stop_event),
+        stop_event=stop_event,
     )
 
 

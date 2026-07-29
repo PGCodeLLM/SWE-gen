@@ -26,3 +26,14 @@ def test_dockerfile_installs_proxy_ca_before_git_clone() -> None:
     clone_index = dockerfile.index("RUN git clone")
 
     assert copy_index < update_index < clone_index
+
+
+def test_dockerfile_exports_proxy_ca_for_node_and_npm() -> None:
+    dockerfile = generate_dockerfile(
+        PARAMS,
+        proxy_ca_filename="swegen-proxy-ca.crt",
+    )
+
+    trusted_ca = "/usr/local/share/ca-certificates/swegen-proxy-ca.crt"
+    assert f"NODE_EXTRA_CA_CERTS={trusted_ca}" in dockerfile
+    assert f"NPM_CONFIG_CAFILE={trusted_ca}" in dockerfile
