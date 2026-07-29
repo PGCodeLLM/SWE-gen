@@ -45,6 +45,7 @@ Issues = "https://github.com/abundant-ai/swe-gen/issues"
 [project.scripts]
 # Console entry to run the Typer CLI directly
 swegen = "swegen.cli:app"
+swegen-pipeline = "swegen.pipeline.cli:app"
 harbor = "harbor.cli.main:app"
 
 [project.optional-dependencies]
