@@ -97,8 +97,8 @@ spec:
                   key: SWEGEN_NO_PROXY
           resources:
             requests:
-              cpu: "2"
-              memory: 4Gi
+              cpu: 500m
+              memory: 1536Mi
             limits:
               cpu: "16"
               memory: 32Gi
