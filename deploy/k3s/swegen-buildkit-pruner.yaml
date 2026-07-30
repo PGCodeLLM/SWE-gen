@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: swegen-buildkit-pruner
+  namespace: swegen-pipeline
+  labels:
+    app.kubernetes.io/name: swegen-buildkit-pruner
+    app.kubernetes.io/component: cache-cleanup
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-buildkit-pruner
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-buildkit-pruner
+        app.kubernetes.io/component: cache-cleanup
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: pruner
+          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-ceu"]
+          args:
+            - |
+              lock_file=/host-run-lock/swegen-buildkit-pruner.lock
+              output_file=/tmp/swegen-buildkit-prune.log
+
+              while true; do
+                printf '%s node=%s buildkit-prune cycle starting\n' "$(date -Iseconds)" "${NODE_NAME}"
+                (
+                  if ! flock -n 9; then
+                    printf '%s node=%s buildkit-prune skipped: node lock is held\n' "$(date -Iseconds)" "${NODE_NAME}"
+                    exit 0
+                  fi
+
+                  printf '%s node=%s cache before prune\n' "$(date -Iseconds)" "${NODE_NAME}"
+                  timeout 30 docker system df || true
+
+                  prune_status=0
+                  timeout "${SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS}" \
+                    docker builder prune \
+                      --all \
+                      --force \
+                      --max-used-space "${SWEGEN_BUILDKIT_MAX_USED_SPACE}" \
+                      --reserved-space "${SWEGEN_BUILDKIT_RESERVED_SPACE}" \
+                      >"${output_file}" 2>&1 || prune_status=$?
+
+                  tail -n 40 "${output_file}" || true
+                  if [ "${prune_status}" -eq 0 ]; then
+                    printf '%s node=%s buildkit-prune completed\n' "$(date -Iseconds)" "${NODE_NAME}"
+                  else
+                    printf '%s node=%s buildkit-prune failed status=%s\n' \
+                      "$(date -Iseconds)" "${NODE_NAME}" "${prune_status}"
+                  fi
+
+                  printf '%s node=%s cache after prune\n' "$(date -Iseconds)" "${NODE_NAME}"
+                  timeout 30 docker system df || true
+                ) 9>"${lock_file}"
+
+                sleep "${SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS}"
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS
+              value: "600"
+            - name: SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS
+              value: "540"
+            - name: SWEGEN_BUILDKIT_MAX_USED_SPACE
+              value: 100GB
+            - name: SWEGEN_BUILDKIT_RESERVED_SPACE
+              value: 20GB
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: host-run-lock
+              mountPath: /host-run-lock
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: host-run-lock
+          hostPath:
+            path: /run/lock
+            type: DirectoryOrCreate

@@ -11,7 +11,9 @@ from swegen.queueing.models import (
     QueueMetrics,
     QueueName,
     RetryDisposition,
+    queue_for_handoff,
     queue_for_stage,
+    queues_for_stage,
 )
 
 MAX_DELAY_SECONDS = 86_400
@@ -179,8 +181,38 @@ class PgmqQueue:
         max_poll_seconds = _bounded_integer(
             "max_poll_seconds", max_poll_seconds, minimum=0, maximum=MAX_POLL_SECONDS
         )
-        queue = queue_for_stage(stage)
+        accepted_queues = queues_for_stage(stage)
+        for priority_queue in accepted_queues[:-1]:
+            claims = self._claim_from_queue(
+                connection,
+                priority_queue,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                quantity=quantity,
+                max_poll_seconds=0,
+                poll_interval_ms=poll_interval_ms,
+            )
+            if claims:
+                return claims
 
+        return self._claim_from_queue(
+            connection,
+            accepted_queues[-1],
+            visibility_timeout_seconds=visibility_timeout_seconds,
+            quantity=quantity,
+            max_poll_seconds=max_poll_seconds,
+            poll_interval_ms=poll_interval_ms,
+        )
+
+    def _claim_from_queue(
+        self,
+        connection: ConnectionLike,
+        queue: QueueName,
+        *,
+        visibility_timeout_seconds: int,
+        quantity: int,
+        max_poll_seconds: int,
+        poll_interval_ms: int,
+    ) -> list[ClaimedMessage]:
         if max_poll_seconds:
             poll_interval_ms = _bounded_integer(
                 "poll_interval_ms",
@@ -295,11 +327,14 @@ class PgmqQueue:
                 "Stage completion",
                 complete_stage(connection, current),
             )
-            next_msg_id = (
-                self.send(connection, successor)
-                if newly_completed and successor is not None
-                else None
-            )
+            next_msg_id = None
+            if newly_completed and successor is not None:
+                next_msg_id = self._send_to_queue(
+                    connection,
+                    queue_for_handoff(current.message.stage, successor.stage),
+                    successor,
+                    delay_seconds=0,
+                )
             self.archive(connection, current)
             return next_msg_id
 
@@ -393,8 +428,8 @@ class PgmqQueue:
 
     def _decode_claim(self, row: object, queue: QueueName) -> ClaimedMessage:
         message = _decode_payload(_row_value(row, 4, "message"))
-        expected_queue = queue_for_stage(message.stage)
-        if queue is not QueueName.DEAD and expected_queue is not queue:
+        accepted_queues = queues_for_stage(message.stage)
+        if queue is not QueueName.DEAD and queue not in accepted_queues:
             raise QueueOperationError(
                 f"Message stage {message.stage.value} does not match queue {queue.value}"
             )
@@ -410,8 +445,8 @@ class PgmqQueue:
 
     @staticmethod
     def _validate_current_claim(current: ClaimedMessage) -> None:
-        expected_queue = queue_for_stage(current.message.stage)
-        if current.queue is not expected_queue:
+        accepted_queues = queues_for_stage(current.message.stage)
+        if current.queue not in accepted_queues:
             raise QueueOperationError(
                 f"Queue {current.queue.value} does not match current stage "
                 f"{current.message.stage.value}"

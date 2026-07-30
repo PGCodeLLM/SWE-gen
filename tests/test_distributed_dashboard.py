@@ -106,6 +106,15 @@ def test_aggregate_pipeline_snapshot_builds_queue_task_and_stage_timing() -> Non
             "scrape_time": NOW,
         },
         {
+            "queue_name": "swegen_validate_repaired",
+            "queue_length": 3,
+            "queue_visible_length": 2,
+            "total_messages": 12,
+            "newest_msg_age_sec": 5,
+            "oldest_msg_age_sec": 45,
+            "scrape_time": NOW,
+        },
+        {
             "queue_name": "swegen_reward",
             "queue_length": 2,
             "queue_visible_length": 1,
@@ -154,6 +163,17 @@ def test_aggregate_pipeline_snapshot_builds_queue_task_and_stage_timing() -> Non
     }
     assert snapshot["queues"]["dead"]["length"] == 2
     assert snapshot["queues"]["dead"]["visible"] == 2
+    assert snapshot["queues"]["stages"]["validate"] == {
+        "queue": "swegen_validate_repaired+swegen_validate",
+        "length": 7,
+        "visible": 6,
+        "in_flight": 1,
+        "total_messages": 92,
+        "newest_message_age_seconds": 5,
+        "oldest_message_age_seconds": 120,
+        "scraped_at": NOW.isoformat(),
+    }
+    assert snapshot["queues"]["validate_repaired"]["length"] == 3
     assert snapshot["task_counts"] == {
         "total": 2,
         "by_state": {"queued": 2},
@@ -359,6 +379,18 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
                 "processed": 10,
             }
         ],
+        lifetime_stage_rows=[
+            {"stage": "generate", "processed": 1234},
+            {"stage": "validate", "processed": 987},
+            {"stage": "unknown", "processed": 9999},
+        ],
+        remote_build_rows=[
+            {"status": "submitting", "count": 2},
+            {"status": "queued", "count": 3},
+            {"status": "running", "count": 4},
+            {"status": "success", "count": 11},
+        ],
+        remote_build_tracking_available=True,
     )
 
     assert snapshot["stage_time_series"]["bucket_seconds"] == 900
@@ -379,6 +411,193 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
         }
     ]
     assert snapshot["hourly_yield"]["stages"]["push"] == []
+    assert snapshot["throughput"]["lifetime_processed"] == {
+        "generate": 1234,
+        "validate": 987,
+        "repair": 0,
+        "reward": 0,
+        "push": 0,
+    }
+    assert snapshot["remote_builds"] == {
+        "available": True,
+        "pending": 9,
+        "status_counts": {
+            "queued": 3,
+            "running": 4,
+            "submitting": 2,
+            "success": 11,
+        },
+    }
+
+
+def test_remote_buildkit_resources_support_worker_local_schema() -> None:
+    from swegen.dashboard.distributed_status import summarize_remote_buildkit_resources
+
+    summary = summarize_remote_buildkit_resources(
+        {
+            "success": True,
+            "scope": "local_buildkit_worker",
+            "owner_pod": "buildkit-worker-6",
+            "queue_depth": 7,
+            "queue_capacity": 2000,
+            "running_count": 3,
+            "queue": {"api_capacity": {"running": 4, "max": 50}},
+        },
+        sampled_workers=("buildkit-worker-2",),
+    )
+
+    assert summary == {
+        "available": True,
+        "scope": "local_buildkit_worker",
+        "is_global": False,
+        "sampled_worker": "buildkit-worker-6",
+        "sampled_workers": ["buildkit-worker-2", "buildkit-worker-6"],
+        "sampled_worker_count": 2,
+        "backend_count": None,
+        "available_backend_count": None,
+        "queue_length": 7,
+        "queue_capacity": 2000,
+        "running_builds": 3,
+        "inflight_builds": 4,
+        "node_disk_io": [],
+        "schema_warning": (
+            "Farm API returned a worker-local sample; queue and running counts are not global."
+        ),
+    }
+
+
+def test_remote_buildkit_resources_support_documented_global_schema() -> None:
+    from swegen.dashboard.distributed_status import summarize_remote_buildkit_resources
+
+    summary = summarize_remote_buildkit_resources(
+        {
+            "count": 3,
+            "global_queue": {"queued": 8, "max_queued": 1000},
+            "global_backend_inflight": {"backend-a": 2, "backend-b": 1},
+            "backends": [
+                {"name": "a", "healthy_for_new_build": True},
+                {"name": "b", "healthy_for_new_build": False},
+                {"name": "c", "healthy_for_new_build": True},
+            ],
+        }
+    )
+
+    assert summary["is_global"] is True
+    assert summary["backend_count"] == 3
+    assert summary["available_backend_count"] == 2
+    assert summary["queue_length"] == 8
+    assert summary["queue_capacity"] == 1000
+    assert summary["inflight_builds"] == 3
+    assert summary["schema_warning"] is None
+
+
+def test_remote_buildkit_resources_normalize_per_node_disk_io() -> None:
+    from swegen.dashboard.distributed_status import summarize_remote_buildkit_resources
+
+    summary = summarize_remote_buildkit_resources(
+        {
+            "global_queue": {"queued": 0, "max_queued": 1000},
+            "nodes": [
+                {
+                    "name": "farm-node-a",
+                    "resources": {
+                        "disk_io": {
+                            "read_bps": 1_048_576,
+                            "write_bps": 2_097_152,
+                            "read_iops": 12,
+                            "write_iops": 34,
+                            "utilization_percent": 81.5,
+                            "io_current": 3,
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+    assert summary["node_disk_io"] == [
+        {
+            "node": "farm-node-a",
+            "read_bytes_per_second": 1_048_576.0,
+            "write_bytes_per_second": 2_097_152.0,
+            "read_iops": 12.0,
+            "write_iops": 34.0,
+            "busy_percent": 81.5,
+            "io_current": 3.0,
+        }
+    ]
+
+
+def test_cadvisor_disk_io_parser_avoids_parent_partition_iops_double_counting() -> None:
+    from swegen.dashboard.distributed_status import parse_cadvisor_disk_io
+
+    metrics = parse_cadvisor_disk_io(
+        "\n".join(
+            (
+                'container_fs_reads_bytes_total{device="/dev/vda",id="/"} 100',
+                'container_fs_writes_bytes_total{device="/dev/vda",id="/"} 200',
+                'container_fs_reads_total{device="/dev/vda",id="/"} 10',
+                'container_fs_reads_total{device="/dev/vda1",id="/"} 10',
+                'container_fs_writes_total{device="/dev/vda",id="/"} 20',
+                'container_fs_writes_total{device="/dev/vda1",id="/"} 20',
+                'container_fs_io_current{device="/dev/vda1",id="/"} 2',
+                'container_fs_io_time_seconds_total{device="/dev/vda1",id="/"} 5',
+                'container_fs_reads_bytes_total{device="/dev/shm",id="/"} 999',
+                'container_fs_reads_bytes_total{device="/dev/vda",id="/pod"} 999',
+            )
+        )
+    )
+
+    assert metrics == {
+        "read_bytes": 100.0,
+        "write_bytes": 200.0,
+        "read_ops": 10.0,
+        "write_ops": 20.0,
+        "io_current": 2.0,
+        "io_time_by_device": {"/dev/vda1": 5.0},
+        "device_count": 1,
+    }
+
+
+def test_remote_buildkit_collector_enforces_safe_polling_and_plain_resources_path() -> None:
+    from swegen.dashboard.distributed_status import RemoteBuildKitFarmCollector
+
+    calls: list[tuple[str, float]] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def getcode() -> int:
+            return 200
+
+        @staticmethod
+        def read(_size: int) -> bytes:
+            return b'{"scope":"local_buildkit_worker","queue_depth":0}'
+
+    class Opener:
+        @staticmethod
+        def open(request: object, *, timeout: float) -> Response:
+            calls.append((request.full_url, timeout))  # type: ignore[attr-defined]
+            return Response()
+
+    collector = RemoteBuildKitFarmCollector(
+        base_url="http://7.156.122.134:32083/",
+        poll_seconds=1,
+        opener=Opener(),
+    )
+
+    assert collector.poll_seconds == 30
+    status, payload = collector._fetch("/resources", 1200)
+    assert status == 200
+    assert payload == {"scope": "local_buildkit_worker", "queue_depth": 0}
+    assert calls == [("http://7.156.122.134:32083/resources", 1200)]
+    assert "force_refresh" not in calls[0][0]
+    assert "include_cache_details" not in calls[0][0]
 
 
 def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:

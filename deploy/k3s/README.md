@@ -10,7 +10,7 @@ PGMQ swegen_generate -> Generate -> PGMQ swegen_validate -> NOP/Oracle
   -> PGMQ swegen_reward -> reward-hack check -> PGMQ swegen_push -> SWR
                          \
                           validation failure -> PGMQ swegen_repair -> Claude repair
-                                                -> swegen_validate (max 3 repairs)
+                                                -> swegen_validate_repaired (max 3 repairs)
 ```
 
 PostgreSQL is authoritative for task state, stage results, queue state, and the
@@ -309,8 +309,20 @@ SELECT queue_name FROM pgmq.meta ORDER BY queue_name;
 SELECT * FROM pgmq.metrics('swegen_generate');
 ```
 
-Expected queues are `swegen_generate`, `swegen_validate`, `swegen_repair`,
-`swegen_reward`, `swegen_push`, and `swegen_dead`.
+Expected queues are `swegen_generate`, `swegen_validate`,
+`swegen_validate_repaired`, `swegen_repair`, `swegen_reward`, `swegen_push`,
+and `swegen_dead`. Validate workers always claim `swegen_validate_repaired`
+first and fall back to the normal FIFO only when no repaired task is visible.
+
+For an existing deployment, create the repaired-task priority FIFO, route old
+Repair worker handoffs into it, and move visible pending repaired tasks:
+
+```bash
+psql -X \
+  "host=${db_host} port=5432 dbname=swegen_distributed user=${db_user}" \
+  -v ON_ERROR_STOP=1 \
+  -f deploy/k3s/migrate-validate-repaired-priority.sql
+```
 
 For an existing deployment created before the repair stage, apply the live
 migration once before deploying repair workers:
@@ -586,6 +598,32 @@ docker buildx prune --force \
   --reserved-space 20gb \
   --max-used-space 100gb \
   --min-free-space 100gb
+```
+
+### Temporary per-node BuildKit pruning
+
+The stopgap BuildKit cache pruner runs once per Kubernetes node and uses that
+node's host Docker socket:
+
+```bash
+kubectl apply -f deploy/k3s/swegen-buildkit-pruner.yaml
+kubectl -n swegen-pipeline rollout status daemonset/swegen-buildkit-pruner
+kubectl -n swegen-pipeline get pods \
+  -l app.kubernetes.io/name=swegen-buildkit-pruner -o wide
+kubectl -n swegen-pipeline logs \
+  -l app.kubernetes.io/name=swegen-buildkit-pruner --tail=80 --prefix
+```
+
+Each Pod runs immediately and then every 10 minutes. It includes all unused
+embedded BuildKit records, prunes the oldest toward a 100 GB maximum, reserves
+20 GB, and gives each prune at most 9 minutes. A lock under the node's
+`/run/lock` prevents overlapping cleanup after replacement or restart races.
+The Docker builder never removes cache records that are actively in use.
+
+Remove the stopgap without changing the pipeline workers:
+
+```bash
+kubectl delete -f deploy/k3s/swegen-buildkit-pruner.yaml
 ```
 
 Tune those budgets to disk size and concurrent build volume. Run the command

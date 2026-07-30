@@ -64,6 +64,7 @@ $swegen_pgmq$;
 
 SELECT pgmq.create('swegen_generate');
 SELECT pgmq.create('swegen_validate');
+SELECT pgmq.create('swegen_validate_repaired');
 SELECT pgmq.create('swegen_repair');
 SELECT pgmq.create('swegen_reward');
 SELECT pgmq.create('swegen_push');

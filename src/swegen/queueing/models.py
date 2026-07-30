@@ -29,6 +29,7 @@ class QueueName(StrEnum):
 
     GENERATE = "swegen_generate"
     VALIDATE = "swegen_validate"
+    VALIDATE_REPAIRED = "swegen_validate_repaired"
     REPAIR = "swegen_repair"
     REWARD = "swegen_reward"
     PUSH = "swegen_push"
@@ -58,11 +59,30 @@ _QUEUE_BY_STAGE: dict[PipelineStage, QueueName] = {
     PipelineStage.PUSH: QueueName.PUSH,
 }
 
+_QUEUES_BY_STAGE: dict[PipelineStage, tuple[QueueName, ...]] = {
+    **{stage: (queue,) for stage, queue in _QUEUE_BY_STAGE.items()},
+    PipelineStage.VALIDATE: (QueueName.VALIDATE_REPAIRED, QueueName.VALIDATE),
+}
+
 
 def queue_for_stage(stage: PipelineStage) -> QueueName:
     """Return the processing queue dedicated to ``stage``."""
 
     return _QUEUE_BY_STAGE[stage]
+
+
+def queues_for_stage(stage: PipelineStage) -> tuple[QueueName, ...]:
+    """Return accepted queues in claim priority order for ``stage``."""
+
+    return _QUEUES_BY_STAGE[stage]
+
+
+def queue_for_handoff(current: PipelineStage, successor: PipelineStage) -> QueueName:
+    """Route Repair validation handoffs ahead of the normal Validate FIFO."""
+
+    if current is PipelineStage.REPAIR and successor is PipelineStage.VALIDATE:
+        return QueueName.VALIDATE_REPAIRED
+    return queue_for_stage(successor)
 
 
 class QueueMessage(BaseModel):

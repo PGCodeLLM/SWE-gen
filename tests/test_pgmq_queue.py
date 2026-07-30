@@ -17,7 +17,9 @@ from swegen.queueing import (
     QueueName,
     QueueOperationError,
     RetryDisposition,
+    queue_for_handoff,
     queue_for_stage,
+    queues_for_stage,
 )
 
 EVENT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -187,6 +189,19 @@ def test_pipeline_stages_map_to_fixed_queues_in_order() -> None:
     assert queue_for_stage(PipelineStage.REPAIR) is QueueName.REPAIR
     assert queue_for_stage(PipelineStage.REWARD) is QueueName.REWARD
     assert queue_for_stage(PipelineStage.PUSH) is QueueName.PUSH
+    assert queues_for_stage(PipelineStage.VALIDATE) == (
+        QueueName.VALIDATE_REPAIRED,
+        QueueName.VALIDATE,
+    )
+    assert queues_for_stage(PipelineStage.REPAIR) == (QueueName.REPAIR,)
+    assert (
+        queue_for_handoff(PipelineStage.REPAIR, PipelineStage.VALIDATE)
+        is QueueName.VALIDATE_REPAIRED
+    )
+    assert (
+        queue_for_handoff(PipelineStage.GENERATE, PipelineStage.VALIDATE)
+        is QueueName.VALIDATE
+    )
 
     assert PipelineStage.GENERATE.next_stage is PipelineStage.VALIDATE
     assert PipelineStage.VALIDATE.next_stage is PipelineStage.REWARD
@@ -199,6 +214,7 @@ def test_all_pgmq_queue_names_fit_the_extension_limit() -> None:
     assert {queue.value for queue in QueueName} == {
         "swegen_generate",
         "swegen_validate",
+        "swegen_validate_repaired",
         "swegen_repair",
         "swegen_reward",
         "swegen_push",
@@ -231,7 +247,7 @@ def test_send_rejects_a_negative_delay_before_executing_sql() -> None:
     assert connection.calls == []
 
 
-def test_claim_decodes_tuple_rows_from_the_stage_queue() -> None:
+def test_validate_claim_checks_repaired_queue_first() -> None:
     message = queue_message(stage=PipelineStage.VALIDATE)
     connection = RecordingConnection([pgmq_row(message)])
 
@@ -244,7 +260,7 @@ def test_claim_decodes_tuple_rows_from_the_stage_queue() -> None:
 
     assert claims == [
         ClaimedMessage(
-            queue=QueueName.VALIDATE,
+            queue=QueueName.VALIDATE_REPAIRED,
             msg_id=71,
             read_count=2,
             enqueued_at=PGMQ_ENQUEUED_AT,
@@ -255,8 +271,34 @@ def test_claim_decodes_tuple_rows_from_the_stage_queue() -> None:
     assert connection.calls == [
         (
             "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read(%s, %s, %s)",
-            ("swegen_validate", 300, 1),
+            ("swegen_validate_repaired", 300, 1),
         )
+    ]
+
+
+def test_validate_claim_falls_back_to_normal_fifo_with_long_poll() -> None:
+    message = queue_message(stage=PipelineStage.VALIDATE)
+    connection = RecordingConnection([], [pgmq_row(message)])
+
+    claims = PgmqQueue().claim(
+        connection,
+        PipelineStage.VALIDATE,
+        visibility_timeout_seconds=300,
+        quantity=1,
+        max_poll_seconds=5,
+        poll_interval_ms=250,
+    )
+
+    assert claims[0].queue is QueueName.VALIDATE
+    assert connection.calls == [
+        (
+            "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read(%s, %s, %s)",
+            ("swegen_validate_repaired", 300, 1),
+        ),
+        (
+            "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read_with_poll(%s, %s, %s, %s, %s)",
+            ("swegen_validate", 300, 1, 5, 250),
+        ),
     ]
 
 
@@ -442,6 +484,23 @@ def test_complete_and_handoff_archives_a_duplicate_without_fanning_out() -> None
         "transaction-exit",
     ]
     assert all("pgmq.send" not in query for query, _ in connection.calls)
+
+
+def test_repair_handoff_sends_validate_successor_to_repaired_fifo() -> None:
+    current = claimed_message(PipelineStage.REPAIR)
+    successor = successor_message(current)
+    connection = RecordingConnection([(902,)], [(True,)])
+
+    next_msg_id = PgmqQueue().complete_and_handoff(
+        connection,
+        current,
+        successor,
+        complete_stage=lambda _connection, _claim: True,
+    )
+
+    assert next_msg_id == 902
+    send_call = next(call for call in connection.calls if "pgmq.send" in call[0])
+    assert send_call[1][0] == "swegen_validate_repaired"
 
 
 def test_complete_and_handoff_archives_the_final_stage_without_a_send() -> None:
@@ -825,7 +884,7 @@ def test_bootstrap_sql_accepts_supported_extension_or_complete_sql_only_api() ->
     assert "QUEUE_VISIBLE_LENGTH" in normalized_sql
     assert "SQL-ONLY" in normalized_sql
 
-    assert normalized_sql.count("SELECT PGMQ.CREATE(") == 6
+    assert normalized_sql.count("SELECT PGMQ.CREATE(") == 7
     for queue in QueueName:
         assert f"'{queue.value}'" in sql
 

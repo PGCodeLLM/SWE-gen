@@ -1490,6 +1490,22 @@ def test_record_stage_result_rejects_a_claim_routed_to_the_wrong_queue() -> None
     assert connection.calls == []
 
 
+def test_record_stage_result_accepts_validate_claim_from_repaired_queue() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.VALIDATE, queue=QueueName.VALIDATE_REPAIRED)
+    connection = RecordingConnection(inserted_stage_result(claim), CursorResult(rowcount=1))
+
+    assert TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+        connection,
+        claim,
+        StageExecution.succeeded({"nop_reward": 0, "oracle_reward": 1}),
+        started_at=STARTED_AT,
+        worker_id="worker-1",
+        node_name="node-a",
+    ) is True
+
+
 def test_record_stage_result_requires_exactly_one_matching_task_update() -> None:
     from swegen.pipeline.task_store import TaskStore, TaskStoreError
 

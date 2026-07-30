@@ -7,7 +7,9 @@ from swegen.queueing.models import (
     QueueMetrics,
     QueueName,
     RetryDisposition,
+    queue_for_handoff,
     queue_for_stage,
+    queues_for_stage,
 )
 from swegen.queueing.pgmq import PgmqQueue, QueueOperationError, StageCompletion
 
@@ -21,5 +23,7 @@ __all__ = [
     "QueueOperationError",
     "RetryDisposition",
     "StageCompletion",
+    "queue_for_handoff",
     "queue_for_stage",
+    "queues_for_stage",
 ]

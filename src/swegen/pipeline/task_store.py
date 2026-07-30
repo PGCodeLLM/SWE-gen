@@ -21,7 +21,7 @@ from swegen.pipeline.models import (
     StageResultStatus,
     TaskFile,
 )
-from swegen.queueing.models import ClaimedMessage, PipelineStage, QueueMessage, queue_for_stage
+from swegen.queueing.models import ClaimedMessage, PipelineStage, QueueMessage, queues_for_stage
 
 DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TASK_BYTES = 512 * 1024 * 1024
@@ -879,8 +879,8 @@ def _validate_claim(claim: ClaimedMessage) -> None:
         raise ValueError("attempt must be a positive integer")
     if not isinstance(message.trace_id, UUID):
         raise ValueError("trace_id must be a UUID")
-    expected_queue = queue_for_stage(message.stage)
-    if claim.queue is not expected_queue:
+    expected_queues = queues_for_stage(message.stage)
+    if claim.queue not in expected_queues:
         raise TaskStoreError(
             f"claim queue {claim.queue.value!r} does not match stage {message.stage.value!r}"
         )

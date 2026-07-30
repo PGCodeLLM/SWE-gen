@@ -220,6 +220,49 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert 'entry.get("model_name") == model' in secret_helper
     assert '"CLAUDE_CODE_MAX_CONTEXT_TOKENS", "160000"' in secret_helper
     assert '"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "150000"' in secret_helper
+    assert "SWEGEN_REMOTE_BUILDKIT_REGISTRY_USERNAME" in secret_helper
+    assert "SWEGEN_REMOTE_BUILDKIT_REGISTRY_PASSWORD" in secret_helper
+    assert "SWEGEN_REMOTE_BUILDKIT_PULL_USERNAME" in secret_helper
+    assert "SWEGEN_REMOTE_BUILDKIT_PULL_PASSWORD" in secret_helper
+    assert "base64.b64decode(encoded, validate=True)" in secret_helper
+
+
+def test_repaired_validate_priority_migration_is_bounded_and_idempotent() -> None:
+    migration = (DEPLOY_DIR / "migrate-validate-repaired-priority.sql").read_text()
+
+    assert "pgmq.create('swegen_validate_repaired')" in migration
+    assert "CREATE OR REPLACE FUNCTION pgmq.send" in migration
+    assert "message->>'attempt'" in migration
+    assert "FOR UPDATE SKIP LOCKED" in migration
+    assert "vt <= clock_timestamp()" in migration
+    assert "pgmq.archive('swegen_validate'" in migration
+    assert "\\set ON_ERROR_STOP on" in migration
+
+
+def test_buildkit_pruner_is_a_bounded_node_local_daemonset() -> None:
+    manifest = yaml.safe_load((DEPLOY_DIR / "swegen-buildkit-pruner.yaml").read_text())
+    pod_spec = manifest["spec"]["template"]["spec"]
+    container = pod_spec["containers"][0]
+    script = container["args"][0]
+    env = {item["name"]: item.get("value") for item in container["env"]}
+
+    assert manifest["kind"] == "DaemonSet"
+    assert manifest["metadata"]["namespace"] == "swegen-pipeline"
+    assert pod_spec["automountServiceAccountToken"] is False
+    assert container["image"] == "swegen-worker:hybrid-buildkit-proxy-skip-20260730"
+    assert "flock -n 9" in script
+    assert "docker builder prune" in script
+    assert "--all" in script and "--force" in script
+    assert env["SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS"] == "600"
+    assert env["SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS"] == "540"
+    assert any(
+        volume.get("hostPath", {}).get("path") == "/var/run/docker.sock"
+        for volume in pod_spec["volumes"]
+    )
+    assert any(
+        volume.get("hostPath", {}).get("path") == "/run/lock"
+        for volume in pod_spec["volumes"]
+    )
 
 
 def test_from_scratch_guide_pins_runtime_and_documents_growth_controls() -> None:
