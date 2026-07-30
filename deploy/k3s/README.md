@@ -435,6 +435,50 @@ retry starts. The older duplicate client is terminated before it can pin a
 second set of BuildKit records. PGMQ visibility recovery remains authoritative
 if a Pod is force-deleted after that grace period.
 
+### Hybrid local and remote BuildKit routing
+
+Harbor builds pass through `SwegenDockerEnvironment`. In `hybrid` mode it
+hashes the task's `environment/` directory and deterministically sends the
+configured percentage to the remote BuildKit farm; the remaining builds keep
+using the four node-local Docker BuildKit daemons and their 48-slot-per-node
+wrapper. A remote build is pushed under a content-addressed SWR tag, pulled by
+the selected worker node, and started through Harbor's prebuilt-image compose
+path. Remote readiness, submission, or pull failures fall back to the same
+local slot path.
+
+The relevant ConfigMap values are:
+
+```text
+SWEGEN_BUILD_ROUTER_MODE=local|hybrid|remote
+SWEGEN_REMOTE_BUILDKIT_URL=http://BUILD_FARM_NODE:32083
+SWEGEN_REMOTE_BUILDKIT_REGISTRY=REGISTRY_HOST
+SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL=REGISTRY_HOST/NAMESPACE
+SWEGEN_REMOTE_BUILDKIT_REPOSITORY=NAMESPACE/REMOTE_BUILD_REPOSITORY
+SWEGEN_REMOTE_BUILDKIT_CALLBACK_URL=http://callback-server.buildkit-isolated.svc.cluster.local:9000/callback
+SWEGEN_REMOTE_BUILDKIT_PERCENT=75
+SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_SOURCE_REGISTRY=LEGACY_REGISTRY_HOST
+SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY=REGISTRY_HOST
+```
+
+Keep the mode `local` until a smoke build reaches `status=success` and the
+resulting image can be pulled from every local worker node. Prefer server-side
+SWR credentials. A temporary client override can be supplied through the
+`SWEGEN_REMOTE_BUILDKIT_REGISTRY_USERNAME`, `..._PASSWORD`,
+`..._PULL_USERNAME`, and `..._PULL_PASSWORD` Secret-backed environment
+variables; the farm's NodePort is plaintext HTTP, so use scoped credentials and
+rotate them after the stopgap. The client disables inherited HTTP proxies
+explicitly; keep the farm IP in `SWEGEN_NO_PROXY` for other diagnostic tools.
+The optional source/mirror pair rewrites only the uploaded root Dockerfile, not
+the stored Harbor task, so legacy private base-image references can use an
+authenticated mirror available to the farm. The transformed Dockerfile is also
+included in the content digest to prevent cache aliasing across mirror changes.
+Set `SWEGEN_REMOTE_BUILDKIT_REPOSITORY` to the same repository as
+`SWEGEN_SWR_REPOSITORY`. Farm builds use content-addressed tags in that
+repository; after NOP/Oracle succeeds, the Push stage verifies the exact
+context digest and repository, records the already-pushed farm image, and skips
+the redundant local build/push. Local-routed or farm-fallback instances still
+use the normal task-ID tag and Push stage.
+
 ## End-to-end smoke test
 
 Use one previously unseen merged pull request:

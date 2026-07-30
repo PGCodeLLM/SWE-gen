@@ -33,6 +33,12 @@ from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
 from swegen.tools.harbor_runner import parse_harbor_outcome, run_harbor_agent
+from swegen.tools.remote_buildkit import (
+    RemoteBuildkitConfig,
+    context_digest,
+    find_successful_remote_image,
+    select_build_route,
+)
 from swegen.tools.subprocess_utils import run_bounded_command
 
 if TYPE_CHECKING:
@@ -512,6 +518,27 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
     expected_local_tag = local_image_tag(task.task_id)
     cleanup_tags = [expected_local_tag, remote_tag]
     try:
+        task_dir = workspace / "tasks" / task.task_id
+        if not task_dir.is_dir():
+            raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+        remote_build_tag = _remote_buildkit_image_for_push(
+            task.task_id,
+            task_dir,
+            expected_repository=f"{host}/{repository}",
+        )
+        if remote_build_tag is not None:
+            if remote_build_tag not in cleanup_tags:
+                cleanup_tags.insert(1, remote_build_tag)
+            return StageExecution.succeeded(
+                {
+                    "remote_tag": remote_build_tag,
+                    "registry": registry,
+                    "suffix": suffix,
+                    "skipped": True,
+                    "already_present": True,
+                    "remote_buildkit": True,
+                }
+            )
         if image_exists_in_registry(remote_tag):
             return StageExecution.succeeded(
                 {
@@ -522,9 +549,6 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
                     "already_present": True,
                 }
             )
-        task_dir = workspace / "tasks" / task.task_id
-        if not task_dir.is_dir():
-            raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
         _ensure_proxy_ca_runtime_environment(task_dir)
         proxy_environment = {
             name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
@@ -560,6 +584,46 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
                     cleanup_tag,
                     _compact_safe_text(error),
                 )
+
+
+def _remote_buildkit_image_for_push(
+    task_id: str,
+    task_dir: Path,
+    *,
+    expected_repository: str,
+) -> str | None:
+    try:
+        config = RemoteBuildkitConfig.from_env()
+    except ValueError as error:
+        LOGGER.warning("remote BuildKit push lookup is disabled: %s", _compact_safe_text(error))
+        return None
+    if config is None:
+        return None
+    environment_dir = task_dir / "environment"
+    if not environment_dir.is_dir():
+        return None
+    digest = context_digest(
+        environment_dir,
+        dockerfile_registry_rewrites=config.dockerfile_registry_rewrites,
+    )
+    if select_build_route(config, digest) != "remote":
+        return None
+    image_ref = find_successful_remote_image(
+        environment_name=task_id,
+        context_digest=digest,
+    )
+    if image_ref is None:
+        return None
+    image_repository = image_ref.rsplit("@", 1)[0].rsplit(":", 1)[0]
+    if image_repository != expected_repository:
+        LOGGER.warning(
+            "remote BuildKit image repository %s does not match push repository %s; "
+            "falling back to the local push path",
+            image_repository,
+            expected_repository,
+        )
+        return None
+    return image_ref
 
 
 def action_for_stage(

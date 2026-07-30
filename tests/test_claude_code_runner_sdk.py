@@ -65,6 +65,9 @@ def test_incomplete_sdk_turn_is_continued_in_same_client(tmp_path, monkeypatch) 
     assert prompts[1] == runner.CC_CONTINUATION_PROMPT
     assert options_seen[0].disallowed_tools == ["Task"]
     assert options_seen[0].permission_mode == "default"
+    assert options_seen[0].env["COMPOSE_BAKE"] == "false"
+    assert options_seen[0].env["DOCKER_BUILDKIT"] == "1"
+    assert options_seen[0].env["BUILDX_BUILDER"] == "default"
     assert runner.os.environ["GITHUB_TOKEN"] == "test-github-token"
     assert runner.os.environ["SWEGEN_CONFIG"] == "/private/swegen.toml"
 

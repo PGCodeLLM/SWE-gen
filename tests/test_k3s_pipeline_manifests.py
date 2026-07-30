@@ -55,12 +55,32 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert config_map["data"]["SWEGEN_REWARD_FALLBACK_MODEL"] == "gpt-5.6-sol"
     assert config_map["data"]["SWEGEN_MAX_REPAIR_ATTEMPTS"] == "3"
     assert config_map["data"]["SWEGEN_REPAIR_TIMEOUT_SECONDS"] == "14400"
+    assert config_map["data"]["SWEGEN_BUILD_ROUTER_MODE"] == "hybrid"
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PERCENT"] == "75"
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL"] == "true"
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL"].endswith(
+        "/swesandbox"
+    )
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_SOURCE_REGISTRY"] == (
+        "swr.cn-southwest-2.myhuaweicloud.com"
+    )
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY"] == (
+        config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REGISTRY"]
+    )
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_URL"].endswith(":32083")
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REGISTRY"] == config_map[
+        "data"
+    ]["SWEGEN_SWR_HOST"]
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REPOSITORY"] == config_map[
+        "data"
+    ]["SWEGEN_SWR_REPOSITORY"]
     no_proxy = config_map["data"]["SWEGEN_NO_PROXY"]
     assert not any(character.isspace() for character in no_proxy)
     assert ".myhuaweicloud.com" in no_proxy
     assert ".huaweicloud.com" in no_proxy
     assert ".tailb940e6.ts.net" not in no_proxy.split(",")
     assert "7.244.3.251" in no_proxy.split(",")
+    assert "7.156.122.134" in no_proxy.split(",")
     assert set(deployments) == {
         "swegen-generate",
         "swegen-validate",
@@ -83,10 +103,10 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     }
     expected_images = {
         "swegen-generate": "swegen-worker:e2e",
-        "swegen-validate": "swegen-worker:validate-next-attempt-20260730",
-        "swegen-repair": "swegen-worker:repair-handoff-fix-20260730",
+        "swegen-validate": "swegen-worker:hybrid-buildkit-proxy-skip-20260730",
+        "swegen-repair": "swegen-worker:hybrid-buildkit-proxy-skip-20260730",
         "swegen-reward": "swegen-worker:e2e",
-        "swegen-push": "swegen-worker:e2e-ca-20260729",
+        "swegen-push": "swegen-worker:hybrid-buildkit-proxy-skip-20260730",
     }
     docker_stages = {"validate", "repair", "push"}
     for name, deployment in deployments.items():
@@ -132,6 +152,37 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
             for mount in container.get("volumeMounts", [])
         )
         assert docker_socket_mounted is (stage in docker_stages)
+        env_map = {
+            item["name"]: item.get("value")
+            for item in container.get("env", [])
+            if "name" in item
+        }
+        if stage in docker_stages:
+            assert env_map.get("DOCKER_BUILDKIT") == "1"
+            assert env_map.get("BUILDX_BUILDER") == "default"
+            assert env_map.get("COMPOSE_BAKE") == "false"
+            assert env_map.get("SWEGEN_BUILD_SLOT_DIR") == "/run/swegen-build-slots"
+            assert env_map.get("SWEGEN_REAL_DOCKER") == "/usr/bin/docker"
+            assert env_map.get("PATH", "").startswith("/opt/swegen/bin:")
+            assert any(
+                mount["mountPath"] == "/run/swegen-build-slots"
+                for mount in container.get("volumeMounts", [])
+            )
+            assert any(
+                mount["mountPath"] == "/opt/swegen/bin"
+                for mount in container.get("volumeMounts", [])
+            )
+            assert any(
+                volume.get("hostPath", {}).get("path") == "/data/swegen-k3s/build-slots"
+                for volume in pod_spec["volumes"]
+            )
+            assert any(
+                volume.get("hostPath", {}).get("path") == "/data/swegen-k3s/bin"
+                for volume in pod_spec["volumes"]
+            )
+        else:
+            assert "COMPOSE_BAKE" not in env_map
+            assert "SWEGEN_BUILD_SLOT_DIR" not in env_map
 
 
 def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:

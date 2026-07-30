@@ -316,3 +316,33 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_activity (
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_stage_activity_heartbeat
     ON pipeline_stage_activity (heartbeat_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Remote BuildKit router state (current state per submitted request)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pipeline_remote_builds (
+    request_id       TEXT        PRIMARY KEY,
+    environment_name TEXT        NOT NULL,
+    worker_id        TEXT,
+    node_name        TEXT,
+    route            TEXT        NOT NULL,
+    status           TEXT        NOT NULL,
+    owner_api_pod    TEXT,
+    image_ref        TEXT,
+    context_digest   TEXT        NOT NULL,
+    submitted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at      TIMESTAMPTZ,
+    error            TEXT,
+    CONSTRAINT ck_pipeline_remote_builds_route CHECK (
+        route IN ('remote', 'local')
+    ),
+    CONSTRAINT ck_pipeline_remote_builds_digest CHECK (
+        context_digest ~ '^[0-9a-f]{64}$'
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_remote_builds_pending
+    ON pipeline_remote_builds (status, updated_at DESC)
+    WHERE route = 'remote' AND status IN ('submitting', 'queued', 'running');
+CREATE INDEX IF NOT EXISTS idx_pipeline_remote_builds_recent
+    ON pipeline_remote_builds (updated_at DESC);

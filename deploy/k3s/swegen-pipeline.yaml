@@ -39,7 +39,19 @@ data:
   SWEGEN_SWR_REPOSITORY: swesandbox/public/swe-gen/feature-implementation/generated
   SWEGEN_SWR_REGISTRY: platform
   SWEGEN_SWR_SUFFIX: _platform
-  SWEGEN_NO_PROXY: ".myhuaweicloud.com,.huaweicloud.com,.huawei.com,127.0.0.1,localhost,7.237.95.141,7.244.3.251,7.244.3.200,7.244.3.78,7.244.2.110,7.244.1.209,10.42.0.0/16,10.43.0.0/16,100.*,10.*"
+  # Enable hybrid after the remote farm's server-side SWR credentials pass a push smoke.
+  SWEGEN_BUILD_ROUTER_MODE: hybrid
+  SWEGEN_REMOTE_BUILDKIT_URL: http://7.156.122.134:32083
+  SWEGEN_REMOTE_BUILDKIT_REGISTRY: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
+  SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox
+  SWEGEN_REMOTE_BUILDKIT_REPOSITORY: swesandbox/public/swe-gen/feature-implementation/generated
+  SWEGEN_REMOTE_BUILDKIT_CALLBACK_URL: http://callback-server.buildkit-isolated.svc.cluster.local:9000/callback
+  SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_SOURCE_REGISTRY: swr.cn-southwest-2.myhuaweicloud.com
+  SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
+  SWEGEN_REMOTE_BUILDKIT_PERCENT: "75"
+  SWEGEN_REMOTE_BUILDKIT_TIMEOUT_SECONDS: "3600"
+  SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL: "true"
+  SWEGEN_NO_PROXY: ".myhuaweicloud.com,.huaweicloud.com,.huawei.com,127.0.0.1,localhost,7.156.122.134,7.237.95.141,7.244.3.251,7.244.3.200,7.244.3.78,7.244.2.110,7.244.1.209,10.42.0.0/16,10.43.0.0/16,100.*,10.*"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -165,7 +177,7 @@ spec:
               swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:validate-next-attempt-20260730
+          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           envFrom:
@@ -184,6 +196,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: "default"
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
             - name: NO_PROXY
               valueFrom:
                 configMapKeyRef:
@@ -206,6 +230,11 @@ spec:
               mountPath: /data/swegen-k3s/workspaces
             - name: docker-sock
               mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
             - name: private-files
               mountPath: /etc/swegen/swegen.toml
               subPath: swegen.toml
@@ -227,6 +256,14 @@ spec:
           hostPath:
             path: /var/run/docker.sock
             type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
         - name: private-files
           secret:
             secretName: swegen-private-files
@@ -259,7 +296,7 @@ spec:
       terminationGracePeriodSeconds: 18000
       containers:
         - name: worker
-          image: swegen-worker:repair-handoff-fix-20260730
+          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
           imagePullPolicy: Never
           args: ["--stage", "repair"]
           envFrom:
@@ -280,6 +317,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: "default"
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
             - name: NO_PROXY
               valueFrom:
                 configMapKeyRef:
@@ -302,6 +351,11 @@ spec:
               mountPath: /data/swegen-k3s/workspaces
             - name: docker-sock
               mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
             - name: private-files
               mountPath: /etc/swegen/swegen.toml
               subPath: swegen.toml
@@ -323,6 +377,14 @@ spec:
           hostPath:
             path: /var/run/docker.sock
             type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
         - name: private-files
           secret:
             secretName: swegen-private-files
@@ -444,7 +506,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: worker
-          image: swegen-worker:e2e-ca-20260729
+          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
           imagePullPolicy: Never
           args: ["--stage", "push"]
           envFrom:
@@ -463,6 +525,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: "default"
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
             - name: NO_PROXY
               valueFrom:
                 configMapKeyRef:
@@ -485,6 +559,11 @@ spec:
               mountPath: /data/swegen-k3s/workspaces
             - name: docker-sock
               mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
             - name: private-files
               mountPath: /etc/swegen/swegen.toml
               subPath: swegen.toml
@@ -506,6 +585,14 @@ spec:
           hostPath:
             path: /var/run/docker.sock
             type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
         - name: private-files
           secret:
             secretName: swegen-private-files

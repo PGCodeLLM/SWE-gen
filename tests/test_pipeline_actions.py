@@ -964,6 +964,50 @@ def test_push_action_builds_pushes_and_removes_local_image(
     }
 
 
+def test_push_action_skips_when_exact_remote_buildkit_image_is_already_pushed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    task_dir = tmp_path / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    remote_tag = "registry.example/team/generated:sha256-abc"
+    monkeypatch.setenv("SWEGEN_SWR_HOST", "registry.example")
+    monkeypatch.setenv("SWEGEN_SWR_REPOSITORY", "team/generated")
+    monkeypatch.setattr(
+        actions,
+        "_remote_buildkit_image_for_push",
+        lambda task_id, directory, expected_repository: remote_tag,
+    )
+    monkeypatch.setattr(
+        actions,
+        "image_exists_in_registry",
+        lambda tag: pytest.fail("task-ID manifest lookup must be skipped"),
+    )
+    monkeypatch.setattr(
+        actions,
+        "build_image_direct",
+        lambda *args, **kwargs: pytest.fail("local build must be skipped"),
+    )
+    removed: list[str] = []
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
+
+    execution = actions.push_action(task, tmp_path)
+
+    assert execution.status is StageResultStatus.SUCCEEDED
+    assert execution.result_json() == {
+        "remote_tag": remote_tag,
+        "registry": "platform",
+        "suffix": "_platform",
+        "skipped": True,
+        "already_present": True,
+        "remote_buildkit": True,
+    }
+    assert removed == [actions.local_image_tag(task.task_id), remote_tag, "registry.example/team/generated:owner__repo-42"]
+
+
 def test_push_action_removes_local_image_when_push_fails(
     tmp_path: Path,
     monkeypatch,

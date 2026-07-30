@@ -937,6 +937,17 @@ async def _run_claude_code_session_async(
         # and route Claude Code's internal lightweight calls to our fast model.
         session_env = claude_session_env(task_id)
 
+        # Force Compose onto the internal BuildKit path for Harbor builds that
+        # Claude launches via Bash. The SDK env map can replace inheritance for
+        # tool subprocesses, so pin these explicitly (mirrors harbor_runner).
+        session_env.update(
+            {
+                "DOCKER_BUILDKIT": os.environ.get("DOCKER_BUILDKIT", "1"),
+                "BUILDX_BUILDER": os.environ.get("BUILDX_BUILDER", "default"),
+                "COMPOSE_BAKE": os.environ.get("COMPOSE_BAKE", "false"),
+            }
+        )
+
         # Claude Code's Node/Bun transport understands HTTP(S) proxy URLs but
         # not SOCKS directly. HTTPS uses the worker's local HTTP-to-SOCKS
         # bridge; plain HTTP can retain the separate SG proxy for package and

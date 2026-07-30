@@ -8,6 +8,7 @@ runtime_root="${SWEGEN_RUNTIME_ROOT:-/data/work/slurm-swegen/slurm-runtime/20260
 secret_root="${SWEGEN_SECRET_ROOT:-${runtime_root}/.slurm-secrets}"
 proxy_env="${SWEGEN_PROXY_ENV:-/data/work/slurm-swegen/.env}"
 docker_config="${SWEGEN_DOCKER_CONFIG:-/root/.docker/config.json}"
+remote_buildkit_registry="${SWEGEN_REMOTE_BUILDKIT_REGISTRY:-swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com}"
 models_yaml="${SWEGEN_MODELS_YAML:-/data/work/alex/SWE-gen/models.yaml}"
 
 credentials_env="${secret_root}/credentials.env"
@@ -52,6 +53,41 @@ merged_docker_config="${temporary_directory}/docker-config.json"
 normalize_env_file "${credentials_env}" "${normalized_credentials}"
 normalize_env_file "${proxy_env}" "${normalized_proxy}"
 normalize_env_file "${reward_env}" "${normalized_reward}"
+
+python3 - "${docker_config}" "${normalized_proxy}" "${remote_buildkit_registry}" <<'PY'
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+
+docker_config_path = Path(sys.argv[1])
+proxy_env_path = Path(sys.argv[2])
+registry = sys.argv[3].strip().rstrip("/")
+config = json.loads(docker_config_path.read_text(encoding="utf-8"))
+auths = config.get("auths") if isinstance(config, dict) else None
+entry = auths.get(registry) if isinstance(auths, dict) else None
+encoded = entry.get("auth") if isinstance(entry, dict) else None
+if not isinstance(encoded, str) or not encoded:
+    raise SystemExit(f"Docker config has no inline auth for {registry}")
+try:
+    decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    username, password = decoded.split(":", 1)
+except (ValueError, UnicodeDecodeError) as error:
+    raise SystemExit(f"Docker config auth for {registry} is invalid") from error
+if not username or not password or any(character in username + password for character in "\r\n\0"):
+    raise SystemExit(f"Docker config auth for {registry} is incomplete or unsafe")
+values = {
+    "SWEGEN_REMOTE_BUILDKIT_REGISTRY_USERNAME": username,
+    "SWEGEN_REMOTE_BUILDKIT_REGISTRY_PASSWORD": password,
+    "SWEGEN_REMOTE_BUILDKIT_PULL_USERNAME": username,
+    "SWEGEN_REMOTE_BUILDKIT_PULL_PASSWORD": password,
+}
+with proxy_env_path.open("a", encoding="utf-8") as destination:
+    for key, value in values.items():
+        destination.write(f"{key}={value}\n")
+os.chmod(proxy_env_path, 0o600)
+PY
 
 uv run --project "${repo_root}" python - "${models_yaml}" "${repair_model_env}" <<'PY'
 import os
