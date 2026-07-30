@@ -14,8 +14,8 @@ def _load():
     return mod
 
 
-def test_default_slot_count_is_48() -> None:
-    assert _load().DEFAULT_SLOTS == 48
+def test_default_slot_count_is_32() -> None:
+    assert _load().DEFAULT_SLOTS == 32
 
 
 def test_needs_slot_for_build_forms() -> None:

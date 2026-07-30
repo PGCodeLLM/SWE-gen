@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install node-local build-slot files and the docker PATH wrapper on one host.
-# Usage: sudo SWEGEN_BUILD_SLOTS=48 ./install-build-slots.sh
+# Usage: sudo SWEGEN_BUILD_SLOTS=32 ./install-build-slots.sh
 set -euo pipefail
 
-SLOTS="${SWEGEN_BUILD_SLOTS:-48}"
+SLOTS="${SWEGEN_BUILD_SLOTS:-32}"
 SLOT_DIR="${SWEGEN_BUILD_SLOT_DIR:-/data/swegen-k3s/build-slots}"
 BIN_DIR="${SWEGEN_BUILD_BIN_DIR:-/data/swegen-k3s/bin}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

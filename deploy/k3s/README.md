@@ -452,7 +452,7 @@ if a Pod is force-deleted after that grace period.
 Harbor builds pass through `SwegenDockerEnvironment`. In `hybrid` mode it
 hashes the task's `environment/` directory and deterministically sends the
 configured percentage to the remote BuildKit farm; the remaining builds keep
-using the four node-local Docker BuildKit daemons and their 48-slot-per-node
+using the four node-local Docker BuildKit daemons and their 32-slot-per-node
 wrapper. A remote build is pushed under a content-addressed SWR tag, pulled by
 the selected worker node, and started through Harbor's prebuilt-image compose
 path. Remote readiness, submission, or pull failures fall back to the same
@@ -480,6 +480,11 @@ SWR credentials. A temporary client override can be supplied through the
 variables; the farm's NodePort is plaintext HTTP, so use scoped credentials and
 rotate them after the stopgap. The client disables inherited HTTP proxies
 explicitly; keep the farm IP in `SWEGEN_NO_PROXY` for other diagnostic tools.
+Also add `SWEGEN_REMOTE_BUILDKIT_REGISTRY` (or its `.swr-pro.myhuaweicloud.com`
+suffix) to each node Docker daemon's `proxies.no-proxy` list. Pod-level
+`NO_PROXY` does not affect `docker pull`; reload is insufficient for this
+setting, so apply Docker daemon restarts one node at a time after draining or
+accepting interruption of active Harbor containers.
 The optional source/mirror pair rewrites only the uploaded root Dockerfile, not
 the stored Harbor task, so legacy private base-image references can use an
 authenticated mirror available to the farm. The transformed Dockerfile is also

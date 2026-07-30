@@ -20,7 +20,7 @@ from pathlib import Path
 
 REAL_DOCKER = os.environ.get("SWEGEN_REAL_DOCKER", "/usr/bin/docker")
 SLOT_DIR = Path(os.environ.get("SWEGEN_BUILD_SLOT_DIR", "/run/swegen-build-slots"))
-DEFAULT_SLOTS = int(os.environ.get("SWEGEN_BUILD_SLOTS", "48"))
+DEFAULT_SLOTS = int(os.environ.get("SWEGEN_BUILD_SLOTS", "32"))
 POLL_SECONDS = float(os.environ.get("SWEGEN_BUILD_SLOT_POLL_SECONDS", "0.25"))
 LOG = os.environ.get("SWEGEN_BUILD_SLOT_LOG", "")
 
