@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID
 
@@ -35,9 +36,51 @@ _ACTION_ENVIRONMENT_NAMES = (
 
 
 @pytest.fixture(autouse=True)
-def clear_pipeline_action_environment(monkeypatch) -> None:
+def configure_pipeline_actions(tmp_path: Path, monkeypatch) -> None:
     for name in _ACTION_ENVIRONMENT_NAMES:
         monkeypatch.delenv(name, raising=False)
+    credentials = tmp_path / "minddistiller.csv"
+    credentials.write_text(
+        "用户名,test-user\n密码,test-password\n镜像访问凭证,docker login mind.example\n"
+    )
+    config = tmp_path / "swegen.toml"
+    config.write_text(
+        "[model]\n"
+        'model = "configured-model"\n'
+        'base_url = "https://model.example"\n'
+        'api_key = "configured-model-key"\n'
+        'fast_model = "configured-fast-model"\n'
+        "\n[openai]\n"
+        'api_key = "configured-openai-key"\n'
+        'task_instruction_model = "instruction-model"\n'
+        'verdict_model = "verdict-model"\n'
+        "\n[github]\n"
+        'gh_tokens = ["github-token-a", "github-token-b", "github-token-c"]\n'
+        "\n[[hacking.llm]]\n"
+        'name = "checker-a"\n'
+        'endpoint = "https://checker-a.example"\n'
+        'model = "checker-model-a"\n'
+        'api_key = "checker-key-a"\n'
+        "\n[[hacking.llm]]\n"
+        'name = "checker-b"\n'
+        'endpoint = "https://checker-b.example"\n'
+        'model = "checker-model-b"\n'
+        'api_key = "checker-key-b"\n'
+        "\n[swr.primary]\n"
+        'host = "primary.example"\n'
+        'repository = "team/primary"\n'
+        'registry = "platform"\n'
+        'suffix = "_platform"\n'
+        "\n[swr.minddistiller]\n"
+        'host = "mind.example"\n'
+        'repository = "team/mind"\n'
+        'registry = "trajectory"\n'
+        'suffix = ""\n'
+        f'credentials_csv = "{credentials}"\n'
+        "\n[completed_tasks]\n"
+        f'output_dir = "{tmp_path / "successful"}"\n'
+    )
+    monkeypatch.setenv("SWEGEN_CONFIG", str(config))
 
 
 def make_task() -> PipelineTask:
@@ -56,6 +99,21 @@ def process_is_running(pid: int) -> bool:
     except FileNotFoundError:
         return False
     return len(stat_fields) > 2 and stat_fields[2] != "Z"
+
+
+def write_harbor_task(root: Path, task: PipelineTask) -> Path:
+    task_dir = root / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "tests").mkdir()
+    (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\n")
+    (task_dir / "task.toml").write_text("[environment]\nbuild_timeout_sec = 600\n")
+    return task_dir
+
+
+@contextmanager
+def fake_minddistiller_environment(*_args, **_kwargs):
+    yield {"DOCKER_CONFIG": "/private/minddistiller"}
 
 
 def test_build_generate_command_uses_relay_flags_and_workspace_paths(
@@ -142,19 +200,16 @@ def test_generate_environment_selects_stable_token_from_config_pool(monkeypatch)
     assert "GITHUB_TOKEN" not in os.environ
 
 
-def test_generate_environment_preserves_explicit_github_token(monkeypatch) -> None:
+def test_generate_environment_ignores_inherited_github_token(monkeypatch) -> None:
     from swegen.pipeline import actions
 
     monkeypatch.setenv("GITHUB_TOKEN", "explicit-token")
-    monkeypatch.setattr(
-        actions,
-        "load_github_tokens",
-        lambda: pytest.fail("config token pool must not be loaded"),
-    )
+    tokens = ["config-a", "config-b"]
+    monkeypatch.setattr(actions, "load_github_tokens", lambda: tokens)
 
     environment = actions._generate_environment(make_task())
 
-    assert environment["GITHUB_TOKEN"] == "explicit-token"
+    assert environment["GITHUB_TOKEN"] == tokens[make_task().trace_id.int % len(tokens)]
 
 
 def test_proxy_ca_environment_is_injected_into_legacy_task_dockerfile(
@@ -468,6 +523,41 @@ def test_logged_command_spawn_failure_leaves_closed_log(tmp_path: Path) -> None:
     log_path.write_text("closed")
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "docker-compose.yml",
+        "nested/docker-compose.yaml",
+        "compose.yml",
+        "environment/compose.yaml",
+    ],
+)
+def test_validate_action_rejects_docker_compose_before_harbor(
+    tmp_path: Path,
+    monkeypatch,
+    relative_path: str,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    compose_path = tmp_path / "tasks" / task.task_id / relative_path
+    compose_path.parent.mkdir(parents=True, exist_ok=True)
+    compose_path.write_text("services: {}\n")
+    monkeypatch.setattr(
+        actions,
+        "run_harbor_agent",
+        lambda *args, **kwargs: pytest.fail("Harbor must not run for Compose tasks"),
+    )
+
+    execution = actions.validate_action(task, tmp_path)
+
+    assert execution.status is StageResultStatus.REJECTED
+    assert execution.result_json() == {
+        "reason": "docker_compose_not_supported",
+        "compose_files": [relative_path],
+    }
+
+
 def test_validate_action_accepts_exact_nop_zero_and_oracle_one(
     tmp_path: Path,
     monkeypatch,
@@ -690,20 +780,20 @@ def test_reward_action_raises_when_detector_returns_infrastructure_error(
     from swegen.pipeline import actions
 
     task = make_task()
-    task_dir = tmp_path / "tasks" / task.task_id
-    task_dir.mkdir(parents=True)
-    monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")
-    monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
+    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
     monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
 
-    async def fake_check(test_bundle, primary, fallback, task_id, instance_dir):
+    async def fake_check(test_bundle, configs, task_id):
         assert test_bundle == "test bundle"
-        assert primary.endpoint == "https://arcyleung-ubuntu.tailb940e6.ts.net"
-        assert primary.model == "gpt-5.3-codex-spark"
-        assert fallback.model == "gpt-5.6-sol"
-        assert primary.api_key == fallback.api_key == "dedicated-secret"
+        assert [config.endpoint for config in configs] == [
+            "https://checker-a.example",
+            "https://checker-b.example",
+        ]
+        assert [config.model for config in configs] == [
+            "checker-model-a",
+            "checker-model-b",
+        ]
         assert task_id == task.task_id
-        assert instance_dir == task_dir
         verdict = HackCheckResult(
             is_hacking=False,
             reason="unavailable",
@@ -711,61 +801,14 @@ def test_reward_action_raises_when_detector_returns_infrastructure_error(
             raw_response="must-not-be-stored",
             error="network unavailable",
         )
-        return primary, verdict, [(primary, verdict)]
+        return [(configs[0], verdict)]
 
-    monkeypatch.setattr(
-        actions,
-        "check_instance_with_fallback",
-        fake_check,
-        raising=False,
-    )
+    monkeypatch.setattr(actions, "check_instance", fake_check)
 
     with pytest.raises(RuntimeError, match="network unavailable") as raised:
         actions.reward_action(task, tmp_path)
 
-    assert "dedicated-secret" not in str(raised.value)
-
-
-def test_reward_action_requires_dedicated_key_by_default(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from swegen.pipeline import actions
-
-    task = make_task()
-    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
-    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
-    monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
-    monkeypatch.setattr(
-        actions,
-        "check_instance_with_fallback",
-        lambda *args, **kwargs: pytest.fail("checker must not run without an approved key"),
-    )
-
-    with pytest.raises(RuntimeError, match="SWEGEN_REWARD_API_KEY"):
-        actions.reward_action(task, tmp_path)
-
-
-def test_reward_action_allows_provider_key_only_with_explicit_opt_in(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from swegen.pipeline import actions
-
-    task = make_task()
-    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
-    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
-    monkeypatch.setenv("SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK", "true")
-    monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
-
-    async def fake_check(test_bundle, primary, fallback, **kwargs):
-        assert primary.api_key == fallback.api_key == "provider-secret"
-        verdict = HackCheckResult(is_hacking=False, reason="clean")
-        return primary, verdict, [(primary, verdict)]
-
-    monkeypatch.setattr(actions, "check_instance_with_fallback", fake_check)
-
-    assert actions.reward_action(task, tmp_path).status is StageResultStatus.SUCCEEDED
+    assert "checker-key-a" not in str(raised.value)
 
 
 def test_reward_action_rejects_hacking_with_compact_evidence(
@@ -776,39 +819,51 @@ def test_reward_action_rejects_hacking_with_compact_evidence(
 
     task = make_task()
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
-    monkeypatch.setenv("SWEGEN_REWARD_ENDPOINT", "https://reward.example")
-    monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
-    monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
-    monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "secret-key")
     monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
 
-    async def fake_check(test_bundle, primary, fallback, **kwargs):
-        assert primary.endpoint == fallback.endpoint == "https://reward.example"
+    async def fake_check(test_bundle, configs, **kwargs):
         verdict = HackCheckResult(
             is_hacking=True,
             reason="tests inspect source text",
             test_framework="pytest",
-            prompt="raw prompt secret-key",
-            raw_response="raw response secret-key",
+            prompt="raw prompt checker-key-a",
+            raw_response="raw response checker-key-a",
         )
-        return primary, verdict, [(primary, verdict)]
+        clean = HackCheckResult(
+            is_hacking=False,
+            reason="tests execute behavior",
+            test_framework="pytest",
+        )
+        return [(configs[0], verdict), (configs[1], clean)]
 
-    monkeypatch.setattr(actions, "check_instance_with_fallback", fake_check)
+    monkeypatch.setattr(actions, "check_instance", fake_check)
 
     execution = actions.reward_action(task, tmp_path)
 
     assert execution.status is StageResultStatus.REJECTED
     assert execution.result_json() == {
-        "selected_model": "primary-model",
-        "attempted_models": ["primary-model"],
-        "used_fallback": False,
-        "framework": "pytest",
-        "reason": "tests inspect source text",
+        "models": ["checker-model-a", "checker-model-b"],
+        "verdicts": [
+            {
+                "name": "checker-a",
+                "model": "checker-model-a",
+                "is_hacking": True,
+                "framework": "pytest",
+                "reason": "tests inspect source text",
+            },
+            {
+                "name": "checker-b",
+                "model": "checker-model-b",
+                "is_hacking": False,
+                "framework": "pytest",
+                "reason": "tests execute behavior",
+            },
+        ],
     }
-    assert "secret-key" not in repr(execution.result_json())
+    assert "checker-key-a" not in repr(execution.result_json())
 
 
-def test_reward_action_succeeds_with_clean_fallback_verdict(
+def test_reward_action_succeeds_when_all_configured_checkers_are_clean(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -816,41 +871,27 @@ def test_reward_action_succeeds_with_clean_fallback_verdict(
 
     task = make_task()
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
-    monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
-    monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
-    monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")
     monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
 
-    async def fake_check(test_bundle, primary, fallback, **kwargs):
-        primary_error = HackCheckResult(
-            is_hacking=False,
-            reason="primary unavailable",
-            error="retryable",
-            prompt="discarded primary prompt",
-            raw_response="discarded primary response",
-        )
-        clean = HackCheckResult(
-            is_hacking=False,
-            reason="tests execute behavior",
-            test_framework="pytest",
-            prompt="discarded fallback prompt",
-            raw_response="discarded fallback response",
-        )
-        return fallback, clean, [(primary, primary_error), (fallback, clean)]
+    async def fake_check(test_bundle, configs, **kwargs):
+        return [
+            (
+                config,
+                HackCheckResult(
+                    is_hacking=False,
+                    reason="tests execute behavior",
+                    test_framework="pytest",
+                ),
+            )
+            for config in configs
+        ]
 
-    monkeypatch.setattr(actions, "check_instance_with_fallback", fake_check)
+    monkeypatch.setattr(actions, "check_instance", fake_check)
 
     execution = actions.reward_action(task, tmp_path)
 
     assert execution.status is StageResultStatus.SUCCEEDED
-    assert execution.result_json() == {
-        "selected_model": "fallback-model",
-        "attempted_models": ["primary-model", "fallback-model"],
-        "used_fallback": True,
-        "framework": "pytest",
-        "reason": "tests execute behavior",
-    }
-    assert "discarded" not in repr(execution.result_json())
+    assert execution.result_json()["models"] == ["checker-model-a", "checker-model-b"]
 
 
 def test_push_action_skips_build_when_remote_manifest_exists(
@@ -860,11 +901,11 @@ def test_push_action_skips_build_when_remote_manifest_exists(
     from swegen.pipeline import actions
 
     task = make_task()
-    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
-    checked: list[str] = []
+    task_dir = write_harbor_task(tmp_path, task)
+    checked: list[tuple[str, dict[str, str] | None]] = []
 
-    def fake_image_exists(remote_tag):
-        checked.append(remote_tag)
+    def fake_image_exists(remote_tag, *, env=None):
+        checked.append((remote_tag, env))
         return True
 
     monkeypatch.setattr(
@@ -881,23 +922,41 @@ def test_push_action_skips_build_when_remote_manifest_exists(
     )
     removed: list[str] = []
     monkeypatch.setattr(actions, "remove_local_image", removed.append, raising=False)
+    monkeypatch.setattr(
+        actions,
+        "minddistiller_docker_environment",
+        fake_minddistiller_environment,
+    )
+    monkeypatch.setattr(
+        actions,
+        "export_completed_task",
+        lambda *args, **kwargs: type("Export", (), {"directory": task_dir})(),
+    )
 
     execution = actions.push_action(task, tmp_path)
 
-    remote_tag = (
-        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
-        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
-    )
-    assert checked == [remote_tag]
+    primary_tag = "primary.example/team/primary:owner__repo-42"
+    minddistiller_tag = "mind.example/team/mind:owner__repo-42"
+    assert checked == [
+        (primary_tag, None),
+        (minddistiller_tag, {"DOCKER_CONFIG": "/private/minddistiller"}),
+    ]
     assert execution.status is StageResultStatus.SUCCEEDED
-    assert execution.result_json() == {
-        "remote_tag": remote_tag,
-        "registry": "platform",
-        "suffix": "_platform",
-        "skipped": True,
-        "already_present": True,
-    }
-    assert removed == [actions.local_image_tag(task.task_id), remote_tag]
+    assert execution.result_json()["pushed_images"] == [
+        {
+            "remote_tag": primary_tag,
+            "registry": "platform",
+            "suffix": "_platform",
+            "already_present": True,
+        },
+        {
+            "remote_tag": minddistiller_tag,
+            "registry": "trajectory",
+            "suffix": "",
+            "already_present": True,
+        },
+    ]
+    assert removed == [actions.local_image_tag(task.task_id), primary_tag, minddistiller_tag]
 
 
 def test_push_action_builds_pushes_and_removes_local_image(
@@ -907,12 +966,7 @@ def test_push_action_builds_pushes_and_removes_local_image(
     from swegen.pipeline import actions
 
     task = make_task()
-    task_dir = tmp_path / "tasks" / task.task_id
-    (task_dir / "environment").mkdir(parents=True)
-    monkeypatch.setenv("SWEGEN_SWR_HOST", "registry.example")
-    monkeypatch.setenv("SWEGEN_SWR_REPOSITORY", "team/generated")
-    monkeypatch.setenv("SWEGEN_SWR_REGISTRY", "custom")
-    monkeypatch.setenv("SWEGEN_SWR_SUFFIX", "_custom")
+    task_dir = write_harbor_task(tmp_path, task)
     for name in (
         "http_proxy",
         "https_proxy",
@@ -925,41 +979,59 @@ def test_push_action_builds_pushes_and_removes_local_image(
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
     monkeypatch.setenv("NO_PROXY", ".example")
     removed: list[str] = []
-    pushed: list[tuple[str, str]] = []
+    pushed: list[tuple[str, str, dict[str, str] | None]] = []
 
-    monkeypatch.setattr(actions, "image_exists_in_registry", lambda remote_tag: False)
+    monkeypatch.setattr(
+        actions,
+        "image_exists_in_registry",
+        lambda remote_tag, **kwargs: False,
+    )
     monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+    monkeypatch.setattr(
+        actions,
+        "minddistiller_docker_environment",
+        fake_minddistiller_environment,
+    )
 
     def fake_build(instance, directory, proxy_env, log):
         assert instance == task.task_id
-        assert directory == task_dir
+        assert directory != task_dir
+        assert (directory / "environment" / "Dockerfile").read_text() == "FROM ubuntu:24.04\n"
         assert proxy_env == {
             "HTTPS_PROXY": "http://proxy.example:8080",
             "NO_PROXY": ".example",
         }
         return "local-source:latest"
 
-    def fake_push(local_tag, remote_tag, log):
-        pushed.append((local_tag, remote_tag))
+    def fake_push(local_tag, remote_tag, log, *, env=None):
+        pushed.append((local_tag, remote_tag, env))
         return True
 
     monkeypatch.setattr(actions, "build_image_direct", fake_build)
     monkeypatch.setattr(actions, "push_to_registry", fake_push)
     monkeypatch.setattr(actions, "remove_local_image", removed.append)
+    monkeypatch.setattr(
+        actions,
+        "export_completed_task",
+        lambda *args, **kwargs: type("Export", (), {"directory": task_dir})(),
+    )
 
     execution = actions.push_action(task, tmp_path)
 
-    remote_tag = "registry.example/team/generated:owner__repo-42"
-    assert pushed == [("local-source:latest", remote_tag)]
-    assert removed == ["local-source:latest", remote_tag]
+    primary_tag = "primary.example/team/primary:owner__repo-42"
+    minddistiller_tag = "mind.example/team/mind:owner__repo-42"
+    assert pushed == [
+        ("local-source:latest", primary_tag, None),
+        (
+            "local-source:latest",
+            minddistiller_tag,
+            {"DOCKER_CONFIG": "/private/minddistiller"},
+        ),
+    ]
+    assert removed == ["local-source:latest", primary_tag, minddistiller_tag]
     assert execution.status is StageResultStatus.SUCCEEDED
-    assert execution.result_json() == {
-        "remote_tag": remote_tag,
-        "registry": "custom",
-        "suffix": "_custom",
-        "skipped": False,
-        "already_present": False,
-    }
+    assert execution.result_json()["remote_tag"] == primary_tag
+    assert (task_dir / "environment" / "Dockerfile").read_text() == "FROM ubuntu:24.04\n"
 
 
 def test_push_action_removes_local_image_when_push_fails(
@@ -969,10 +1041,19 @@ def test_push_action_removes_local_image_when_push_fails(
     from swegen.pipeline import actions
 
     task = make_task()
-    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
+    write_harbor_task(tmp_path, task)
     removed: list[str] = []
-    monkeypatch.setattr(actions, "image_exists_in_registry", lambda remote_tag: False)
+    monkeypatch.setattr(
+        actions,
+        "image_exists_in_registry",
+        lambda remote_tag, **kwargs: False,
+    )
     monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+    monkeypatch.setattr(
+        actions,
+        "minddistiller_docker_environment",
+        fake_minddistiller_environment,
+    )
     monkeypatch.setattr(
         actions,
         "build_image_direct",
@@ -981,14 +1062,14 @@ def test_push_action_removes_local_image_when_push_fails(
     monkeypatch.setattr(actions, "push_to_registry", lambda *args, **kwargs: False)
     monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
-    with pytest.raises(RuntimeError, match="image push failed"):
+    with pytest.raises(RuntimeError, match="primary SWR image push failed"):
         actions.push_action(task, tmp_path)
 
-    remote_tag = (
-        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
-        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
-    )
-    assert removed == ["local-source:latest", remote_tag]
+    assert removed == [
+        "local-source:latest",
+        "primary.example/team/primary:owner__repo-42",
+        "mind.example/team/mind:owner__repo-42",
+    ]
 
 
 def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
@@ -998,10 +1079,19 @@ def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
     from swegen.pipeline import actions
 
     task = make_task()
-    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
+    write_harbor_task(tmp_path, task)
     removed: list[str] = []
-    monkeypatch.setattr(actions, "image_exists_in_registry", lambda remote_tag: False)
+    monkeypatch.setattr(
+        actions,
+        "image_exists_in_registry",
+        lambda remote_tag, **kwargs: False,
+    )
     monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+    monkeypatch.setattr(
+        actions,
+        "minddistiller_docker_environment",
+        fake_minddistiller_environment,
+    )
     monkeypatch.setattr(
         actions,
         "build_image_direct",
@@ -1012,11 +1102,11 @@ def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
     with pytest.raises(RuntimeError, match="build crashed"):
         actions.push_action(task, tmp_path)
 
-    remote_tag = (
-        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
-        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
-    )
-    assert removed == ["local-source:latest", remote_tag]
+    assert removed == [
+        "local-source:latest",
+        "primary.example/team/primary:owner__repo-42",
+        "mind.example/team/mind:owner__repo-42",
+    ]
 
 
 def test_action_for_stage_maps_all_pipeline_stages_and_rejects_unknown() -> None:

@@ -775,10 +775,13 @@ def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one configured stage worker via ``python -m``."""
 
+    from swegen.model_settings import configure_current_process
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", required=True, type=_parse_stage)
     arguments = parser.parse_args(argv)
 
+    configure_current_process(f"pipeline-{arguments.stage.value}")
     worker = _build_runtime_worker(arguments.stage)
     signal.signal(signal.SIGTERM, worker.request_stop)
     signal.signal(signal.SIGINT, worker.request_stop)

@@ -15,6 +15,8 @@ from swegen.pipeline.models import PipelineTask
 from swegen.queueing.models import PipelineStage, QueueMessage, QueueMetrics, QueueName
 from swegen.queueing.pgmq import ConnectionLike, PgmqQueue
 
+ENQUEUE_ADVISORY_LOCK_KEYS = (0x53574547, 2)  # "SWEG", enqueue generation 2
+
 _INSERT_TASK_SQL = """
     INSERT INTO pipeline_tasks (
         task_id, task_version, repo, pr, trace_id, state, current_stage,
@@ -157,6 +159,10 @@ def enqueue_pipeline_task(
     queue_adapter = queue or PgmqQueue()
 
     with connection.transaction():
+        connection.execute(
+            "SELECT pg_advisory_xact_lock(%s, %s)",
+            ENQUEUE_ADVISORY_LOCK_KEYS,
+        )
         inserted = connection.execute(
             _INSERT_TASK_SQL,
             (

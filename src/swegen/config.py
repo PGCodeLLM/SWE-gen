@@ -63,63 +63,6 @@ class CreateConfig:
 
 
 @dataclass(frozen=True)
-class FarmConfig:
-    """Configuration for the farm command (continuous PR processing).
-
-    The farm command uses a language-agnostic pipeline that works
-    for any repository. Claude Code analyzes the repo to detect language, runtime,
-    build system, and test framework automatically.
-
-    Attributes:
-        repo: GitHub repository in "owner/repo" format
-        output: Output directory for generated tasks (default: tasks/)
-        state_dir: Directory for local state/logs/jobs
-        repo_cache_dir: Directory for shared git repository cache
-        force: Regenerate even if task already exists
-        timeout: Timeout per PR in seconds
-        cc_timeout: Timeout for Claude Code session in seconds
-        api_delay: Delay between GitHub API calls in seconds
-        task_delay: Delay between tasks in seconds
-        reset: Reset state and start from beginning
-        resume_from: Resume from date (ISO format or YYYY-MM-DD)
-        dry_run: Only show what would run (no task generation)
-        docker_prune_batch: Run docker cleanup after every N PRs (0 to disable)
-        skip_list: Path to file with task IDs to skip
-        no_cache: Disable reusing successful Dockerfiles as hints
-        require_minimum_difficulty: Require 3+ source files for task
-        min_source_files: Minimum number of source files required (default: 3)
-        max_source_files: Maximum number of source files allowed to avoid large refactors (default: 10)
-        environment: Environment type for Harbor runs (docker, daytona, e2b, modal, runloop, gke)
-        verbose: Enable verbose output
-        require_issue: Require PR to have a linked issue (higher quality instructions)
-        validate: Run Harbor validation after CC (useful when CC times out but task may be valid)
-    """
-
-    repo: str
-    output: Path = field(default_factory=lambda: Path("tasks"))
-    state_dir: Path = field(default_factory=lambda: Path(".swegen"))
-    repo_cache_dir: Path = field(default_factory=lambda: Path("data_cache/repos"))
-    force: bool = True
-    timeout: int = 300
-    cc_timeout: int = 900
-    api_delay: float = 0.5
-    task_delay: int = 60
-    reset: bool = False
-    resume_from: str | None = None
-    dry_run: bool = False
-    docker_prune_batch: int = 5
-    skip_list: str | None = None
-    no_cache: bool = False
-    require_minimum_difficulty: bool = True
-    min_source_files: int = 3
-    max_source_files: int = 10
-    environment: EnvironmentType = EnvironmentType.DOCKER
-    verbose: bool = False
-    require_issue: bool = True
-    validate: bool = True
-
-
-@dataclass(frozen=True)
 class ValidateConfig:
     """Configuration for the validate command.
 

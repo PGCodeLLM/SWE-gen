@@ -14,6 +14,11 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
+from swegen.model_settings import (
+    configure_current_process,
+    load_analysis_settings,
+    load_openai_settings,
+)
 from swegen.tools.harbor_runner import (
     harbor_cmd_base,
     parse_harbor_outcome,
@@ -139,6 +144,12 @@ class AnalyzeArgs:
 
 def run_analyze(args: AnalyzeArgs) -> AnalysisResult:
     """Main entry point for task analysis."""
+    configure_current_process("swegen-analyze")
+    analysis_settings = load_analysis_settings()
+    openai_settings = load_openai_settings()
+    args.model = analysis_settings.agent_model
+    args.analysis_model = analysis_settings.classifier_model
+    args.verdict_model = openai_settings.verdict_model
     console = Console()
 
     # Resolve task path

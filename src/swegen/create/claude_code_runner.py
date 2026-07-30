@@ -845,22 +845,17 @@ async def _run_claude_code_session_async(
             print(f"[SDK] Task dir: {task_dir}", flush=True)
             print("-" * 60, flush=True)
 
-        # Resolve model + endpoint: env var > swegen.toml > default.
+        # Model routing and credentials come exclusively from swegen.toml.
         model_settings = load_model_settings()
-        # The SDK CLI subprocess inherits this process's env, so set the base URL
-        # there when it's configured but not already pinned in the environment
-        # (env stays authoritative).
-        if model_settings.base_url and "ANTHROPIC_BASE_URL" not in os.environ:
-            os.environ["ANTHROPIC_BASE_URL"] = model_settings.base_url
         logger.info(
             "Using model %s (endpoint: %s)",
             model_settings.model,
-            os.environ.get("ANTHROPIC_BASE_URL") or "default",
+            model_settings.base_url or "default",
         )
         if verbose:
             print(
                 f"[SDK] Model: {model_settings.model} | "
-                f"Endpoint: {os.environ.get('ANTHROPIC_BASE_URL') or 'default'}",
+                f"Endpoint: {model_settings.base_url or 'default'}",
                 flush=True,
             )
 
@@ -906,14 +901,7 @@ async def _run_claude_code_session_async(
                 }
             )
 
-        requested_effort = os.environ.get("SWEGEN_AGENT_REASONING_EFFORT", "high").strip().lower()
-        supported_efforts = {"low", "medium", "high", "xhigh", "max"}
-        if requested_effort not in supported_efforts:
-            logger.warning(
-                "Unsupported SWEGEN_AGENT_REASONING_EFFORT=%r; using high",
-                requested_effort,
-            )
-            requested_effort = "high"
+        requested_effort = model_settings.reasoning_effort
 
         if verbose:
             print(

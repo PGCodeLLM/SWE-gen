@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
+import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from math import isfinite
@@ -24,10 +29,16 @@ from push_all_verified import (
 from reward_hacking_detector.hacking import (
     LLMConfig,
     build_test_bundle,
-    check_instance_with_fallback,
+    check_instance,
 )
 from swegen.create.claude_code_utils import redact_sensitive_text
-from swegen.model_settings import load_github_tokens
+from swegen.model_settings import (
+    configured_subprocess_env,
+    load_github_tokens,
+    load_hacking_settings,
+    load_swr_target,
+)
+from swegen.pipeline.completion import export_completed_task, load_minddistiller_login
 from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
@@ -43,13 +54,6 @@ MAX_COMMAND_LOG_BYTES = 1024 * 1024
 DEFAULT_CC_TIMEOUT_SECONDS = 10800
 DEFAULT_GENERATE_TIMEOUT_SECONDS = 14400.0
 DEFAULT_HARBOR_TIMEOUT_SECONDS = 3600.0
-DEFAULT_REWARD_ENDPOINT = "https://arcyleung-ubuntu.tailb940e6.ts.net"
-DEFAULT_REWARD_PRIMARY_MODEL = "gpt-5.3-codex-spark"
-DEFAULT_REWARD_FALLBACK_MODEL = "gpt-5.6-sol"
-DEFAULT_SWR_HOST = "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com"
-DEFAULT_SWR_REPOSITORY = "swesandbox/public/swe-gen/feature-implementation/generated"
-DEFAULT_SWR_REGISTRY = "platform"
-DEFAULT_SWR_SUFFIX = "_platform"
 _PROXY_ENVIRONMENT_NAMES = (
     "http_proxy",
     "https_proxy",
@@ -207,15 +211,27 @@ def build_generate_command(task: PipelineTask, workspace: Path) -> list[str]:
 
 
 def _generate_environment(task: PipelineTask) -> dict[str, str]:
-    """Return a subprocess environment with a stable legacy GitHub token."""
+    """Return TOML-controlled subprocess settings with a stable GitHub token."""
 
-    environment = dict(os.environ)
-    if environment.get("GITHUB_TOKEN", "").strip():
-        return environment
+    environment = configured_subprocess_env(task.task_id)
     tokens = load_github_tokens()
     if tokens:
         environment["GITHUB_TOKEN"] = tokens[task.trace_id.int % len(tokens)]
+    else:
+        environment.pop("GITHUB_TOKEN", None)
     return environment
+
+
+def find_docker_compose_files(task_dir: Path) -> tuple[str, ...]:
+    """Return Docker Compose YAMLs that make a generated task unsuitable."""
+
+    compose_names = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+    matches = [
+        path.relative_to(task_dir).as_posix()
+        for path in task_dir.rglob("*")
+        if path.is_file() and path.name.lower() in compose_names
+    ]
+    return tuple(sorted(matches))
 
 
 def _ensure_proxy_ca_runtime_environment(task_dir: Path) -> bool:
@@ -338,7 +354,17 @@ def validate_action(
 ) -> StageExecution:
     """Require Harbor's NOP baseline to fail and Oracle solution to pass."""
 
-    _ensure_proxy_ca_runtime_environment(workspace / "tasks" / task.task_id)
+    task_dir = workspace / "tasks" / task.task_id
+    compose_files = find_docker_compose_files(task_dir)
+    if compose_files:
+        return StageExecution.rejected(
+            {
+                "reason": "docker_compose_not_supported",
+                "compose_files": list(compose_files),
+            }
+        )
+
+    _ensure_proxy_ca_runtime_environment(task_dir)
     local_tag = local_image_tag(task.task_id)
     try:
         nop_reward = _validation_reward(
@@ -384,113 +410,162 @@ def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
     test_bundle = build_test_bundle(task_dir)
     if not test_bundle.strip():
         raise RuntimeError("reward test bundle is empty or unreadable")
-    api_key = os.environ.get("SWEGEN_REWARD_API_KEY", "").strip()
-    if not api_key and _environment_boolean("SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK"):
-        api_key = (
-            os.environ.get("OPENAI_API_KEY", "").strip()
-            or os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        )
-    if not api_key:
-        raise RuntimeError(
-            "SWEGEN_REWARD_API_KEY is required; provider-key fallback requires "
-            "SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK=true"
-        )
-    endpoint = _environment_value("SWEGEN_REWARD_ENDPOINT", DEFAULT_REWARD_ENDPOINT)
-    primary = LLMConfig(
-        name="primary",
-        endpoint=endpoint,
-        model=_environment_value(
-            "SWEGEN_REWARD_PRIMARY_MODEL",
-            DEFAULT_REWARD_PRIMARY_MODEL,
-        ),
-        api_key=api_key,
-    )
-    fallback = LLMConfig(
-        name="fallback",
-        endpoint=endpoint,
-        model=_environment_value(
-            "SWEGEN_REWARD_FALLBACK_MODEL",
-            DEFAULT_REWARD_FALLBACK_MODEL,
-        ),
-        api_key=api_key,
-    )
-    selected, verdict, attempts = asyncio.run(
-        check_instance_with_fallback(
-            test_bundle,
-            primary,
-            fallback,
-            task_id=task.task_id,
-            instance_dir=task_dir,
-        )
-    )
-    if verdict.error:
+    configs = [
+        LLMConfig(item.name, item.endpoint, item.model, item.api_key)
+        for item in load_hacking_settings()
+    ]
+    attempts = asyncio.run(check_instance(test_bundle, configs, task_id=task.task_id))
+    failures = [(config, verdict) for config, verdict in attempts if verdict.error is not None]
+    if failures:
+        config, verdict = failures[0]
         raise RuntimeError(
             "reward-hacking checker infrastructure error "
-            f"(model={_compact_safe_text(selected.model, 200)}): "
+            f"(model={_compact_safe_text(config.model, 200)}): "
             f"{_compact_safe_text(verdict.error, 500)}"
         )
     evidence = {
-        "selected_model": _compact_text(selected.model, 200),
-        "attempted_models": [_compact_text(config.model, 200) for config, _result in attempts],
-        "used_fallback": selected.model == fallback.model and selected.model != primary.model,
-        "framework": _compact_text(verdict.test_framework, 200),
-        "reason": _compact_text(verdict.reason),
+        "models": [_compact_text(config.model, 200) for config, _verdict in attempts],
+        "verdicts": [
+            {
+                "name": _compact_text(config.name, 200),
+                "model": _compact_text(config.model, 200),
+                "is_hacking": verdict.is_hacking,
+                "framework": _compact_text(verdict.test_framework, 200),
+                "reason": _compact_text(verdict.reason),
+            }
+            for config, verdict in attempts
+        ],
     }
-    if verdict.is_hacking:
+    if any(verdict.is_hacking for _config, verdict in attempts):
         return StageExecution.rejected(evidence)
     return StageExecution.succeeded(evidence)
 
 
-def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
-    """Build and publish a task image to the configured SWR target."""
+@contextmanager
+def minddistiller_docker_environment(credentials_csv: Path, host: str):
+    username, password = load_minddistiller_login(credentials_csv, expected_host=host)
+    with tempfile.TemporaryDirectory(prefix="swegen-minddistiller-docker-") as temporary:
+        config_dir = Path(temporary)
+        source_dir = Path(os.environ.get("DOCKER_CONFIG", "/root/.docker"))
+        source_config = source_dir / "config.json"
+        if source_config.is_file():
+            try:
+                config = json.loads(source_config.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise RuntimeError(f"could not read Docker config: {error}") from error
+        else:
+            config = {}
+        if not isinstance(config, dict):
+            raise RuntimeError("Docker config must contain a JSON object")
+        auth = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+        auths = config.setdefault("auths", {})
+        if not isinstance(auths, dict):
+            raise RuntimeError("Docker config auths must contain an object")
+        auths[host] = {"auth": auth}
+        config_path = config_dir / "config.json"
+        config_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+        config_path.chmod(0o600)
+        environment = dict(os.environ)
+        environment["DOCKER_CONFIG"] = str(config_dir)
+        yield environment
 
-    host = _environment_value("SWEGEN_SWR_HOST", DEFAULT_SWR_HOST).strip("/")
-    repository = _environment_value(
-        "SWEGEN_SWR_REPOSITORY",
-        DEFAULT_SWR_REPOSITORY,
-    ).strip("/")
-    registry = _environment_value("SWEGEN_SWR_REGISTRY", DEFAULT_SWR_REGISTRY)
-    suffix = _environment_value("SWEGEN_SWR_SUFFIX", DEFAULT_SWR_SUFFIX)
-    remote_tag = f"{host}/{repository}:{task.task_id}"
-    expected_local_tag = local_image_tag(task.task_id)
-    cleanup_tags = [expected_local_tag, remote_tag]
-    try:
-        if image_exists_in_registry(remote_tag):
-            return StageExecution.succeeded(
-                {
-                    "remote_tag": remote_tag,
-                    "registry": registry,
-                    "suffix": suffix,
-                    "skipped": True,
-                    "already_present": True,
-                }
-            )
-        task_dir = workspace / "tasks" / task.task_id
-        if not task_dir.is_dir():
-            raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
-        _ensure_proxy_ca_runtime_environment(task_dir)
-        proxy_environment = {
-            name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
-        }
-        built_tag = build_image_direct(
-            task.task_id,
-            task_dir,
-            proxy_env=proxy_environment,
-            log=LOGGER.info,
+
+def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
+    """Build once, push to both SWRs, export the task, and persist completion data."""
+
+    primary = load_swr_target("primary")
+    minddistiller = load_swr_target("minddistiller")
+    if minddistiller.credentials_csv is None:
+        raise RuntimeError("[swr.minddistiller].credentials_csv is required")
+    primary_tag = primary.image_reference(task.task_id)
+    minddistiller_tag = minddistiller.image_reference(task.task_id)
+    if primary_tag == minddistiller_tag:
+        raise RuntimeError("primary and MindDistiller SWR targets must be different")
+    if (primary.registry, primary.suffix) == (
+        minddistiller.registry,
+        minddistiller.suffix,
+    ):
+        raise RuntimeError(
+            "primary and MindDistiller pushed_images registry/suffix values must be different"
         )
-        if not isinstance(built_tag, str) or not built_tag.strip():
-            raise RuntimeError(f"image build failed for {task.task_id}")
-        if built_tag not in cleanup_tags:
-            cleanup_tags.insert(1, built_tag)
-        if not push_to_registry(built_tag, remote_tag, log=LOGGER.info):
-            raise RuntimeError(f"image push failed for {task.task_id}")
+    expected_local_tag = local_image_tag(task.task_id)
+    cleanup_tags = [expected_local_tag, primary_tag, minddistiller_tag]
+    try:
+        with minddistiller_docker_environment(
+            minddistiller.credentials_csv,
+            minddistiller.host,
+        ) as minddistiller_env:
+            primary_exists = image_exists_in_registry(primary_tag)
+            minddistiller_exists = image_exists_in_registry(
+                minddistiller_tag,
+                env=minddistiller_env,
+            )
+            task_dir = workspace / "tasks" / task.task_id
+            if not task_dir.is_dir():
+                raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+            if not primary_exists or not minddistiller_exists:
+                proxy_environment = {
+                    name: value
+                    for name in _PROXY_ENVIRONMENT_NAMES
+                    if (value := os.environ.get(name, ""))
+                }
+                with tempfile.TemporaryDirectory(
+                    prefix=f"push-build-{task.task_id}-",
+                    dir=workspace,
+                ) as build_directory:
+                    build_task_dir = Path(build_directory) / task.task_id
+                    shutil.copytree(task_dir, build_task_dir)
+                    _ensure_proxy_ca_runtime_environment(build_task_dir)
+                    built_tag = build_image_direct(
+                        task.task_id,
+                        build_task_dir,
+                        proxy_env=proxy_environment,
+                        log=LOGGER.info,
+                    )
+                if not isinstance(built_tag, str) or not built_tag.strip():
+                    raise RuntimeError(f"image build failed for {task.task_id}")
+                if built_tag not in cleanup_tags:
+                    cleanup_tags.insert(1, built_tag)
+                if not primary_exists and not push_to_registry(
+                    built_tag,
+                    primary_tag,
+                    log=LOGGER.info,
+                ):
+                    raise RuntimeError(f"primary SWR image push failed for {task.task_id}")
+                if not minddistiller_exists and not push_to_registry(
+                    built_tag,
+                    minddistiller_tag,
+                    log=LOGGER.info,
+                    env=minddistiller_env,
+                ):
+                    raise RuntimeError(f"MindDistiller SWR image push failed for {task.task_id}")
+
+            export = export_completed_task(
+                task,
+                task_dir,
+                voyager_image_ref=primary_tag,
+                minddistiller_image_ref=minddistiller_tag,
+            )
         return StageExecution.succeeded(
             {
-                "remote_tag": remote_tag,
-                "registry": registry,
-                "suffix": suffix,
-                "skipped": False,
-                "already_present": False,
+                "remote_tag": primary_tag,
+                "registry": primary.registry,
+                "suffix": primary.suffix,
+                "pushed_images": [
+                    {
+                        "remote_tag": primary_tag,
+                        "registry": primary.registry,
+                        "suffix": primary.suffix,
+                        "already_present": primary_exists,
+                    },
+                    {
+                        "remote_tag": minddistiller_tag,
+                        "registry": minddistiller.registry,
+                        "suffix": minddistiller.suffix,
+                        "already_present": minddistiller_exists,
+                    },
+                ],
+                "harbor_directory": str(export.directory),
             }
         )
     finally:
@@ -533,7 +608,9 @@ def action_for_stage(
 __all__ = [
     "action_for_stage",
     "build_generate_command",
+    "find_docker_compose_files",
     "generate_action",
+    "minddistiller_docker_environment",
     "push_action",
     "reward_action",
     "validate_action",

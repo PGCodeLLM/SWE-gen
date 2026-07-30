@@ -866,6 +866,50 @@ def _push_inventory_fields(result: Mapping[str, object]) -> tuple[str, str | Non
     return remote_tag.strip(), registry.strip() if isinstance(registry, str) else None, suffix
 
 
+def _push_inventory_rows(
+    result: Mapping[str, object],
+) -> tuple[tuple[str, str | None, str], ...]:
+    """Validate all registry inventories in a successful push result.
+
+    Older producers supplied only the top-level ``remote_tag`` fields.  New
+    dual-SWR producers additionally supply ``pushed_images`` while retaining
+    those top-level fields for compatibility.  When both forms are present,
+    the top-level fields must describe the first (primary) inventory.
+    """
+
+    primary = _push_inventory_fields(result)
+    raw_inventories = result.get("pushed_images")
+    if raw_inventories is None:
+        return (primary,)
+    if not isinstance(raw_inventories, list) or not raw_inventories:
+        raise TaskStoreError("push result pushed_images must be a non-empty list")
+
+    inventories: list[tuple[str, str | None, str]] = []
+    remote_tags: set[str] = set()
+    registry_variants: set[tuple[str | None, str]] = set()
+    for index, raw_inventory in enumerate(raw_inventories, 1):
+        if not isinstance(raw_inventory, Mapping):
+            raise TaskStoreError(f"push result pushed_images entry #{index} must be an object")
+        inventory = _push_inventory_fields(raw_inventory)
+        remote_tag, registry, suffix = inventory
+        if remote_tag in remote_tags:
+            raise TaskStoreError("push result contains duplicate pushed_images remote_tag values")
+        variant = (registry, suffix)
+        if variant in registry_variants:
+            raise TaskStoreError(
+                "push result contains duplicate pushed_images registry/suffix values"
+            )
+        remote_tags.add(remote_tag)
+        registry_variants.add(variant)
+        inventories.append(inventory)
+
+    if inventories[0] != primary:
+        raise TaskStoreError(
+            "push result top-level inventory must match the first pushed_images entry"
+        )
+    return tuple(inventories)
+
+
 class TaskStore:
     """Store pipeline tasks using a connection and transaction owned by the caller."""
 
@@ -1059,9 +1103,9 @@ class TaskStore:
             raise TaskFileError("only successful generate results may contain task files")
 
         result = _redact_json_object(execution.result_json())
-        push_fields: tuple[str, str | None, str] | None = None
+        push_inventories: tuple[tuple[str, str | None, str], ...] = ()
         if message.stage is PipelineStage.PUSH and execution.status is StageResultStatus.SUCCEEDED:
-            push_fields = _push_inventory_fields(result)
+            push_inventories = _push_inventory_rows(result)
 
         error: str | None = None
         if execution.status is StageResultStatus.REJECTED:
@@ -1148,8 +1192,7 @@ class TaskStore:
                 "stage completion must update exactly one task matching its identity and stage"
             )
 
-        if push_fields is not None:
-            remote_tag, registry, suffix = push_fields
+        for remote_tag, registry, suffix in push_inventories:
             connection.execute(
                 _INSERT_PUSHED_IMAGE_SQL,
                 (

@@ -825,9 +825,8 @@ def test_bundle_reuse_mode_does_not_replace_remote_model_profiles(tmp_path, monk
         bundle.unlink(missing_ok=True)
 
 
-def test_slurm_worker_uses_authenticated_quota_and_isolated_docker_configs() -> None:
+def test_legacy_slurm_worker_uses_authenticated_quota_and_isolated_docker_configs() -> None:
     worker = Path("src/slurm_node_worker.sh").read_text()
-    launcher = Path("run_orchestrator.sh").read_text()
 
     assert "https://api.github.com/rate_limit" in worker
     assert "github_remaining" in worker
@@ -836,8 +835,6 @@ def test_slurm_worker_uses_authenticated_quota_and_isolated_docker_configs() -> 
     assert "docker_build_proxy=ok" in worker
     assert "timeout --kill-after=5s 15s docker image rm" in worker
     assert "bash curl docker git jq timeout" in worker
-    assert "env.HTTP_PROXY" in launcher
-    assert 'export DOCKER_CONFIG="$SWEGEN_DOCKER_CONFIG_DIR"' in launcher
     assert "umask 0077" in worker
     assert "groups_per_route=3" in worker
     assert "group_index < groups_per_route" in worker

@@ -1,37 +1,71 @@
-# swegen.toml — optional configuration for the Claude Code task-generation runner.
+# SWE-gen runtime configuration.
 #
-# Copy this file to `swegen.toml` in the directory you run swegen from (or point
-# the SWEGEN_CONFIG env var at it) to pick the model and inference endpoint used
-# by the create/farm pipeline.
-#
-# Precedence (highest first):
-#   1. Environment variables  (ANTHROPIC_MODEL, ANTHROPIC_BASE_URL)
-#   2. This file
-#   3. Built-in defaults
-#
-# Every key is optional; omit a key to fall back to the next source.
+# Copy this file to swegen.toml and replace every placeholder.  For model
+# endpoints, model names, and API credentials, this file is authoritative:
+# inherited environment variables and CLI model/key overrides are ignored.
 
 [model]
-# Model name passed to the Claude Code SDK.
-# Overridden by the ANTHROPIC_MODEL env var if set.
+# Claude Agent SDK / Claude Code-compatible endpoint used for task generation.
 model = "qwen3.5-397b-a17b-alex-swe-gen"
+base_url = "https://model-endpoint.example"
+api_key = "replace-me"
+fast_model = "gpt-5.3-codex-spark"
+opus_model = "qwen3.5-397b-a17b-alex-swe-gen"
+sonnet_model = "qwen3.5-397b-a17b-alex-swe-gen"
+reasoning_effort = "high"
 
-# Inference endpoint (sets ANTHROPIC_BASE_URL for the SDK subprocess).
-# Overridden by the ANTHROPIC_BASE_URL env var if set.
-# Leave commented out to use the SDK/CLI default endpoint.
-# base_url = "https://my-inference-endpoint/v1"
+[openai]
+# OpenAI-compatible endpoint used for task instructions and analysis verdicts.
+base_url = "https://openai-compatible-endpoint.example/v1"
+api_key = "replace-me"
+task_instruction_model = "gpt-5.6-terra"
+verdict_model = "gpt-5.6-terra"
+
+[analysis]
+# Harbor agent trials and Claude-based trial classification.
+agent_model = "anthropic/claude-sonnet-4-5"
+classifier_model = "claude-sonnet-4-5"
 
 [github]
-# GitHub token used by the orchestrator to look up linked issue numbers for
-# task metadata. Precedence: --github-token flag > GITHUB_TOKEN env var > this.
-# token = "ghp_..."
+# A token is selected from this pool for each process/task.
+gh_tokens = [
+  "ghp_replace_me",
+]
 
-# Pool of GitHub tokens the orchestrator rotates between for cloning and API
-# lookups. A token is chosen at random per task; on a rate-limit/forbidden
-# error (HTTP 429/403) the run is retried with a different token from the pool.
-# Takes precedence over `token` when set. An explicit --github-token flag or a
-# GITHUB_TOKEN env var overrides the pool entirely.
-# gh_tokens = [
-#     "ghp_...",
-#     "ghp_...",
-# ]
+[[hacking.llm]]
+name = "primary"
+endpoint = "https://reward-checker.example"
+model = "gpt-5.6-sol"
+api_key = "replace-me"
+
+[autoqueue]
+source_table = "public.pr_tasks"
+# An explicit max_queued has priority over the per-worker calculation.
+# max_queued = 100
+max_queued_per_generate_worker = 1.5
+generate_workers = 48
+poll_seconds = 30.0
+task_version = 1
+max_retries = 3
+require_obs = true
+pr_categories = ["feature"]
+exclude_languages = []
+
+[swr.primary]
+host = "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com"
+repository = "swesandbox/public/swe-gen/feature-implementation/generated"
+registry = "platform"
+suffix = "_platform"
+
+[swr.minddistiller]
+host = "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"
+repository = "aifm.coder.exp/swegen/generated"
+registry = "trajectory"
+suffix = ""
+# Relative paths are resolved from the directory containing swegen.toml.
+# In K3s, use /etc/swegen/minddistiller_swr.csv instead.
+credentials_csv = "swr_credentials/minddistiller_swr.csv"
+
+[completed_tasks]
+# In K3s, use /app/data_cache/successful_harbor_tasks.
+output_dir = "data_cache/successful_harbor_tasks"

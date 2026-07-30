@@ -270,14 +270,15 @@ def test_pipeline_schema_has_named_tables_and_idempotent_stage_key() -> None:
     assert "CREATE TABLE IF NOT EXISTS pipeline_task_files" in sql
     assert "CREATE TABLE IF NOT EXISTS pipeline_stage_results" in sql
     assert "CREATE TABLE IF NOT EXISTS pipeline_stage_activity" in sql
+    assert "CREATE TABLE IF NOT EXISTS completed_tasks" in sql
     assert "CONSTRAINT pk_pipeline_tasks PRIMARY KEY (task_id, task_version)" in sql
     assert (
         "CONSTRAINT pk_pipeline_stage_results PRIMARY KEY (task_id, task_version, stage, attempt)"
     ) in sql
-    assert (
-        "CONSTRAINT pk_pipeline_stage_activity PRIMARY KEY (task_id, task_version, stage)"
-        in sql
-    )
+    assert "CONSTRAINT pk_pipeline_stage_activity PRIMARY KEY (task_id, task_version, stage)" in sql
+    assert "instance_id TEXT PRIMARY KEY" in sql
+    assert "config_toml_minddistiller TEXT" in sql
+    assert "config_toml_voyager TEXT" in sql
 
 
 def test_pipeline_schema_has_named_identity_and_file_constraints() -> None:

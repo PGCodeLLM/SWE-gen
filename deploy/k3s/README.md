@@ -6,7 +6,7 @@ the information needed to expand, rebuild, or migrate it later.
 The pipeline is:
 
 ```text
-PGMQ swegen_generate -> Generate -> PGMQ swegen_validate -> NOP/Oracle
+Autoqueue -> PGMQ swegen_generate -> Generate -> PGMQ swegen_validate -> NOP/Oracle
   -> PGMQ swegen_reward -> reward-hack check -> PGMQ swegen_push -> SWR
 ```
 
@@ -313,7 +313,7 @@ git switch swegen-k3s
 uv sync --frozen
 ```
 
-Choose one immutable worker tag for a clean deployment and set all four
+Choose one immutable worker tag for a clean deployment and set all five
 Deployments in `swegen-pipeline.yaml` to that tag. The production manifest can
 temporarily contain different debugging tags; a rebuild should converge them.
 
@@ -339,12 +339,11 @@ become schedulable later.
 
 The helper requires these root-readable source files:
 
-- model credentials for Generate;
-- reward-checker credentials;
-- `swegen.toml`;
+- `swegen.toml`, containing all model endpoints, model names, and API keys;
 - the combined proxy CA bundle;
 - an HTTP/HTTPS proxy environment file;
-- Docker `config.json` containing registry credentials.
+- Docker `config.json` containing the primary wce1sr registry credentials;
+- `swr_credentials/minddistiller_swr.csv` for the second SWR.
 
 Run it without printing secrets:
 
@@ -352,6 +351,7 @@ Run it without printing secrets:
 SWEGEN_SECRET_ROOT='/secure/swegen-secrets' \
 SWEGEN_PROXY_ENV='/secure/swegen-secrets/proxy.env' \
 SWEGEN_DOCKER_CONFIG='/root/.docker/config.json' \
+SWEGEN_MINDDISTILLER_SWR_CSV='/secure/swegen-secrets/minddistiller_swr.csv' \
   ./deploy/k3s/create-secrets.sh
 ```
 
@@ -367,12 +367,19 @@ Review `deploy/k3s/swegen-pipeline.yaml` before applying it:
 1. Set the PostgreSQL host, port, user, and database.
 2. Update proxy and `NO_PROXY` values for the new network.
 3. Replace worker image tags with the tag imported above.
-4. Update or remove node selectors for Generate, Reward, and Push.
+4. Update or remove node selectors for Autoqueue, Generate, Reward, and Push.
 5. Keep Validate without a node selector so the scheduler can use any node
    with sufficient requested resources.
-6. For the first smoke test, set every Deployment to one replica. Do not apply
+6. Set `[autoqueue].generate_workers` in `swegen.toml` to the Generate replica
+   count. An explicit `[autoqueue].max_queued` takes priority; otherwise the
+   limit is `max_queued_per_generate_worker * generate_workers`.
+7. Set `[swr.minddistiller].credentials_csv` to
+   `/etc/swegen/minddistiller_swr.csv` and `[completed_tasks].output_dir` to
+   `/app/data_cache/successful_harbor_tasks`. Set its repository to
+   `aifm.coder.exp/swegen/generated`; images use the instance ID as the tag.
+8. For the first smoke test, set every Deployment to one replica. Do not apply
    large production replica counts to an unverified cluster.
-7. Confirm CPU and memory requests reflect observed usage. Kubernetes schedules
+9. Confirm CPU and memory requests reflect observed usage. Kubernetes schedules
    against requests, not live utilization.
 
 Validate and apply:
@@ -381,6 +388,7 @@ Validate and apply:
 kubectl apply --dry-run=server -f deploy/k3s/swegen-pipeline.yaml
 kubectl apply -f deploy/k3s/swegen-pipeline.yaml
 kubectl -n swegen-pipeline get deploy,pods -o wide
+kubectl -n swegen-pipeline rollout status deploy/swegen-autoqueue --timeout=10m
 kubectl -n swegen-pipeline rollout status deploy/swegen-generate --timeout=10m
 kubectl -n swegen-pipeline rollout status deploy/swegen-validate --timeout=10m
 kubectl -n swegen-pipeline rollout status deploy/swegen-reward --timeout=10m
@@ -412,6 +420,7 @@ shell history. Monitor the task:
 
 ```bash
 uv run swegen-pipeline status --task-id OWNER__REPO-PR_NUMBER
+kubectl -n swegen-pipeline logs deploy/swegen-autoqueue --tail=100
 kubectl -n swegen-pipeline logs -l swegen.pgcode/stage=generate --tail=100
 kubectl -n swegen-pipeline logs -l swegen.pgcode/stage=validate --tail=100
 kubectl -n swegen-pipeline logs -l swegen.pgcode/stage=reward --tail=100
@@ -419,8 +428,8 @@ kubectl -n swegen-pipeline logs -l swegen.pgcode/stage=push --tail=100
 ```
 
 Success requires one durable result for each stage, stored task files in
-`public.pipeline_task_files`, empty or decreasing stage queues, and a recorded
-SWR push.
+`public.pipeline_task_files`, empty or decreasing stage queues, two recorded
+SWR pushes, a `public.completed_tasks` row, and a persistent task dump.
 
 ## Dashboard
 
@@ -446,8 +455,10 @@ when nodes are added.
 
 `/data/swegen-k3s/workspaces` is a node-local `hostPath`, not `emptyDir`, but
 each delivery is intentionally created with `TemporaryDirectory` and removed
-after the stage completes. Completed Harbor task files are stored in
+after the stage completes. Generated Harbor task files are stored in
 `swegen_distributed.public.pipeline_task_files` and rematerialized on demand.
+After both SWR uploads, the successful task is also dumped under
+`/data/swegen-k3s/successful-harbor-tasks`.
 
 Consequences:
 
@@ -582,7 +593,7 @@ Use a controlled queue-preserving cutover:
 1. stop new enqueues;
 2. wait for `pipeline_stage_activity` to become empty, or explicitly release
    and account for every remaining claim;
-3. scale the four Deployments to zero without deleting PGMQ queues;
+3. scale the five Deployments to zero without deleting PGMQ queues;
 4. take a full PostgreSQL backup and an etcd snapshot;
 5. build the replacement cluster with the same reviewed versions;
 6. restore the complete `swegen_distributed` database, including the SQL-only

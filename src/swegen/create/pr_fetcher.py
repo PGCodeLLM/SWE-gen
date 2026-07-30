@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from swegen.model_settings import load_github_token
 from swegen.net import github_requests_kwargs, requests_ssl_kwargs
 
 
@@ -26,7 +27,10 @@ class GitHubPRFetcher:
         """
         self.repo = self._parse_repo(repo)
         self.pr_number = pr_number
-        self.github_token = github_token or os.environ.get("GITHUB_TOKEN")
+        # Retain the parameter for API compatibility, but never let it override
+        # the authoritative token pool in swegen.toml.
+        del github_token
+        self.github_token = load_github_token()
 
         # API setup
         self.api_base = "https://api.github.com"
@@ -50,9 +54,7 @@ class GitHubPRFetcher:
         url = f"{self.api_base}{endpoint}"
         logger = logging.getLogger("swegen")
         attempts = max(1, int(os.environ.get("SWEGEN_GITHUB_API_ATTEMPTS", "4")))
-        base_delay = max(
-            0.0, float(os.environ.get("SWEGEN_GITHUB_RETRY_BASE_SECONDS", "5"))
-        )
+        base_delay = max(0.0, float(os.environ.get("SWEGEN_GITHUB_RETRY_BASE_SECONDS", "5")))
         max_wait = max(
             base_delay,
             float(os.environ.get("SWEGEN_GITHUB_MAX_WAIT_SECONDS", "3600")),
@@ -308,7 +310,7 @@ class GitHubPRFetcher:
         issues = []
         fetched_issues: set[tuple[str, int]] = set()  # Track which we successfully fetched
 
-        for (repo, issue_num) in sorted(issue_refs.keys(), key=lambda x: (x[0], x[1])):
+        for repo, issue_num in sorted(issue_refs.keys(), key=lambda x: (x[0], x[1])):
             # Skip if we already fetched this issue from another repo
             # (in case same issue number exists in both fork and upstream)
             if (repo, issue_num) in fetched_issues:

@@ -1053,7 +1053,7 @@ def test_successful_middle_stages_queue_the_exact_successor(
     ]
 
 
-def test_successful_push_completes_the_task_and_appends_inventory() -> None:
+def test_successful_push_completes_the_task_and_appends_both_inventories() -> None:
     from swegen.pipeline.task_store import TaskStore
 
     claim = make_claim(PipelineStage.PUSH)
@@ -1062,12 +1062,25 @@ def test_successful_push_completes_the_task_and_appends_inventory() -> None:
         "registry": "swr",
         "suffix": "_platform",
         "already_present": False,
+        "pushed_images": [
+            {
+                "remote_tag": "swr.example/swegen/owner__repo-123:v1",
+                "registry": "swr",
+                "suffix": "_platform",
+            },
+            {
+                "remote_tag": "mind.example/swegen/owner__repo-123:v1",
+                "registry": "trajectory",
+                "suffix": "",
+            },
+        ],
     }
     execution = StageExecution.succeeded(result)
     payload = json_payload(execution.result_json())
     connection = RecordingConnection(
         inserted_stage_result(claim),
         CursorResult(rowcount=1),
+        CursorResult(),
         CursorResult(),
     )
 
@@ -1108,7 +1121,57 @@ def test_successful_push_completes_the_task_and_appends_inventory() -> None:
                 payload,
             ),
         ),
+        (
+            INSERT_PUSHED_IMAGE_SQL,
+            (
+                claim.message.task_id,
+                "trajectory",
+                "",
+                "mind.example/swegen/owner__repo-123:v1",
+                True,
+                "pushed_images",
+                payload,
+            ),
+        ),
     ]
+
+
+def test_successful_push_rejects_duplicate_inventory_targets_before_sql() -> None:
+    from swegen.pipeline.task_store import TaskStore, TaskStoreError
+
+    claim = make_claim(PipelineStage.PUSH)
+    execution = StageExecution.succeeded(
+        {
+            "remote_tag": "swr.example/swegen/task:v1",
+            "registry": "platform",
+            "suffix": "_platform",
+            "pushed_images": [
+                {
+                    "remote_tag": "swr.example/swegen/task:v1",
+                    "registry": "platform",
+                    "suffix": "_platform",
+                },
+                {
+                    "remote_tag": "swr.example/swegen/task:v1",
+                    "registry": "trajectory",
+                    "suffix": "",
+                },
+            ],
+        }
+    )
+    connection = RecordingConnection()
+
+    with pytest.raises(TaskStoreError, match="duplicate"):
+        TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+            connection,
+            claim,
+            execution,
+            started_at=STARTED_AT,
+            worker_id="worker-1",
+            node_name="node-a",
+        )
+
+    assert connection.calls == []
 
 
 def test_expected_rejection_marks_the_task_rejected_without_files() -> None:

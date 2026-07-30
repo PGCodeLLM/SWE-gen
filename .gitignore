@@ -90,6 +90,7 @@ get_merge_commit_ids.py
 reward_hacking_detector/hacking_checker.toml
 reward_hacking_detector/hacking_checker_CODEX_ONLY.toml
 swegen.toml
+swr_credentials/*.csv
 data_cache/
 boyuan_graphing/
 boyuan_hack_example/

@@ -42,9 +42,6 @@ uv pip install swegen
 
 # Generate a task from a merged PR
 swegen create --repo axios/axios --pr 7150
-
-# Or farm all PRs from a repo
-swegen farm fastapi/fastapi
 ```
 
 ## Installation
@@ -53,13 +50,15 @@ swegen farm fastapi/fastapi
 uv pip install swegen
 ```
 
-Ensure these environment variables are set:
+Copy the example configuration and fill in its endpoint, model, and credential
+values:
 
 ```bash
-export GITHUB_TOKEN=<gh-token>
-export OPENAI_API_KEY=<api-key>
-export ANTHROPIC_API_KEY=<api-key>  # or CLAUDE_CODE_OAUTH_TOKEN
+cp swegen.toml.example swegen.toml
 ```
+
+`swegen.toml` is authoritative for model endpoints, model names, GitHub/model
+API keys, reward-hacking checkers, autoqueue limits, and SWR targets.
 
 **Note:** Cloud sandbox environments (Daytona, E2B, Modal, etc.) require additional API keys.
 
@@ -70,9 +69,9 @@ For the PostgreSQL/PGMQ distributed worker pipeline, see the
 
 **Commands:**
 - `swegen create` — Generate a task from a merged PR
-- `swegen farm` — Continuously process PRs from a repository
 - `swegen validate` — Validate existing task (NOP + Oracle)
 - `swegen analyze` — Deep analysis with agent trials to verify task quality
+- `swegen-pipeline enqueue` — Manually enqueue one distributed task
 
 ### Generate a Task
 
@@ -98,39 +97,24 @@ swegen create --repo <owner/repo> --pr <num>
 
 </details>
 
-### Continuous PR Farming
+### Automatically queue distributed work
 
-Stream through entire PR history, process each sequentially with state persistence.
+`src/autoqueue.py` replaces the deprecated root orchestrator. It only selects
+eligible rows from `public.pr_tasks` and atomically enqueues them into the PGMQ
+pipeline. Run one polling process with `./run_autoqueue.sh`, or use
+`./run_autoqueue.sh --once` for a single fill operation.
+
+For a manual MindDistiller batch upload, place its credential CSV under
+`swr_credentials/` and run:
 
 ```bash
-swegen farm fastapi/fastapi
+swr_credentials/minddistiller_build_and_upload.sh ids.txt tasks/
 ```
 
-<details>
-<summary>Options</summary>
-
-- `--output PATH` — Output directory for generated tasks (default: `tasks`)
-- `--state-dir PATH` — State directory for cache/logs (default: `.swegen`)
-- `--timeout N` — Timeout per PR in seconds (default: 300)
-- `--cc-timeout N` — Claude Code session timeout (default: 3200)
-- `--task-delay N` — Delay between tasks in seconds (default: 60)
-- `--api-delay N` — Delay between GitHub API calls in seconds (default: 0.5)
-- `--env, -e TYPE` — Environment type: `docker`, `daytona`, `e2b`, `modal`, `runloop`, `gke` (default: `docker`)
-- `--resume-from DATE` — Resume from date or timestamp
-- `--reset` — Reset state and start from beginning
-- `--dry-run` — Preview without generation
-- `--force` — Regenerate even if task already exists (default: true)
-- `--no-validate` — Skip Harbor validation step
-- `--require-issue` / `--no-require-issue` — Require PRs to have linked issues (default: True)
-- `--no-require-minimum-difficulty` — Skip 3+ file and LLM checks
-- `--min-source-files N` — Minimum number of source files required (default: 3, tests excluded)
-- `--max-source-files N` — Maximum number of source files to avoid large refactors (default: 10, tests excluded)
-- `--no-cache` — Disable cached artifacts
-- `--docker-prune-batch N` — Run docker cleanup after every N PRs (default: 5, 0 to disable)
-- `--skip-list PATH` — Path to file with task IDs to skip (one per line)
-- `-v, --verbose`
-
-</details>
+The selector builds and retains `ea_sz_<instance_id>:latest` for each listed
+task, then pushes and verifies
+`swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com/aifm.coder.exp/swegen/generated:<instance_id>`.
+Per-task logs and a final report are written under `swr_credentials/docker-build-logs/`.
 
 ### Validate Existing Tasks
 

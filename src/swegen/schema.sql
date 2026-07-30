@@ -193,6 +193,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_pushed_images_backfill
     WHERE source_file IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- Completed Harbor task variants for downstream consumers
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS completed_tasks (
+    instance_id                    TEXT PRIMARY KEY,
+    harbor_directory_hostname      TEXT,
+    harbor_directory_filepath      TEXT,
+    dockerfile_original            TEXT,
+    test_sh_original               TEXT,
+    config_toml_original           TEXT,
+    dockerfile_minddistiller       TEXT,
+    test_sh_minddistiller          TEXT,
+    config_toml_minddistiller      TEXT,
+    dockerfile_voyager             TEXT,
+    test_sh_voyager                TEXT,
+    config_toml_voyager            TEXT
+);
+
+-- ---------------------------------------------------------------------------
 -- Distributed PGMQ pipeline state
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS pipeline_tasks (

@@ -2,23 +2,23 @@
 set -euo pipefail
 
 namespace="${SWEGEN_K3S_NAMESPACE:-swegen-pipeline}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd -- "${script_dir}/../.." && pwd)"
 runtime_root="${SWEGEN_RUNTIME_ROOT:-/data/work/slurm-swegen/slurm-runtime/20260716-sol-max-full-16w/workspace}"
 secret_root="${SWEGEN_SECRET_ROOT:-${runtime_root}/.slurm-secrets}"
 proxy_env="${SWEGEN_PROXY_ENV:-/data/work/slurm-swegen/.env}"
 docker_config="${SWEGEN_DOCKER_CONFIG:-/root/.docker/config.json}"
+minddistiller_csv="${SWEGEN_MINDDISTILLER_SWR_CSV:-${repository_root}/swr_credentials/minddistiller_swr.csv}"
 
-credentials_env="${secret_root}/credentials.env"
-reward_env="${secret_root}/reward-credentials.env"
 swegen_config="${secret_root}/swegen.toml"
 combined_ca="${secret_root}/combined-ca.crt"
 
 for required_file in \
-    "${credentials_env}" \
-    "${reward_env}" \
     "${swegen_config}" \
     "${combined_ca}" \
     "${proxy_env}" \
-    "${docker_config}"
+    "${docker_config}" \
+    "${minddistiller_csv}"
 do
     if [[ ! -r "${required_file}" ]]; then
         printf 'Required secret source is not readable: %s\n' "${required_file}" >&2
@@ -40,13 +40,9 @@ normalize_env_file() {
     chmod 0600 "${destination_file}"
 }
 
-normalized_credentials="${temporary_directory}/credentials.env"
 normalized_proxy="${temporary_directory}/proxy.env"
-normalized_reward="${temporary_directory}/reward.env"
 merged_docker_config="${temporary_directory}/docker-config.json"
-normalize_env_file "${credentials_env}" "${normalized_credentials}"
 normalize_env_file "${proxy_env}" "${normalized_proxy}"
-normalize_env_file "${reward_env}" "${normalized_reward}"
 
 python3 - "${docker_config}" "${normalized_proxy}" "${merged_docker_config}" <<'PY'
 import json
@@ -103,21 +99,17 @@ fi
 "${kubectl[@]}" create namespace "${namespace}" \
     --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
 
-"${kubectl[@]}" -n "${namespace}" create secret generic swegen-model-credentials \
-    --from-env-file="${normalized_credentials}" \
-    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
-
 "${kubectl[@]}" -n "${namespace}" create secret generic swegen-runtime-proxy \
     --from-env-file="${normalized_proxy}" \
-    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
-
-"${kubectl[@]}" -n "${namespace}" create secret generic swegen-reward-credentials \
-    --from-env-file="${normalized_reward}" \
     --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
 
 "${kubectl[@]}" -n "${namespace}" create secret generic swegen-private-files \
     --from-file=swegen.toml="${swegen_config}" \
     --from-file=combined-ca.crt="${combined_ca}" \
+    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+
+"${kubectl[@]}" -n "${namespace}" create secret generic swegen-minddistiller-swr \
+    --from-file=minddistiller_swr.csv="${minddistiller_csv}" \
     --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
 
 "${kubectl[@]}" -n "${namespace}" create secret generic swegen-docker-config \
@@ -143,10 +135,9 @@ unset postgres_password
     --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
 
 "${kubectl[@]}" -n "${namespace}" get secret \
-    swegen-model-credentials \
     swegen-runtime-proxy \
-    swegen-reward-credentials \
     swegen-private-files \
+    swegen-minddistiller-swr \
     swegen-docker-config \
     swegen-database \
     -o name

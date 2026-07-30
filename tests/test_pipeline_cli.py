@@ -48,6 +48,9 @@ class RecordingConnection:
         normalized_query = normalize_sql(query)
         parameters = tuple(params or ())
         self.calls.append((normalized_query, parameters))
+        if normalized_query.startswith("SELECT pg_advisory_xact_lock"):
+            self.events.append("enqueue-lock")
+            return FakeCursor(())
         if normalized_query.startswith("INSERT INTO pipeline_tasks"):
             self.events.append("insert-task")
         elif "pgmq.send" in normalized_query:
@@ -76,6 +79,9 @@ class EchoingEnqueueConnection(RecordingConnection):
         normalized_query = normalize_sql(query)
         parameters = tuple(params or ())
         self.calls.append((normalized_query, parameters))
+        if normalized_query.startswith("SELECT pg_advisory_xact_lock"):
+            self.events.append("enqueue-lock")
+            return FakeCursor(())
         if normalized_query.startswith("INSERT INTO pipeline_tasks"):
             self.events.append("insert-task")
             return FakeCursor(({"task_id": parameters[0], "task_version": parameters[1]},))
@@ -128,12 +134,17 @@ def test_enqueue_inserts_task_and_sends_generate_message_in_one_transaction() ->
     assert result.pgmq_msg_id == 71
     assert connection.events == [
         "transaction-enter",
+        "enqueue-lock",
         "insert-task",
         "send",
         "transaction-exit",
     ]
 
-    insert_sql, insert_params = connection.calls[0]
+    lock_sql, lock_params = connection.calls[0]
+    assert "pg_advisory_xact_lock" in lock_sql
+    assert lock_params == cli.ENQUEUE_ADVISORY_LOCK_KEYS
+
+    insert_sql, insert_params = connection.calls[1]
     assert "ON CONFLICT DO NOTHING" in insert_sql
     assert "RETURNING task_id, task_version" in insert_sql
     assert insert_params == (
@@ -148,7 +159,7 @@ def test_enqueue_inserts_task_and_sends_generate_message_in_one_transaction() ->
         ENQUEUED_AT,
     )
 
-    send_sql, send_params = connection.calls[1]
+    send_sql, send_params = connection.calls[2]
     assert "pgmq.send" in send_sql
     assert send_params[0] == QueueName.GENERATE.value
     assert send_params[2] == 0
@@ -179,8 +190,8 @@ def test_enqueue_canonicalizes_mixed_case_repository_identity() -> None:
 
     assert result.task.repo == "ticketmaster/aurora"
     assert result.task.task_id == "ticketmaster__aurora-13"
-    assert connection.calls[0][1][2] == "ticketmaster/aurora"
-    payload = json.loads(str(connection.calls[1][1][1]))
+    assert connection.calls[1][1][2] == "ticketmaster/aurora"
+    payload = json.loads(str(connection.calls[2][1][1]))
     assert payload["task_id"] == "ticketmaster__aurora-13"
 
 
@@ -197,9 +208,10 @@ def test_enqueue_duplicate_rolls_back_without_sending() -> None:
             now_factory=lambda: ENQUEUED_AT,
         )
 
-    assert len(connection.calls) == 1
+    assert len(connection.calls) == 2
     assert connection.events == [
         "transaction-enter",
+        "enqueue-lock",
         "insert-task",
         "transaction-rollback",
     ]
@@ -220,7 +232,7 @@ def test_enqueue_rejects_an_unexpected_insert_identity_without_sending() -> None
             now_factory=lambda: ENQUEUED_AT,
         )
 
-    assert len(connection.calls) == 1
+    assert len(connection.calls) == 2
     assert "send" not in connection.events
     assert connection.events[-1] == "transaction-rollback"
 

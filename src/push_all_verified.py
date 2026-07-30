@@ -240,7 +240,12 @@ def _append_image_record(repo: LedgerRepo, record: dict, *, reg: Registry, pushe
 # ── Docker operations ───────────────────────────────────────────────
 
 
-def image_exists_in_registry(remote_tag: str, timeout: int = 60) -> bool:
+def image_exists_in_registry(
+    remote_tag: str,
+    timeout: int = 60,
+    *,
+    env: dict[str, str] | None = None,
+) -> bool:
     """Check if an image already exists in the remote registry.
 
     Uses ``docker manifest inspect``.  Returns False on timeout or any
@@ -252,6 +257,7 @@ def image_exists_in_registry(remote_tag: str, timeout: int = 60) -> bool:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return proc.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
@@ -390,7 +396,14 @@ def _safe_rmi(tag: str, force: bool = True, timeout: int = 120) -> None:
         pass
 
 
-def push_to_registry(local_tag: str, remote_tag: str, log=print) -> bool:
+def push_to_registry(
+    local_tag: str,
+    remote_tag: str,
+    log=print,
+    *,
+    env: dict[str, str] | None = None,
+    push_timeout_seconds: float = 1800,
+) -> bool:
     """Tag ``local_tag`` as ``remote_tag`` and push it.  Removes remote tag after."""
     pushed = False
     try:
@@ -398,6 +411,7 @@ def push_to_registry(local_tag: str, remote_tag: str, log=print) -> bool:
             ["docker", "tag", local_tag, remote_tag],
             timeout_seconds=60,
             max_output_bytes=MAX_DOCKER_OUTPUT_BYTES,
+            env=env,
             redactor=redact_sensitive_text,
         )
         if tag_proc.returncode != 0:
@@ -407,8 +421,9 @@ def push_to_registry(local_tag: str, remote_tag: str, log=print) -> bool:
         log(f"  [PUSH] Pushing {remote_tag} ...")
         push_proc = run_bounded_command(
             ["docker", "push", remote_tag],
-            timeout_seconds=1800,
+            timeout_seconds=push_timeout_seconds,
             max_output_bytes=MAX_DOCKER_OUTPUT_BYTES,
+            env=env,
             redactor=redact_sensitive_text,
         )
         if push_proc.returncode != 0:

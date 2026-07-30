@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any
-import json
+
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -15,7 +16,12 @@ from openai import OpenAI
 from rich.console import Console
 
 from swegen.create.claude_code_utils import Colors, print_sdk_message
-from swegen.model_settings import claude_session_env
+from swegen.model_settings import (
+    claude_session_env,
+    configure_current_process,
+    load_analysis_settings,
+    load_openai_settings,
+)
 
 from .models import (
     BaselineResult,
@@ -104,7 +110,9 @@ class TrialClassifier:
             verbose: If True, stream Claude Code output to console
             timeout: Maximum time per classification in seconds (default: 300 = 5 min)
         """
-        self._model = model
+        del model
+        configure_current_process("analysis-classifier")
+        self._model = load_analysis_settings().classifier_model
         self._verbose = verbose
         self._timeout = timeout
         self._setup_authentication()
@@ -440,17 +448,17 @@ def _compute_task_verdict_openai(
         classifications: List of individual trial classifications
         baseline: Optional baseline validation results
         quality_check_passed: Whether static quality check passed
-        model: OpenAI model to use (default: gpt-5.2)
+        model: Deprecated compatibility parameter; swegen.toml is authoritative.
         console: Optional console for progress output
         verbose: If True, print progress messages
-        api_key: Optional OpenAI API key (defaults to OPENAI_API_KEY env var)
+        api_key: Deprecated compatibility parameter; swegen.toml is authoritative.
         timeout: Optional OpenAI client timeout override (seconds)
         
     Returns:
         TaskVerdict with LLM-synthesized analysis
         
     Raises:
-        RuntimeError: If OPENAI_API_KEY is not set or LLM call fails
+        RuntimeError: If swegen.toml is incomplete or the LLM call fails
     """
     if not classifications:
         return TaskVerdict(
@@ -460,9 +468,8 @@ def _compute_task_verdict_openai(
             recommendations=["Run agent trials first"],
         )
     
-    # Check API key
-    if not (api_key or os.getenv("OPENAI_API_KEY")):
-        raise RuntimeError("OPENAI_API_KEY not set for verdict synthesis")
+    settings = load_openai_settings()
+    del api_key, model
     
     # Format baseline summary
     if baseline:
@@ -501,17 +508,22 @@ def _compute_task_verdict_openai(
         console.print("  [dim]Synthesizing verdict with OpenAI...[/dim]")
     
     if verbose:
-        print(f"\n{Colors.YELLOW}[Verdict] Synthesizing task verdict with {model}...{Colors.RESET}", flush=True)
+        print(
+            f"\n{Colors.YELLOW}[Verdict] Synthesizing task verdict with "
+            f"{settings.verdict_model}...{Colors.RESET}",
+            flush=True,
+        )
     
     # Create OpenAI client and make structured output call
     client = OpenAI(
-        api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        api_key=settings.api_key,
+        base_url=settings.base_url,
         timeout=timeout or VERDICT_TIMEOUT,
     )
     
     try:
         completion = client.beta.chat.completions.parse(
-            model=model,
+            model=settings.verdict_model,
             messages=[
                 {"role": "user", "content": prompt},
             ],

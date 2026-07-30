@@ -36,6 +36,11 @@ def test_incomplete_sdk_turn_is_continued_in_same_client(tmp_path, monkeypatch) 
     )
     monkeypatch.setattr(runner, "ClaudeSDKClient", FakeClient)
     monkeypatch.setattr(runner, "load_model_settings", lambda: ModelSettings(model="test-model"))
+    monkeypatch.setattr(
+        runner,
+        "claude_session_env",
+        lambda _task_id: {"ANTHROPIC_MODEL": "test-model"},
+    )
     monkeypatch.setattr(runner, "_check_validation_state", lambda *_args, **_kwargs: next(states))
     monkeypatch.setenv("GITHUB_TOKEN", "test-github-token")
     monkeypatch.setenv("SWEGEN_CONFIG", "/private/swegen.toml")
@@ -127,6 +132,11 @@ def test_generate_only_session_completes_files_without_harbor(tmp_path, monkeypa
 
     monkeypatch.setattr(runner, "ClaudeSDKClient", FakeClient)
     monkeypatch.setattr(runner, "load_model_settings", lambda: ModelSettings(model="test-model"))
+    monkeypatch.setattr(
+        runner,
+        "claude_session_env",
+        lambda _task_id: {"ANTHROPIC_MODEL": "test-model"},
+    )
     monkeypatch.setattr(
         runner,
         "_check_validation_state",

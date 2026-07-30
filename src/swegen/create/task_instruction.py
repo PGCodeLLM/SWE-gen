@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from openai import OpenAI
+
+from swegen.model_settings import load_openai_settings
 
 from .utils import CombinedPRTaskEvaluation
 
@@ -16,7 +17,6 @@ MAX_TOTAL_TEST_LENGTH = 10000  # Max total chars for all test files
 MIN_INSTRUCTION_LENGTH = 100
 OPENAI_API_TIMEOUT = 90.0
 MAX_COMPLETION_TOKENS = 4096
-MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 DEBUG_REASON_TRUNCATE_LENGTH = 100
 
 COMBINED_SYSTEM_PROMPT = """You are evaluating GitHub pull requests and converting substantial ones into SWE-bench tasks.
@@ -359,7 +359,7 @@ def evaluate_and_generate_task(
     metadata: dict,
     files: list[dict],
     repo: str,
-    model: str = MODEL_NAME,
+    model: str | None = None,
     api_key: str | None = None,
     linked_issues: list[dict] | None = None,
     force_generate_instruction: bool = False,
@@ -389,9 +389,12 @@ def evaluate_and_generate_task(
     """
     logger = logging.getLogger("swegen")
 
-    # Check API key
-    if not (api_key or os.getenv("OPENAI_API_KEY")):
-        raise RuntimeError("OPENAI_API_KEY not set")
+    settings = load_openai_settings()
+    # These arguments remain in the public API for compatibility, but runtime
+    # routing and credentials are authoritative in swegen.toml.
+    del api_key, model
+    resolved_api_key = settings.api_key
+    resolved_model = settings.task_instruction_model
 
     # Prepare prompt data
     # NOTE: We intentionally do NOT pass diff/commits to avoid leaking the solution
@@ -430,7 +433,8 @@ def evaluate_and_generate_task(
     )
 
     client = OpenAI(
-        api_key=api_key or os.getenv("OPENAI_API_KEY"),
+        api_key=resolved_api_key,
+        base_url=settings.base_url,
         timeout=OPENAI_API_TIMEOUT,  # Longer timeout for reasoning models
     )
 
@@ -449,7 +453,7 @@ def evaluate_and_generate_task(
         # so backends that return clean JSON behave exactly as before.
         try:
             completion = client.beta.chat.completions.parse(
-                model=model,
+                model=resolved_model,
                 messages=messages,
                 response_format=CombinedPRTaskEvaluation,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
@@ -479,7 +483,7 @@ def evaluate_and_generate_task(
                     response_format = {"type": "json_object"}
 
                 raw = client.chat.completions.create(
-                    model=model,
+                    model=resolved_model,
                     messages=messages,
                     response_format=response_format,
                     max_completion_tokens=MAX_COMPLETION_TOKENS,

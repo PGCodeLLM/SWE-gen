@@ -31,13 +31,55 @@ data:
   SWEGEN_GITHUB_RETRY_BASE_SECONDS: "10"
   SWEGEN_GITHUB_MAX_WAIT_SECONDS: "300"
   SWEGEN_HARBOR_TIMEOUT_SECONDS: "3600"
-  SWEGEN_REWARD_PRIMARY_MODEL: gpt-5.6-sol
-  SWEGEN_REWARD_FALLBACK_MODEL: gpt-5.6-sol
-  SWEGEN_SWR_HOST: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
-  SWEGEN_SWR_REPOSITORY: swesandbox/public/swe-gen/feature-implementation/generated
-  SWEGEN_SWR_REGISTRY: platform
-  SWEGEN_SWR_SUFFIX: _platform
   SWEGEN_NO_PROXY: ".myhuaweicloud.com,.huaweicloud.com,.huawei.com,127.0.0.1,localhost,7.237.95.141,7.244.3.251,7.244.3.200,7.244.3.78,7.244.2.110,7.244.1.209,10.42.0.0/16,10.43.0.0/16,100.*,10.*"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swegen-autoqueue
+  namespace: swegen-pipeline
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-autoqueue
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-autoqueue
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        swegen.pgcode/node-ip: 7.244.3.200
+      containers:
+        - name: autoqueue
+          image: swegen-worker:e2e
+          imagePullPolicy: Never
+          command: ["python", "src/autoqueue.py"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+      volumes:
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -74,8 +116,6 @@ spec:
                 name: swegen-database
             - secretRef:
                 name: swegen-runtime-proxy
-            - secretRef:
-                name: swegen-model-credentials
           env:
             - name: POD_NAME
               valueFrom:
@@ -262,11 +302,6 @@ spec:
             - secretRef:
                 name: swegen-runtime-proxy
           env:
-            - name: SWEGEN_REWARD_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: swegen-reward-credentials
-                  key: OPENAI_API_KEY
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -391,6 +426,12 @@ spec:
               mountPath: /root/.docker/config.json
               subPath: config.json
               readOnly: true
+            - name: minddistiller-swr
+              mountPath: /etc/swegen/minddistiller_swr.csv
+              subPath: minddistiller_swr.csv
+              readOnly: true
+            - name: successful-harbor-tasks
+              mountPath: /app/data_cache/successful_harbor_tasks
       volumes:
         - name: workspace
           hostPath:
@@ -408,3 +449,11 @@ spec:
           secret:
             secretName: swegen-docker-config
             defaultMode: 0400
+        - name: minddistiller-swr
+          secret:
+            secretName: swegen-minddistiller-swr
+            defaultMode: 0400
+        - name: successful-harbor-tasks
+          hostPath:
+            path: /data/swegen-k3s/successful-harbor-tasks
+            type: DirectoryOrCreate
