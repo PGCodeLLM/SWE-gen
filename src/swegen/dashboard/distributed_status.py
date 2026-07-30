@@ -13,7 +13,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-STAGES = ("generate", "validate", "reward", "push")
+STAGES = ("generate", "validate", "repair", "reward", "push")
 QUEUE_BY_STAGE = {stage: f"swegen_{stage}" for stage in STAGES}
 DEAD_QUEUE = "swegen_dead"
 
@@ -45,6 +45,36 @@ def _memory_bytes(value: str) -> int:
         if value.endswith(suffix):
             return round(float(value[: -len(suffix)]) * multiplier)
     return round(float(value))
+
+
+def _pod_cpu_request_millicores(pod: dict[str, Any]) -> int:
+    spec = pod.get("spec", {})
+    regular = sum(
+        _cpu_millicores(str(container.get("resources", {}).get("requests", {}).get("cpu", "0")))
+        for container in spec.get("containers", [])
+    )
+    init_max = max(
+        (
+            _cpu_millicores(str(container.get("resources", {}).get("requests", {}).get("cpu", "0")))
+            for container in spec.get("initContainers", [])
+        ),
+        default=0,
+    )
+    overhead = _cpu_millicores(str(spec.get("overhead", {}).get("cpu", "0")))
+    return max(regular, init_max) + overhead
+
+
+def _allocated_cpu_by_node(pod_doc: dict[str, Any]) -> dict[str, int]:
+    allocated: Counter[str] = Counter()
+    for pod in pod_doc.get("items", []):
+        if pod.get("kind") not in {None, "Pod"}:
+            continue
+        if pod.get("status", {}).get("phase") in {"Succeeded", "Failed"}:
+            continue
+        node_name = pod.get("spec", {}).get("nodeName")
+        if node_name:
+            allocated[node_name] += _pod_cpu_request_millicores(pod)
+    return dict(allocated)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -456,6 +486,12 @@ class K3sStatusCollector:
                 "deployments,pods",
             ]
         )
+        allocation_error = None
+        try:
+            all_pod_doc = self._get(["get", "pods", "-A"])
+        except Exception as error:
+            all_pod_doc = None
+            allocation_error = f"{type(error).__name__}: {str(error)[:300]}"
         nodes = []
         for item in node_doc.get("items", []):
             conditions = {c["type"]: c for c in item.get("status", {}).get("conditions", [])}
@@ -484,6 +520,7 @@ class K3sStatusCollector:
             }
             for stage in STAGES
         }
+        pods_by_node: dict[str, list[dict[str, Any]]] = {}
         storage_mounts: list[dict[str, Any]] = []
         for item in workload_doc.get("items", []):
             stage = item.get("metadata", {}).get("labels", {}).get("swegen.pgcode/stage")
@@ -552,7 +589,33 @@ class K3sStatusCollector:
                 )
                 node = item.get("spec", {}).get("nodeName") or "unscheduled"
                 stages[stage]["nodes"][node] = stages[stage]["nodes"].get(node, 0) + 1
-        resource_metrics = self._collect_resource_metrics(node_doc)
+                if node != "unscheduled":
+                    pods_by_node.setdefault(node, []).append(
+                        {
+                            "name": item.get("metadata", {}).get("name", "unknown"),
+                            "stage": stage,
+                            "phase": status.get("phase", "Unknown"),
+                            "ready": bool(container_statuses) and pod_ready,
+                            "restarts": sum(
+                                int(entry.get("restartCount") or 0) for entry in container_statuses
+                            ),
+                        }
+                    )
+        for node in nodes:
+            scheduled_pods = sorted(
+                pods_by_node.get(node["name"], []),
+                key=lambda pod: (pod["stage"], pod["name"]),
+            )
+            node["pods"] = scheduled_pods
+            node["pod_count"] = len(scheduled_pods)
+            node["pods_by_stage"] = dict(
+                sorted(Counter(pod["stage"] for pod in scheduled_pods).items())
+            )
+        resource_metrics = self._collect_resource_metrics(
+            node_doc,
+            all_pod_doc=all_pod_doc,
+            allocation_error=allocation_error,
+        )
         workspace_mounts = [
             mount
             for mount in storage_mounts
@@ -597,7 +660,13 @@ class K3sStatusCollector:
             "scaling": scaling,
         }
 
-    def _collect_resource_metrics(self, node_doc: dict[str, Any]) -> dict[str, Any]:
+    def _collect_resource_metrics(
+        self,
+        node_doc: dict[str, Any],
+        *,
+        all_pod_doc: dict[str, Any] | None,
+        allocation_error: str | None,
+    ) -> dict[str, Any]:
         try:
             completed = self.runner(
                 ["kubectl", "--request-timeout=3s", "top", "nodes", "--no-headers"],
@@ -619,10 +688,14 @@ class K3sStatusCollector:
                     _cpu_millicores(fields[1]),
                     _memory_bytes(fields[3]),
                 )
+            allocated_by_node = (
+                _allocated_cpu_by_node(all_pod_doc) if all_pod_doc is not None else None
+            )
 
             per_node = []
             missing = []
             total_cpu_used = 0
+            total_cpu_allocated = 0
             total_cpu_allocatable = 0
             total_memory_used = 0
             total_memory_allocatable = 0
@@ -641,6 +714,9 @@ class K3sStatusCollector:
                     None,
                 )
                 usage = usage_by_node.get(name)
+                cpu_allocated = (
+                    allocated_by_node.get(name, 0) if allocated_by_node is not None else None
+                )
                 if usage is None:
                     missing.append(name)
                     cpu_used = None
@@ -650,6 +726,8 @@ class K3sStatusCollector:
                     total_cpu_used += cpu_used
                     total_memory_used += memory_used
                 total_cpu_allocatable += cpu_allocatable
+                if cpu_allocated is not None:
+                    total_cpu_allocated += cpu_allocated
                 total_memory_allocatable += memory_allocatable
                 per_node.append(
                     {
@@ -657,10 +735,16 @@ class K3sStatusCollector:
                         "ip": internal_ip,
                         "available": usage is not None,
                         "cpu_used_millicores": cpu_used,
+                        "cpu_allocated_millicores": cpu_allocated,
                         "cpu_allocatable_millicores": cpu_allocatable,
                         "cpu_percent": (
                             round(cpu_used * 100 / cpu_allocatable, 1)
                             if cpu_used is not None and cpu_allocatable
+                            else None
+                        ),
+                        "cpu_allocated_percent": (
+                            round(cpu_allocated * 100 / cpu_allocatable, 1)
+                            if cpu_allocated is not None and cpu_allocatable
                             else None
                         ),
                         "memory_used_bytes": memory_used,
@@ -679,13 +763,22 @@ class K3sStatusCollector:
                 "error": (
                     None if all_available else f"metrics missing for nodes: {', '.join(missing)}"
                 ),
+                "allocation_error": allocation_error,
                 "collected_at": datetime.now(UTC).isoformat(),
                 "aggregate": {
                     "cpu_used_millicores": total_cpu_used if all_available else None,
+                    "cpu_allocated_millicores": (
+                        total_cpu_allocated if allocated_by_node is not None else None
+                    ),
                     "cpu_allocatable_millicores": total_cpu_allocatable,
                     "cpu_percent": (
                         round(total_cpu_used * 100 / total_cpu_allocatable, 1)
                         if all_available and total_cpu_allocatable
+                        else None
+                    ),
+                    "cpu_allocated_percent": (
+                        round(total_cpu_allocated * 100 / total_cpu_allocatable, 1)
+                        if allocated_by_node is not None and total_cpu_allocatable
                         else None
                     ),
                     "memory_used_bytes": total_memory_used if all_available else None,
@@ -711,6 +804,7 @@ class K3sStatusCollector:
                 "available": False,
                 "stale": False,
                 "error": message,
+                "allocation_error": None,
                 "collected_at": None,
                 "aggregate": {},
                 "nodes": [],

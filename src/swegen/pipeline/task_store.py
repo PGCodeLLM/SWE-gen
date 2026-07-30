@@ -21,7 +21,7 @@ from swegen.pipeline.models import (
     StageResultStatus,
     TaskFile,
 )
-from swegen.queueing.models import ClaimedMessage, PipelineStage, queue_for_stage
+from swegen.queueing.models import ClaimedMessage, PipelineStage, QueueMessage, queue_for_stage
 
 DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TASK_BYTES = 512 * 1024 * 1024
@@ -113,6 +113,50 @@ _HEARTBEAT_STAGE_ACTIVITY_SQL = """
 _CLEAR_STAGE_ACTIVITY_SQL = """
     DELETE FROM pipeline_stage_activity
     WHERE task_id = %s AND task_version = %s AND stage = %s AND pgmq_msg_id = %s
+"""
+_NEXT_STAGE_ATTEMPT_SQL = """
+    SELECT COALESCE(MAX(attempt), 0) + 1 AS next_attempt
+    FROM pipeline_stage_results
+    WHERE task_id = %s AND task_version = %s AND stage = %s
+"""
+_RESERVE_REPAIR_CANDIDATE_SQL = """
+    WITH candidate AS (
+        SELECT
+            task.task_id,
+            task.task_version,
+            task.trace_id,
+            COALESCE((
+                SELECT MAX(result.attempt)
+                FROM pipeline_stage_results AS result
+                WHERE result.task_id = task.task_id
+                  AND result.task_version = task.task_version
+                  AND result.stage = 'repair'
+            ), 0) + 1 AS repair_attempt
+        FROM pipeline_tasks AS task
+        WHERE task.state IN ('failed', 'rejected')
+          AND task.current_stage IN ('validate', 'repair')
+          AND COALESCE((
+                SELECT MAX(result.attempt)
+                FROM pipeline_stage_results AS result
+                WHERE result.task_id = task.task_id
+                  AND result.task_version = task.task_version
+                  AND result.stage = 'repair'
+          ), 0) < %s
+        ORDER BY task.updated_at, task.task_id, task.task_version
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    )
+    UPDATE pipeline_tasks AS task
+    SET state = 'queued',
+        current_stage = 'repair',
+        updated_at = %s,
+        finished_at = NULL,
+        last_error = NULL,
+        last_reason = NULL
+    FROM candidate
+    WHERE task.task_id = candidate.task_id
+      AND task.task_version = candidate.task_version
+    RETURNING task.task_id, task.task_version, task.trace_id, candidate.repair_attempt
 """
 
 
@@ -902,6 +946,68 @@ class TaskStore:
         files = tuple(_decode_task_file(row) for row in rows)
         return tuple(sorted(files, key=lambda task_file: task_file.path))
 
+    def next_stage_attempt(
+        self,
+        connection: ConnectionLike,
+        task_id: str,
+        task_version: int,
+        stage: PipelineStage,
+    ) -> int:
+        """Return the next durable attempt number for one task stage."""
+
+        task_id, task_version = _require_task_identity(task_id, task_version)
+        try:
+            stage = PipelineStage(stage)
+        except (TypeError, ValueError) as error:
+            raise ValueError("stage must be a fixed pipeline stage") from error
+        row = connection.execute(
+            _NEXT_STAGE_ATTEMPT_SQL,
+            (task_id, task_version, stage.value),
+        ).fetchone()
+        value = _row_value(row, 0, "next_attempt") if row is not None else None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise TaskStoreError(f"database returned an invalid next attempt: {value!r}")
+        return value
+
+    def reserve_repair_candidate(
+        self,
+        connection: ConnectionLike,
+        *,
+        max_repair_attempts: int,
+        event_id: UUID,
+        enqueued_at: datetime,
+    ) -> QueueMessage | None:
+        """Move one eligible failed validation task to repair under a row lock."""
+
+        if (
+            isinstance(max_repair_attempts, bool)
+            or not isinstance(max_repair_attempts, int)
+            or max_repair_attempts <= 0
+        ):
+            raise ValueError("max_repair_attempts must be a positive integer")
+        if not isinstance(event_id, UUID):
+            raise ValueError("event_id must be a UUID")
+        enqueued_at = _require_aware_datetime("enqueued_at", enqueued_at).astimezone(UTC)
+        row = connection.execute(
+            _RESERVE_REPAIR_CANDIDATE_SQL,
+            (max_repair_attempts, enqueued_at),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return QueueMessage(
+                schema_version=1,
+                event_id=event_id,
+                task_id=_row_value(row, 0, "task_id"),  # type: ignore[arg-type]
+                task_version=_row_value(row, 1, "task_version"),  # type: ignore[arg-type]
+                stage=PipelineStage.REPAIR,
+                attempt=_row_value(row, 3, "repair_attempt"),  # type: ignore[arg-type]
+                trace_id=_row_value(row, 2, "trace_id"),  # type: ignore[arg-type]
+                enqueued_at=enqueued_at,
+            )
+        except (TypeError, ValueError) as error:
+            raise TaskStoreError(f"invalid repair candidate row: {error}") from error
+
     def replace_files(
         self,
         connection: ConnectionLike,
@@ -1049,14 +1155,14 @@ class TaskStore:
 
         message = claim.message
         task_files = _validate_task_files(execution.files, verify_integrity=True)
-        generate_success = (
-            message.stage is PipelineStage.GENERATE
+        file_replacement_success = (
+            message.stage in {PipelineStage.GENERATE, PipelineStage.REPAIR}
             and execution.status is StageResultStatus.SUCCEEDED
         )
-        if generate_success and not task_files:
-            raise TaskFileError("successful generate requires non-empty task files")
-        if task_files and not generate_success:
-            raise TaskFileError("only successful generate results may contain task files")
+        if file_replacement_success and not task_files:
+            raise TaskFileError("successful generate or repair requires non-empty task files")
+        if task_files and not file_replacement_success:
+            raise TaskFileError("only successful generate or repair results may contain task files")
 
         result = _redact_json_object(execution.result_json())
         push_fields: tuple[str, str | None, str] | None = None
@@ -1100,7 +1206,7 @@ class TaskStore:
         if _returned_stage_identity(inserted_row) != expected_identity:
             raise TaskStoreError("stage result returned a different task/stage attempt identity")
 
-        if generate_success:
+        if file_replacement_success:
             self._replace_files_by_identity(
                 connection,
                 message.task_id,

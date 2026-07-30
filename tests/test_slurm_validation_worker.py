@@ -90,6 +90,9 @@ def test_harbor_wall_timeout_terminates_complete_client_process_group(
         "killpg",
         lambda pid, signum: signals.append((pid, signum)),
     )
+    # Production polls every second so it can reap a duplicate Compose retry.
+    # Make this fake child's first timeout represent the full wall deadline.
+    monkeypatch.setattr(harbor_runner, "HARBOR_CANCEL_POLL_SECONDS", 10.0)
     # The wall-timeout path reaps orphaned containers; stub it so the test does
     # not shell out to a real docker on the timeout branch.
     reaped: list[str] = []

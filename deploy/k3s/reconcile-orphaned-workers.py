@@ -14,7 +14,7 @@ from collections.abc import Sequence
 DEFAULT_NAMESPACE = "swegen-pipeline"
 DEFAULT_MIN_AGE_SECONDS = 300
 DEFAULT_STOP_TIMEOUT_SECONDS = 10
-WORKER_POD_PATTERN = re.compile(r"^swegen-(?:generate|validate|reward|push)(?:-|$)")
+WORKER_POD_PATTERN = re.compile(r"^swegen-(?:generate|validate|repair|reward|push)(?:-|$)")
 
 
 def _run_json(command: Sequence[str]) -> dict[str, object]:

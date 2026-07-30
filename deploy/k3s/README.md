@@ -8,6 +8,9 @@ The pipeline is:
 ```text
 PGMQ swegen_generate -> Generate -> PGMQ swegen_validate -> NOP/Oracle
   -> PGMQ swegen_reward -> reward-hack check -> PGMQ swegen_push -> SWR
+                         \
+                          validation failure -> PGMQ swegen_repair -> Claude repair
+                                                -> swegen_validate (max 3 repairs)
 ```
 
 PostgreSQL is authoritative for task state, stage results, queue state, and the
@@ -24,6 +27,7 @@ The production cluster was verified with:
 | K3s | `v1.36.2+k3s1` |
 | Bundled containerd | `v2.3.2-k3s2` |
 | Docker Engine | `29.6.x` |
+| Worker Docker Compose | `v2.40.3` (pinned in `Dockerfile.worker`) |
 | PostgreSQL | `16.13` |
 | PGMQ | official `1.12.0` SQL objects, installed without `CREATE EXTENSION` |
 | Python | 3.12 in the worker image |
@@ -31,6 +35,12 @@ The production cluster was verified with:
 
 Pin K3s exactly during installation. Test PostgreSQL, Docker, K3s, and PGMQ
 upgrades on a staging queue before upgrading production.
+
+Do not replace the worker image's pinned Compose binary with Compose v5
+without a concurrency test. Compose v5.3.1 ignores `COMPOSE_BAKE=false` and
+delegates every build to a separate `docker-buildx bake` client. At validator
+scale those clients can accumulate and wedge the Docker daemon. Compose
+v2.40.3 keeps BuildKit caching but honors the internal-builder setting.
 
 ## Recommended topology
 
@@ -257,7 +267,7 @@ psql -X "host=${db_host} port=5432 dbname=postgres user=${db_user}" \
   -c 'CREATE DATABASE swegen_distributed;'
 ```
 
-Install the reviewed upstream SQL-only distribution and create the five fixed
+Install the reviewed upstream SQL-only distribution and create the six fixed
 queues. `psql` should prompt for the password interactively:
 
 ```bash
@@ -299,8 +309,18 @@ SELECT queue_name FROM pgmq.meta ORDER BY queue_name;
 SELECT * FROM pgmq.metrics('swegen_generate');
 ```
 
-Expected queues are `swegen_generate`, `swegen_validate`, `swegen_reward`,
-`swegen_push`, and `swegen_dead`.
+Expected queues are `swegen_generate`, `swegen_validate`, `swegen_repair`,
+`swegen_reward`, `swegen_push`, and `swegen_dead`.
+
+For an existing deployment created before the repair stage, apply the live
+migration once before deploying repair workers:
+
+```bash
+psql -X \
+  "host=${db_host} port=5432 dbname=swegen_distributed user=${db_user}" \
+  -v ON_ERROR_STOP=1 \
+  -f deploy/k3s/migrate-repair-stage.sql
+```
 
 ## Prepare the repository and worker image
 
@@ -313,7 +333,7 @@ git switch swegen-k3s
 uv sync --frozen
 ```
 
-Choose one immutable worker tag for a clean deployment and set all four
+Choose one immutable worker tag for a clean deployment and set all five
 Deployments in `swegen-pipeline.yaml` to that tag. The production manifest can
 temporarily contain different debugging tags; a rebuild should converge them.
 
@@ -340,6 +360,8 @@ become schedulable later.
 The helper requires these root-readable source files:
 
 - model credentials for Generate;
+- `/data/work/alex/SWE-gen/models.yaml` (or `SWEGEN_MODELS_YAML`) containing
+  exactly one `glm-5.2-moedsa` entry for Repair;
 - reward-checker credentials;
 - `swegen.toml`;
 - the combined proxy CA bundle;
@@ -352,13 +374,24 @@ Run it without printing secrets:
 SWEGEN_SECRET_ROOT='/secure/swegen-secrets' \
 SWEGEN_PROXY_ENV='/secure/swegen-secrets/proxy.env' \
 SWEGEN_DOCKER_CONFIG='/root/.docker/config.json' \
+SWEGEN_MODELS_YAML='/secure/swegen-secrets/models.yaml' \
   ./deploy/k3s/create-secrets.sh
 ```
 
 The script prompts for the PostgreSQL password unless
 `SWEGEN_PG_PASSWORD` is already supplied by a secure process environment. It
 creates only Kubernetes Secret objects and never writes plaintext credentials
-to the repository.
+to the repository. Repair credentials are stored separately in
+`swegen-repair-model-credentials`; the helper sets the primary and fast Claude
+Code model variables to `glm-5.2-moedsa` without printing the API key. It also
+sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS=160000` and
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000` so repair sessions compact before the
+model deployment's context limit. Override either value in the helper's process
+environment when targeting a deployment with a different context window.
+Set `SWEGEN_REPAIR_MODEL_NAME=gpt-5.6-sol` when Repair should use the same
+`models.yaml` entry and `1.95.77.23:3000` endpoint as Generate; the helper
+selects the matching model entry and recreates only the repair credential
+Secret with those values.
 
 ## Configure and deploy the pipeline
 
@@ -368,12 +401,20 @@ Review `deploy/k3s/swegen-pipeline.yaml` before applying it:
 2. Update proxy and `NO_PROXY` values for the new network.
 3. Replace worker image tags with the tag imported above.
 4. Update or remove node selectors for Generate, Reward, and Push.
-5. Keep Validate without a node selector so the scheduler can use any node
+5. Keep Validate and Repair without node selectors so the scheduler can use any node
    with sufficient requested resources.
-6. For the first smoke test, set every Deployment to one replica. Do not apply
+6. Keep Validate at 96 replicas on a four-node, 192-CPU-per-node cluster. Its
+   topology spread constraint places 24 validators on each node and prevents
+   one Docker daemon from absorbing most of the build load.
+7. For the first smoke test, set every Deployment to one replica. Do not apply
    large production replica counts to an unverified cluster.
-7. Confirm CPU and memory requests reflect observed usage. Kubernetes schedules
+8. Confirm CPU and memory requests reflect observed usage. Kubernetes schedules
    against requests, not live utilization.
+
+Start Repair at four replicas. Measure the fraction of repaired tasks that pass
+their next authoritative validation attempt before increasing it. Do not scale
+toward 240 repair pods unless that yield is near or above 50% and Docker build
+throughput is stable; repair and validation share the node Docker daemons.
 
 Validate and apply:
 
@@ -387,9 +428,12 @@ kubectl -n swegen-pipeline rollout status deploy/swegen-reward --timeout=10m
 kubectl -n swegen-pipeline rollout status deploy/swegen-push --timeout=10m
 ```
 
-Do not force-delete workers performing long Harbor jobs. The Deployments use
-long termination grace periods so claimed work can finish or safely become
-visible again.
+Validation uses a five-minute termination grace period. Its Harbor wrapper
+cancels the complete process group, removes task containers, and detects
+Harbor's abandoned first `docker compose build` when the built-in environment
+retry starts. The older duplicate client is terminated before it can pin a
+second set of BuildKit records. PGMQ visibility recovery remains authoritative
+if a Pod is force-deleted after that grace period.
 
 ## End-to-end smoke test
 
@@ -504,6 +548,11 @@ Tune those budgets to disk size and concurrent build volume. Run the command
 manually first, then automate it with a systemd timer and `flock` so only one
 cleanup runs at a time. BuildKit prunes unused cache records; it should not
 need to stop the daemon.
+
+Pause Validate and Push before a large maintenance prune. Both stages can run
+Docker builds, and active BuildKit records are protected from garbage
+collection. On the four-node production layout, restore Validate to 96 replicas
+afterward and confirm the scheduler has placed 24 Pods on each node.
 
 Periodically remove stopped Harbor containers and old unused images:
 

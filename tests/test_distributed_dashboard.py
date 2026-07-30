@@ -288,7 +288,7 @@ def test_aggregate_pipeline_snapshot_computes_completion_windows_and_stale_activ
         "succeeded": 1,
         "instances_per_second": round(1 / 900, 6),
     }
-    reward = snapshot["tasks"][0]["stages"][2]
+    reward = next(stage for stage in snapshot["tasks"][0]["stages"] if stage["stage"] == "reward")
     assert reward["heartbeat_age_seconds"] == 120.0
     assert reward["stale"] is True
 
@@ -440,6 +440,55 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
             },
         ]
     }
+    workloads = {
+        "items": [
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "generate-a",
+                    "labels": {"swegen.pgcode/stage": "generate"},
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"resources": {"requests": {"cpu": "500m"}}}],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True, "restartCount": 0}],
+                },
+            },
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "reward-a",
+                    "labels": {"swegen.pgcode/stage": "reward"},
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"resources": {"requests": {"cpu": "0.25"}}}],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": False, "restartCount": 2}],
+                },
+            },
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "validate-b",
+                    "labels": {"swegen.pgcode/stage": "validate"},
+                },
+                "spec": {
+                    "nodeName": "node-b",
+                    "containers": [{"resources": {"requests": {"cpu": "1500m"}}}],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True, "restartCount": 1}],
+                },
+            },
+        ]
+    }
     fail_top = False
 
     def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
@@ -452,7 +501,7 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
                 stdout="node-a 1000m 25% 2Gi 25%\nnode-b 2000m 25% 4096Mi 25%\n",
                 stderr="",
             )
-        document = nodes if "nodes" in command else {"items": []}
+        document = nodes if "nodes" in command else workloads
         return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
 
     collector = K3sStatusCollector(runner=runner)
@@ -464,8 +513,24 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
     assert metrics["aggregate"]["cpu_used_millicores"] == 3_000
     assert metrics["aggregate"]["cpu_allocatable_millicores"] == 12_000
     assert metrics["aggregate"]["cpu_percent"] == 25.0
+    assert metrics["aggregate"]["cpu_allocated_millicores"] == 2_250
+    assert metrics["aggregate"]["cpu_allocated_percent"] == 18.8
     assert metrics["aggregate"]["memory_percent"] == 25.0
     assert metrics["nodes"][0]["ip"] == "10.0.0.1"
+    assert metrics["nodes"][0]["cpu_allocated_millicores"] == 750
+    assert metrics["nodes"][0]["cpu_allocated_percent"] == 18.8
+    assert first_snapshot["nodes"][0]["pod_count"] == 2
+    assert first_snapshot["nodes"][0]["pods_by_stage"] == {
+        "generate": 1,
+        "reward": 1,
+    }
+    assert first_snapshot["nodes"][0]["pods"][1] == {
+        "name": "reward-a",
+        "stage": "reward",
+        "phase": "Running",
+        "ready": False,
+        "restarts": 2,
+    }
     assert first_snapshot["scaling"] == {
         "max_replicas": 12,
         "basis": "sum of cluster node allocatable CPU, floored to whole CPUs",

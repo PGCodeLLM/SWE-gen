@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS pipeline_tasks (
         state IN ('queued', 'running', 'rejected', 'failed', 'completed')
     ),
     CONSTRAINT ck_pipeline_tasks_current_stage CHECK (
-        current_stage IN ('generate', 'validate', 'reward', 'push')
+        current_stage IN ('generate', 'validate', 'repair', 'reward', 'push')
     )
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_tasks_state_stage
@@ -274,7 +274,7 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_results (
     CONSTRAINT fk_pipeline_stage_results_task FOREIGN KEY (task_id, task_version)
         REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
     CONSTRAINT ck_pipeline_stage_results_stage CHECK (
-        stage IN ('generate', 'validate', 'reward', 'push')
+        stage IN ('generate', 'validate', 'repair', 'reward', 'push')
     ),
     CONSTRAINT ck_pipeline_stage_results_attempt_positive CHECK (attempt > 0),
     CONSTRAINT ck_pipeline_stage_results_status CHECK (
@@ -303,7 +303,7 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_activity (
     CONSTRAINT fk_pipeline_stage_activity_task FOREIGN KEY (task_id, task_version)
         REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
     CONSTRAINT ck_pipeline_stage_activity_stage CHECK (
-        stage IN ('generate', 'validate', 'reward', 'push')
+        stage IN ('generate', 'validate', 'repair', 'reward', 'push')
     ),
     CONSTRAINT ck_pipeline_stage_activity_attempt_positive CHECK (attempt > 0),
     CONSTRAINT ck_pipeline_stage_activity_pgmq_msg_id_positive CHECK (pgmq_msg_id > 0),

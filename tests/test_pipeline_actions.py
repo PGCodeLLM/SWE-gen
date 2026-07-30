@@ -5,6 +5,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -19,6 +20,7 @@ _ACTION_ENVIRONMENT_NAMES = (
     "SWEGEN_CC_TIMEOUT_SECONDS",
     "SWEGEN_GENERATE_TIMEOUT_SECONDS",
     "SWEGEN_HARBOR_TIMEOUT_SECONDS",
+    "SWEGEN_REPAIR_TIMEOUT_SECONDS",
     "SWEGEN_REWARD_ENDPOINT",
     "SWEGEN_REWARD_PRIMARY_MODEL",
     "SWEGEN_REWARD_FALLBACK_MODEL",
@@ -1019,11 +1021,53 @@ def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
     assert removed == ["local-source:latest", remote_tag]
 
 
+def test_repair_action_captures_agent_edits_and_returns_to_authoritative_validation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    task_dir = tmp_path / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "tests").mkdir()
+    (task_dir / "solution").mkdir()
+    (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\nexit 1\n")
+    (task_dir / "tests" / "case.py").write_text("assert False\n")
+    (task_dir / "solution" / "solve.sh").write_text("#!/bin/sh\n")
+    calls: list[dict[str, object]] = []
+
+    def fake_session(**kwargs):
+        calls.append(kwargs)
+        (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\npytest -q case.py\n")
+        return SimpleNamespace(
+            success=False,
+            nop_passed=True,
+            oracle_passed=False,
+            error_message="oracle still failed",
+        )
+
+    monkeypatch.setattr(actions, "run_claude_code_session", fake_session)
+
+    execution = actions.repair_action(task, tmp_path)
+
+    assert execution.status is StageResultStatus.SUCCEEDED
+    assert execution.result_json()["agent_reported_success"] is False
+    captured = {task_file.path: task_file.content for task_file in execution.files}
+    assert captured["tests/test.sh"] == b"#!/bin/sh\npytest -q case.py\n"
+    assert calls[0]["repair"] is True
+    assert calls[0]["validate"] is True
+    assert calls[0]["test_files"] == ["tests/case.py"]
+    assert calls[0]["timeout"] == actions.DEFAULT_REPAIR_TIMEOUT_SECONDS
+
+
 def test_action_for_stage_maps_all_pipeline_stages_and_rejects_unknown() -> None:
     from swegen.pipeline import actions
 
     assert actions.action_for_stage(PipelineStage.GENERATE) is actions.generate_action
     assert actions.action_for_stage(PipelineStage.VALIDATE) is actions.validate_action
+    assert actions.action_for_stage(PipelineStage.REPAIR) is actions.repair_action
     assert actions.action_for_stage(PipelineStage.REWARD) is actions.reward_action
     assert actions.action_for_stage(PipelineStage.PUSH) is actions.push_action
 

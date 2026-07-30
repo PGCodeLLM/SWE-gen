@@ -1,8 +1,118 @@
 from __future__ import annotations
 
-from subprocess import CompletedProcess
+import re
+from subprocess import CompletedProcess, run
 
 import pytest
+
+
+def evaluate_chart_scroll_target(saved: int | None, max_scroll: int) -> int:
+    from swegen.dashboard.server import HTML
+
+    match = re.search(
+        r"function chartScrollTarget\(saved,maxScroll\)\{[^}]+\}",
+        HTML,
+    )
+    assert match is not None
+    saved_javascript = "undefined" if saved is None else str(saved)
+    completed = run(
+        [
+            "node",
+            "-e",
+            f"{match.group(0)};process.stdout.write(String("
+            f"chartScrollTarget({saved_javascript},{max_scroll})));",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(completed.stdout)
+
+
+def evaluate_cpu_triple(
+    used: str,
+    allocated: str,
+    allocatable: str,
+) -> str:
+    from swegen.dashboard.server import HTML
+
+    definitions = []
+    for name in ("compactCores", "cpuPart", "formatCpuTriple"):
+        match = re.search(rf"const {name}=.*?;", HTML)
+        assert match is not None
+        definitions.append(match.group(0))
+    completed = run(
+        [
+            "node",
+            "-e",
+            "".join(definitions)
+            + f"process.stdout.write(formatCpuTriple({used},{allocated},{allocatable}));",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+def test_chart_first_render_defaults_to_the_rightmost_position() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert evaluate_chart_scroll_target(None, 417) == 417
+    assert "restoreChartScroll(chart,stage)" in HTML
+    assert "requestAnimationFrame" in HTML
+
+
+def test_chart_refresh_preserves_a_user_selected_scroll_position() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert evaluate_chart_scroll_target(137, 417) == 137
+    assert evaluate_chart_scroll_target(0, 417) == 0
+    assert "hasOwnProperty.call(uiState.chartScroll,stage)" in HTML
+    assert "uiState.chartScroll[stage]=chart.scrollLeft" in HTML
+
+
+def test_cpu_triple_formats_used_allocated_and_allocatable_in_order() -> None:
+    assert evaluate_cpu_triple("1250", "2500", "4000") == ("1.25 (31.3)% / 2.5 (62.5)% / 4 cores")
+
+
+def test_cpu_triple_preserves_meaningful_fractional_cores() -> None:
+    assert evaluate_cpu_triple("254", "1500", "192000") == ("0.254 (0.1)% / 1.5 (0.8)% / 192 cores")
+    assert evaluate_cpu_triple("40747", "498200", "768000") == (
+        "40.7 (5.3)% / 498.2 (64.9)% / 768 cores"
+    )
+
+
+def test_cpu_triple_handles_zero_or_missing_capacity_without_invalid_numbers() -> None:
+    assert evaluate_cpu_triple("100", "undefined", "1000") == ("0.1 (10)% / — / 1 cores")
+    unavailable = evaluate_cpu_triple("100", "200", "0")
+    assert unavailable == "— / — / — cores"
+    assert "NaN" not in unavailable
+    assert "Infinity" not in unavailable
+
+
+def test_dashboard_places_resources_and_storage_immediately_before_recent_tasks() -> None:
+    from swegen.dashboard.server import HTML
+
+    outcomes = HTML.index("<h2>15-minute outcomes</h2>")
+    resources = HTML.index("<h2>Cluster resources</h2>")
+    storage = HTML.index("<h2>Harbor task storage</h2>")
+    recent_tasks = HTML.index("<h2>Recent tasks</h2>")
+
+    assert outcomes < resources < storage < recent_tasks
+    assert "<h2>Task states</h2>" not in HTML
+    assert 'id="states"' not in HTML
+    assert "el('states')" not in HTML
+
+
+def test_top_stage_cards_use_display_names_and_omit_dead_letters() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert "<b>${stageNames[stage]}</b>" in HTML
+    assert "stage.toUpperCase()" not in HTML
+    assert "DEAD LETTERS" not in HTML
+    for title in ("SWEgen", "NOP / Oracle", "Repair", "Reward hack", "SWR push"):
+        assert title in HTML
 
 
 def test_generate_total_is_apportioned_across_main_and_overflow() -> None:

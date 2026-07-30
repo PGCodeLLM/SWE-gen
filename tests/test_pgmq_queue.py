@@ -184,11 +184,13 @@ def test_queue_message_requires_positive_counters(field: str, value: int) -> Non
 def test_pipeline_stages_map_to_fixed_queues_in_order() -> None:
     assert queue_for_stage(PipelineStage.GENERATE) is QueueName.GENERATE
     assert queue_for_stage(PipelineStage.VALIDATE) is QueueName.VALIDATE
+    assert queue_for_stage(PipelineStage.REPAIR) is QueueName.REPAIR
     assert queue_for_stage(PipelineStage.REWARD) is QueueName.REWARD
     assert queue_for_stage(PipelineStage.PUSH) is QueueName.PUSH
 
     assert PipelineStage.GENERATE.next_stage is PipelineStage.VALIDATE
     assert PipelineStage.VALIDATE.next_stage is PipelineStage.REWARD
+    assert PipelineStage.REPAIR.next_stage is PipelineStage.VALIDATE
     assert PipelineStage.REWARD.next_stage is PipelineStage.PUSH
     assert PipelineStage.PUSH.next_stage is None
 
@@ -197,6 +199,7 @@ def test_all_pgmq_queue_names_fit_the_extension_limit() -> None:
     assert {queue.value for queue in QueueName} == {
         "swegen_generate",
         "swegen_validate",
+        "swegen_repair",
         "swegen_reward",
         "swegen_push",
         "swegen_dead",
@@ -822,7 +825,7 @@ def test_bootstrap_sql_accepts_supported_extension_or_complete_sql_only_api() ->
     assert "QUEUE_VISIBLE_LENGTH" in normalized_sql
     assert "SQL-ONLY" in normalized_sql
 
-    assert normalized_sql.count("SELECT PGMQ.CREATE(") == 5
+    assert normalized_sql.count("SELECT PGMQ.CREATE(") == 6
     for queue in QueueName:
         assert f"'{queue.value}'" in sql
 

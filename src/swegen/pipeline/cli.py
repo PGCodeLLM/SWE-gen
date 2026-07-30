@@ -42,8 +42,9 @@ _STAGE_RESULTS_SQL = """
         CASE stage
             WHEN 'generate' THEN 1
             WHEN 'validate' THEN 2
-            WHEN 'reward' THEN 3
-            WHEN 'push' THEN 4
+            WHEN 'repair' THEN 3
+            WHEN 'reward' THEN 4
+            WHEN 'push' THEN 5
         END,
         attempt
 """
@@ -56,8 +57,9 @@ _STAGE_RESULTS_FILTERED_SQL = """
         CASE stage
             WHEN 'generate' THEN 1
             WHEN 'validate' THEN 2
-            WHEN 'reward' THEN 3
-            WHEN 'push' THEN 4
+            WHEN 'repair' THEN 3
+            WHEN 'reward' THEN 4
+            WHEN 'push' THEN 5
         END,
         attempt
 """

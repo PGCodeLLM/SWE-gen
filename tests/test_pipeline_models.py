@@ -346,8 +346,8 @@ def test_pipeline_schema_uses_the_fixed_state_stage_and_result_values() -> None:
     sql = schema_sql()
 
     assert "state IN ('queued', 'running', 'rejected', 'failed', 'completed')" in sql
-    assert "current_stage IN ('generate', 'validate', 'reward', 'push')" in sql
-    assert "stage IN ('generate', 'validate', 'reward', 'push')" in sql
+    assert "current_stage IN ('generate', 'validate', 'repair', 'reward', 'push')" in sql
+    assert "stage IN ('generate', 'validate', 'repair', 'reward', 'push')" in sql
     assert "status IN ('succeeded', 'rejected', 'failed')" in sql
     assert "content BYTEA NOT NULL" in sql
     assert "result JSONB NOT NULL DEFAULT '{}'::jsonb" in sql

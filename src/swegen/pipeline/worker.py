@@ -203,6 +203,7 @@ class WorkerSettings:
     heartbeat_interval_seconds: float = 60
     poll_seconds: int = 10
     max_deliveries: int = 3
+    max_repair_attempts: int = 3
     retry_visibility_timeout_seconds: int = 300
     workspace_root: Path = field(default_factory=_default_workspace_root)
 
@@ -224,6 +225,9 @@ class WorkerSettings:
         max_deliveries = _bounded_positive_integer(
             "max_deliveries", self.max_deliveries, MAX_DELIVERIES
         )
+        max_repair_attempts = _bounded_positive_integer(
+            "max_repair_attempts", self.max_repair_attempts, MAX_DELIVERIES
+        )
         retry_visibility = _bounded_positive_integer(
             "retry_visibility_timeout_seconds",
             self.retry_visibility_timeout_seconds,
@@ -243,6 +247,7 @@ class WorkerSettings:
         object.__setattr__(self, "heartbeat_interval_seconds", heartbeat)
         object.__setattr__(self, "poll_seconds", poll_seconds)
         object.__setattr__(self, "max_deliveries", max_deliveries)
+        object.__setattr__(self, "max_repair_attempts", max_repair_attempts)
         object.__setattr__(
             self,
             "retry_visibility_timeout_seconds",
@@ -470,6 +475,9 @@ class PipelineWorker:
         if self.stop_event.is_set():
             return False
 
+        if self.stage is PipelineStage.REPAIR:
+            self._seed_repair_candidate()
+
         with self.connection_factory() as connection:
             claims = self.queue.claim(
                 connection,
@@ -490,6 +498,23 @@ class PipelineWorker:
                 self._release_claim(claim)
                 continue
             self._process_claim(claim)
+        return True
+
+    def _seed_repair_candidate(self) -> bool:
+        """Atomically reserve and enqueue at most one failed validation task."""
+
+        enqueued_at = self._now()
+        with self.connection_factory() as connection:
+            with connection.transaction():
+                message = self.store.reserve_repair_candidate(
+                    connection,
+                    max_repair_attempts=self.settings.max_repair_attempts,
+                    event_id=self._uuid_factory(),
+                    enqueued_at=enqueued_at,
+                )
+                if message is None:
+                    return False
+                self.queue.send(connection, message)
         return True
 
     def _release_claim(self, claim: ClaimedMessage, *, clear_activity: bool = False) -> None:
@@ -646,10 +671,11 @@ class PipelineWorker:
 
         with self.connection_factory() as connection:
             if execution.should_handoff:
+                successor = self._successor(connection, claim)
                 self.queue.complete_and_handoff(
                     connection,
                     claim,
-                    self._successor(claim),
+                    successor,
                     complete_stage=record_stage_result,
                 )
             else:
@@ -659,7 +685,7 @@ class PipelineWorker:
                     complete_stage=record_stage_result,
                 )
 
-    def _successor(self, claim: ClaimedMessage) -> QueueMessage | None:
+    def _successor(self, connection: Any, claim: ClaimedMessage) -> QueueMessage | None:
         message = claim.message
         next_stage = message.stage.next_stage
         if next_stage is None:
@@ -670,7 +696,12 @@ class PipelineWorker:
             task_id=message.task_id,
             task_version=message.task_version,
             stage=next_stage,
-            attempt=1,
+            attempt=self.store.next_stage_attempt(
+                connection,
+                message.task_id,
+                message.task_version,
+                next_stage,
+            ),
             trace_id=message.trace_id,
             enqueued_at=self._now(),
         )
@@ -768,6 +799,9 @@ def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
         queue=PgmqQueue(),
         store=TaskStore(),
         action=_load_stage_action(stage, cancel_event=stop_event),
+        settings=WorkerSettings(
+            max_repair_attempts=int(os.environ.get("SWEGEN_MAX_REPAIR_ATTEMPTS", "3"))
+        ),
         stop_event=stop_event,
     )
 

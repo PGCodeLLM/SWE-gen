@@ -657,6 +657,45 @@ remove the remaining TODO/template content and stop only after both files are
 complete and saved for the downstream validation stage.
 """
 
+CC_REPAIR_PROMPT = """
+## Your Task: Repair an Existing Harbor Task
+
+The generated Harbor task for **{repo} PR #{pr_number}** failed downstream
+NOP/Oracle validation. Repair the task artifacts in place, then run Harbor and
+iterate until NOP has reward 0 and Oracle has reward 1.
+
+Task directory: `{task_dir}`
+Dataset path: `{dataset_path}`
+Harbor jobs: `{jobs_dir}`
+Task ID: `{task_id}`
+Extracted task test files:
+{test_files_list}
+
+This is a task-packaging repair, not a request to rewrite the upstream bug fix.
+Inspect `environment/Dockerfile`, `environment/bug.patch`, `solution/fix.patch`,
+`solution/solve.sh`, and `tests/test.sh`. Typical repairs include runtime and
+dependency pins, CA/proxy setup, build steps, copied test fixtures, test command
+scope, and post-patch rebuilds. Preserve the task identity and Harbor layout.
+
+Run the validations synchronously and keep their output under `{jobs_dir}`:
+
+```bash
+harbor run {harbor_config_args} --agent nop -p {dataset_path} -t {task_id} --jobs-dir {jobs_dir}/{task_id}-nop-1 --no-delete --env {environment}
+harbor run {harbor_config_args} --agent oracle -p {dataset_path} -t {task_id} --jobs-dir {jobs_dir}/{task_id}-oracle-1 --env {environment}
+```
+
+Increment the run suffix on retries. Do not delegate to Task/subagents or start
+background agents. Stop only after saving all changes and attempting both NOP
+and Oracle; validation remains authoritative downstream.
+"""
+
+CC_REPAIR_CONTINUATION_PROMPT = """
+Continue repairing the same Harbor task. Inspect the latest Harbor results,
+edit the task artifacts in place, and rerun NOP and Oracle synchronously. Do not
+delegate or return a progress-only response. Stop only after saving the repair
+and attempting both validations.
+"""
+
 MAX_INCOMPLETE_CONTINUATIONS = 3
 
 
@@ -676,6 +715,7 @@ def run_claude_code_session(
     environment: str = "docker",
     jobs_dir: Path | None = None,
     validate: bool = True,
+    repair: bool = False,
 ) -> ClaudeCodeResult:
     """
     Run Claude Code session to complete skeleton and make harbor pass.
@@ -731,6 +771,7 @@ def run_claude_code_session(
                 environment=environment,
                 jobs_dir=jobs_dir,
                 validate=validate,
+                repair=repair,
             )
         )
     finally:
@@ -761,6 +802,7 @@ async def _run_claude_code_session_async(
     environment: str = "docker",
     jobs_dir: Path | None = None,
     validate: bool = True,
+    repair: bool = False,
 ) -> ClaudeCodeResult:
     """Async implementation of Claude Code session."""
     logger = logging.getLogger("swegen")
@@ -796,7 +838,15 @@ async def _run_claude_code_session_async(
         dataset_path=dataset_path,
         logger=logger,
     )
-    prompt_template = CC_PROMPT if validate else CC_GENERATE_ONLY_PROMPT
+    if repair and not validate:
+        raise ValueError("repair sessions require validation")
+    prompt_template = (
+        CC_REPAIR_PROMPT
+        if repair
+        else CC_PROMPT
+        if validate
+        else CC_GENERATE_ONLY_PROMPT
+    )
     prompt_text = prompt_template.format(
         repo=repo,
         pr_number=pr_number,
@@ -810,7 +860,7 @@ async def _run_claude_code_session_async(
         harbor_config_args=harbor_config_args,
         dockerfile_hint_section=dockerfile_hint_section,
     )
-    prompt_kind = "full" if validate else "generation-only"
+    prompt_kind = "repair" if repair else "full" if validate else "generation-only"
     if dockerfile_hint_section:
         logger.info(
             "Using %s prompt with Dockerfile hint from %s, PR #%s",
@@ -1001,7 +1051,9 @@ async def _run_claude_code_session_async(
                                     flush=True,
                                 )
                             next_prompt = (
-                                CC_CONTINUATION_PROMPT
+                                CC_REPAIR_CONTINUATION_PROMPT
+                                if repair
+                                else CC_CONTINUATION_PROMPT
                                 if validate
                                 else CC_GENERATE_ONLY_CONTINUATION_PROMPT
                             )

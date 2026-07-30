@@ -112,3 +112,85 @@ def test_run_harbor_agent_cancels_process_group_and_reaps_containers(
         )
 
     assert reaped == ["owner__repo-1"]
+
+
+def test_run_harbor_agent_disables_compose_bake_delegation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    check_environment = (
+        "import os, sys; "
+        "sys.exit(0 if os.environ.get('COMPOSE_BAKE') == 'false' "
+        "and os.environ.get('DOCKER_BUILDKIT') == '1' else 7)"
+    )
+    monkeypatch.setattr(
+        harbor_runner,
+        "harbor_cmd_base",
+        lambda: [sys.executable, "-c", check_environment],
+    )
+    monkeypatch.setattr(harbor_runner, "suffixed_docker_config_args", lambda *_: [])
+    monkeypatch.setattr(harbor_runner, "_reap_harbor_containers", lambda *_: None)
+
+    exit_code, result_path = harbor_runner.run_harbor_agent(
+        "owner__repo-1",
+        tmp_path / "tasks",
+        tmp_path / "jobs",
+        "nop",
+        capture_output=True,
+        wall_timeout_seconds=60,
+    )
+
+    assert exit_code == 0
+    assert result_path is None
+
+
+def test_duplicate_compose_builds_keep_only_newest_retry() -> None:
+    processes = (
+        harbor_runner._ComposeBuildProcess(
+            pid=101,
+            started_at_ticks=1_000,
+            project="owner__repo-1__suffix",
+        ),
+        harbor_runner._ComposeBuildProcess(
+            pid=202,
+            started_at_ticks=2_000,
+            project="owner__repo-1__suffix",
+        ),
+        harbor_runner._ComposeBuildProcess(
+            pid=303,
+            started_at_ticks=500,
+            project="another__repo-2__suffix",
+        ),
+    )
+
+    assert harbor_runner._duplicate_compose_build_pids(processes) == (101,)
+
+
+def test_duplicate_compose_reaper_escalates_stuck_client(monkeypatch) -> None:
+    processes = (
+        harbor_runner._ComposeBuildProcess(
+            pid=101,
+            started_at_ticks=1_000,
+            project="owner__repo-1__suffix",
+        ),
+        harbor_runner._ComposeBuildProcess(
+            pid=202,
+            started_at_ticks=2_000,
+            project="owner__repo-1__suffix",
+        ),
+    )
+    signals: list[tuple[int, int]] = []
+    clock = iter((10.0, 10.0 + harbor_runner.COMPOSE_REAP_GRACE_SECONDS))
+    monkeypatch.setattr(harbor_runner, "_compose_build_processes", lambda _pgid: processes)
+    monkeypatch.setattr(harbor_runner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        harbor_runner.os,
+        "kill",
+        lambda pid, selected_signal: signals.append((pid, selected_signal)),
+    )
+    terminating_since: dict[int, float] = {}
+
+    harbor_runner._reap_duplicate_compose_builds(999, terminating_since)
+    harbor_runner._reap_duplicate_compose_builds(999, terminating_since)
+
+    assert signals == [(101, harbor_runner.signal.SIGTERM), (101, harbor_runner.signal.SIGKILL)]

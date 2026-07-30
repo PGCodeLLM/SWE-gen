@@ -20,6 +20,7 @@ from harbor.models.trial.result import TrialResult
 SUFFIXED_DOCKER_ENV_IMPORT_PATH = "swegen.tools.suffixed_docker:SwegenDockerEnvironment"
 HARBOR_CANCEL_POLL_SECONDS = 1.0
 HARBOR_STOP_GRACE_SECONDS = 10.0
+COMPOSE_REAP_GRACE_SECONDS = 5.0
 
 
 class HarborRunCancelled(RuntimeError):
@@ -135,6 +136,131 @@ def _stop_harbor_process_group(child: subprocess.Popen[str]) -> None:
     child.communicate()
 
 
+@dataclass(frozen=True, slots=True)
+class _ComposeBuildProcess:
+    pid: int
+    started_at_ticks: int
+    project: str
+
+
+def _process_started_at_ticks(pid: int) -> int:
+    """Read Linux's monotonic process start tick from ``/proc/<pid>/stat``."""
+
+    stat = (Path("/proc") / str(pid) / "stat").read_text()
+    closing_parenthesis = stat.rfind(")")
+    if closing_parenthesis < 0:
+        raise ValueError(f"invalid /proc stat for pid {pid}")
+    # Fields after the command name begin at field 3 (state); starttime is
+    # field 22, hence offset 19 in this suffix.
+    return int(stat[closing_parenthesis + 2 :].split()[19])
+
+
+def _compose_build_processes(process_group_id: int) -> tuple[_ComposeBuildProcess, ...]:
+    """Return Compose build clients that belong to one Harbor process group."""
+
+    processes: list[_ComposeBuildProcess] = []
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if os.getpgid(pid) != process_group_id:
+                continue
+            argv = tuple(
+                value.decode(errors="replace")
+                for value in (entry / "cmdline").read_bytes().split(b"\0")
+                if value
+            )
+            if (
+                len(argv) < 3
+                or Path(argv[0]).name != "docker"
+                or argv[1] != "compose"
+                or "build" not in argv[2:]
+            ):
+                continue
+            project_index = argv.index("-p")
+            project = argv[project_index + 1]
+            if not project:
+                continue
+            processes.append(
+                _ComposeBuildProcess(
+                    pid=pid,
+                    started_at_ticks=_process_started_at_ticks(pid),
+                    project=project,
+                )
+            )
+        except (IndexError, OSError, ProcessLookupError, ValueError):
+            # Processes can exit or change between /proc enumeration and read.
+            continue
+    return tuple(processes)
+
+
+def _duplicate_compose_build_pids(
+    processes: tuple[_ComposeBuildProcess, ...],
+) -> tuple[int, ...]:
+    """Choose every stale retry client while keeping the newest per project."""
+
+    by_project: dict[str, list[_ComposeBuildProcess]] = {}
+    for process in processes:
+        by_project.setdefault(process.project, []).append(process)
+    stale: list[int] = []
+    for project_processes in by_project.values():
+        ordered = sorted(
+            project_processes,
+            key=lambda process: (process.started_at_ticks, process.pid),
+        )
+        stale.extend(process.pid for process in ordered[:-1])
+    return tuple(stale)
+
+
+def _reap_duplicate_compose_builds(
+    process_group_id: int,
+    terminating_since: dict[int, float],
+) -> int:
+    """Cancel Harbor's abandoned first build when its built-in retry starts.
+
+    Harbor retries environment startup after the task's build timeout. Its
+    Docker backend currently lets asyncio cancellation abandon the first
+    ``docker compose build`` client, so the retry runs two identical BuildKit
+    solves for the same project. Reap the older client promptly and escalate
+    if it ignores SIGTERM.
+    """
+
+    now = time.monotonic()
+    stale_pids = set(
+        _duplicate_compose_build_pids(_compose_build_processes(process_group_id))
+    )
+    for pid in tuple(terminating_since):
+        if pid not in stale_pids:
+            terminating_since.pop(pid, None)
+    for pid in stale_pids:
+        first_signal_at = terminating_since.setdefault(pid, now)
+        selected_signal = (
+            signal.SIGKILL
+            if now - first_signal_at >= COMPOSE_REAP_GRACE_SECONDS
+            else signal.SIGTERM
+        )
+        try:
+            os.kill(pid, selected_signal)
+        except ProcessLookupError:
+            terminating_since.pop(pid, None)
+    return len(stale_pids)
+
+
+def _reap_remaining_compose_builds(process_group_id: int) -> None:
+    """Terminate Compose build clients left after Harbor itself has exited."""
+
+    for process in _compose_build_processes(process_group_id):
+        try:
+            os.kill(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
 def run_harbor_agent(
     task_id: str,
     dataset_path: Path,
@@ -195,16 +321,17 @@ def run_harbor_agent(
     if not delete_after:
         cmd.append("--no-delete")
 
-    # Force Compose's build onto the legacy per-service build path instead of
-    # delegating to `docker buildx bake`. Compose v2 (v5.3.1 here) defaults to
-    # bake, whose `docker-buildx bake` procs deadlock on futex_wait_queue under
-    # Stage-2 concurrency (builds wedge at ~0% CPU, never harvested, slots never
-    # free — the whole baseline queue stalls). COMPOSE_BAKE=0 disables that path.
+    # Force Compose's build onto its internal BuildKit path instead of
+    # delegating to `docker buildx bake`. The worker image pins Compose v2.40.3,
+    # the last compatible line where COMPOSE_BAKE=false is honored. Compose
+    # v5.3.1 ignores this setting and always chooses Bake when BuildKit is on.
+    # Under Stage-2 concurrency those `docker-buildx bake` clients deadlock on
+    # futex_wait_queue, are never harvested, and eventually stall the queue.
     # Passed explicitly in the child env (not just inherited) so it survives any
     # sg/newgrp/login-shell hop Harbor makes when it shells out to Compose.
     child_env = {
         **os.environ,
-        "COMPOSE_BAKE": "0",
+        "COMPOSE_BAKE": "false",
         "DOCKER_BUILDKIT": "1",
     }
     child = subprocess.Popen(
@@ -218,6 +345,7 @@ def run_harbor_agent(
     deadline = (
         None if wall_timeout_seconds is None else time.monotonic() + wall_timeout_seconds
     )
+    duplicate_compose_terminations: dict[int, float] = {}
     while True:
         if cancel_event is not None and cancel_event.is_set():
             _stop_harbor_process_group(child)
@@ -232,22 +360,23 @@ def run_harbor_agent(
                 f"Harbor {agent} timed out after {wall_timeout_seconds:g} seconds"
             )
 
-        poll_timeout = remaining
-        if cancel_event is not None:
-            poll_timeout = HARBOR_CANCEL_POLL_SECONDS
-            if remaining is not None:
-                poll_timeout = min(poll_timeout, remaining)
+        _reap_duplicate_compose_builds(child.pid, duplicate_compose_terminations)
+        poll_timeout = HARBOR_CANCEL_POLL_SECONDS
+        if remaining is not None:
+            poll_timeout = min(poll_timeout, remaining)
         try:
             stdout, stderr = child.communicate(timeout=poll_timeout)
             break
         except subprocess.TimeoutExpired as error:
-            if cancel_event is None:
+            if remaining is not None and poll_timeout >= remaining:
                 _stop_harbor_process_group(child)
                 _reap_harbor_containers(task_id, environment)
                 raise TimeoutError(
                     f"Harbor {agent} timed out after {wall_timeout_seconds:g} seconds"
                 ) from error
             continue
+
+    _reap_remaining_compose_builds(child.pid)
 
     # Normal completion: Harbor's own teardown may still have failed silently
     # under daemon load (it swallows compose-down errors), so reap defensively.

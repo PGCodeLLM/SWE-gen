@@ -298,15 +298,19 @@ def test_status_filters_all_ledger_queries_and_reports_fixed_queues() -> None:
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
             (
-                "swegen_reward length=2 visible=2 total=12 "
+                "swegen_repair length=2 visible=2 total=12 "
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
             (
-                "swegen_push length=3 visible=3 total=13 "
+                "swegen_reward length=3 visible=3 total=13 "
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
             (
-                "swegen_dead length=4 visible=4 total=14 "
+                "swegen_push length=4 visible=4 total=14 "
+                "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
+            ),
+            (
+                "swegen_dead length=5 visible=5 total=15 "
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
         ]

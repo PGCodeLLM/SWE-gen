@@ -31,6 +31,8 @@ data:
   SWEGEN_GITHUB_RETRY_BASE_SECONDS: "10"
   SWEGEN_GITHUB_MAX_WAIT_SECONDS: "300"
   SWEGEN_HARBOR_TIMEOUT_SECONDS: "3600"
+  SWEGEN_REPAIR_TIMEOUT_SECONDS: "14400"
+  SWEGEN_MAX_REPAIR_ATTEMPTS: "3"
   SWEGEN_REWARD_PRIMARY_MODEL: gpt-5.6-sol
   SWEGEN_REWARD_FALLBACK_MODEL: gpt-5.6-sol
   SWEGEN_SWR_HOST: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
@@ -135,12 +137,12 @@ metadata:
   name: swegen-validate
   namespace: swegen-pipeline
 spec:
-  replicas: 168
+  replicas: 96
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 50%
-      maxUnavailable: 0
+      maxSurge: 0
+      maxUnavailable: 20%
   selector:
     matchLabels:
       app.kubernetes.io/name: swegen-worker
@@ -152,10 +154,18 @@ spec:
         swegen.pgcode/stage: validate
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 7200
+      terminationGracePeriodSeconds: 300
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker
+              swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:e2e-observe-tail-activity-20260729
+          image: swegen-worker:validate-next-attempt-20260730
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           envFrom:
@@ -165,6 +175,102 @@ spec:
                 name: swegen-database
             - secretRef:
                 name: swegen-runtime-proxy
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/swegen-k3s/workspaces
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/swegen-k3s/workspaces
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swegen-repair
+  namespace: swegen-pipeline
+spec:
+  replicas: 4
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-worker
+      swegen.pgcode/stage: repair
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-worker
+        swegen.pgcode/stage: repair
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 18000
+      containers:
+        - name: worker
+          image: swegen-worker:repair-handoff-fix-20260730
+          imagePullPolicy: Never
+          args: ["--stage", "repair"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+            - secretRef:
+                name: swegen-repair-model-credentials
           env:
             - name: POD_NAME
               valueFrom:

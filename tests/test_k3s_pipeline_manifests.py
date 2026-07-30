@@ -21,7 +21,10 @@ def test_worker_image_has_required_runtime_tools() -> None:
     assert "python:3.12" in dockerfile
     assert "docker-ce-cli" in dockerfile
     assert "docker-buildx-plugin" in dockerfile
-    assert "docker-compose-plugin" in dockerfile
+    assert "DOCKER_COMPOSE_VERSION=2.40.3" in dockerfile
+    assert "DOCKER_COMPOSE_SHA256=" in dockerfile
+    assert "docker-compose-linux-x86_64" in dockerfile
+    assert "docker-compose-plugin" not in dockerfile
     assert "pip install --no-cache-dir uv==0.11.28" in dockerfile
     assert "uv sync --frozen --no-dev" in dockerfile
     assert "--mount=type=secret,id=combined_ca" in dockerfile
@@ -50,6 +53,8 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert config_map["data"]["SWEGEN_GITHUB_MAX_WAIT_SECONDS"] == "300"
     assert config_map["data"]["SWEGEN_REWARD_PRIMARY_MODEL"] == "gpt-5.6-sol"
     assert config_map["data"]["SWEGEN_REWARD_FALLBACK_MODEL"] == "gpt-5.6-sol"
+    assert config_map["data"]["SWEGEN_MAX_REPAIR_ATTEMPTS"] == "3"
+    assert config_map["data"]["SWEGEN_REPAIR_TIMEOUT_SECONDS"] == "14400"
     no_proxy = config_map["data"]["SWEGEN_NO_PROXY"]
     assert not any(character.isspace() for character in no_proxy)
     assert ".myhuaweicloud.com" in no_proxy
@@ -59,6 +64,7 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert set(deployments) == {
         "swegen-generate",
         "swegen-validate",
+        "swegen-repair",
         "swegen-reward",
         "swegen-push",
     }
@@ -70,29 +76,46 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     }
     expected_replicas = {
         "swegen-generate": 48,
-        "swegen-validate": 168,
+        "swegen-validate": 96,
+        "swegen-repair": 4,
         "swegen-reward": 16,
         "swegen-push": 1,
     }
     expected_images = {
         "swegen-generate": "swegen-worker:e2e",
-        "swegen-validate": "swegen-worker:e2e-observe-tail-activity-20260729",
+        "swegen-validate": "swegen-worker:validate-next-attempt-20260730",
+        "swegen-repair": "swegen-worker:repair-handoff-fix-20260730",
         "swegen-reward": "swegen-worker:e2e",
         "swegen-push": "swegen-worker:e2e-ca-20260729",
     }
-    docker_stages = {"validate", "push"}
+    docker_stages = {"validate", "repair", "push"}
     for name, deployment in deployments.items():
         pod_spec = deployment["spec"]["template"]["spec"]
         container = pod_spec["containers"][0]
         stage = name.removeprefix("swegen-")
 
         assert deployment["spec"]["replicas"] == expected_replicas[name]
-        if name == "swegen-validate":
+        if name in {"swegen-validate", "swegen-repair"}:
             assert "nodeSelector" not in pod_spec
-            assert deployment["spec"]["strategy"] == {
-                "type": "RollingUpdate",
-                "rollingUpdate": {"maxSurge": "50%", "maxUnavailable": 0},
-            }
+            if name == "swegen-validate":
+                assert deployment["spec"]["strategy"] == {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {"maxSurge": 0, "maxUnavailable": "20%"},
+                }
+                assert pod_spec["terminationGracePeriodSeconds"] == 300
+                assert pod_spec["topologySpreadConstraints"] == [
+                    {
+                        "maxSkew": 1,
+                        "topologyKey": "kubernetes.io/hostname",
+                        "whenUnsatisfiable": "DoNotSchedule",
+                        "labelSelector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": "swegen-worker",
+                                "swegen.pgcode/stage": "validate",
+                            }
+                        },
+                    }
+                ]
         else:
             assert pod_spec["nodeSelector"] == {
                 "swegen.pgcode/node-ip": expected_nodes[name]
@@ -141,12 +164,18 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert '"httpsProxy"' in secret_helper
     assert '"noProxy"' in secret_helper
     assert '--from-file=config.json="${merged_docker_config}"' in secret_helper
+    assert "swegen-repair-model-credentials" in secret_helper
+    assert 'os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-moedsa")' in secret_helper
+    assert 'entry.get("model_name") == model' in secret_helper
+    assert '"CLAUDE_CODE_MAX_CONTEXT_TOKENS", "160000"' in secret_helper
+    assert '"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "150000"' in secret_helper
 
 
 def test_from_scratch_guide_pins_runtime_and_documents_growth_controls() -> None:
     guide = (DEPLOY_DIR / "README.md").read_text()
 
     assert "v1.36.2+k3s1" in guide
+    assert "v2.40.3" in guide and "COMPOSE_BAKE=false" in guide
     assert "PostgreSQL" in guide and "16.13" in guide
     assert "PGMQ" in guide and "1.12.0" in guide and "SQL-only" in guide
     assert "src/swegen/queueing/bootstrap.sql" in guide

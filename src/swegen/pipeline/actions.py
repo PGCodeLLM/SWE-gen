@@ -26,6 +26,7 @@ from reward_hacking_detector.hacking import (
     build_test_bundle,
     check_instance_with_fallback,
 )
+from swegen.create.claude_code_runner import run_claude_code_session
 from swegen.create.claude_code_utils import redact_sensitive_text
 from swegen.model_settings import load_github_tokens
 from swegen.pipeline.models import PipelineTask, StageExecution
@@ -42,6 +43,7 @@ LOGGER = logging.getLogger(__name__)
 MAX_COMMAND_LOG_BYTES = 1024 * 1024
 DEFAULT_CC_TIMEOUT_SECONDS = 10800
 DEFAULT_GENERATE_TIMEOUT_SECONDS = 14400.0
+DEFAULT_REPAIR_TIMEOUT_SECONDS = 14400
 DEFAULT_HARBOR_TIMEOUT_SECONDS = 3600.0
 DEFAULT_REWARD_ENDPOINT = "https://arcyleung-ubuntu.tailb940e6.ts.net"
 DEFAULT_REWARD_PRIMARY_MODEL = "gpt-5.3-codex-spark"
@@ -377,6 +379,61 @@ def validate_action(
             )
 
 
+def repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
+    """Let Claude Code repair task packaging, then return it to validation."""
+
+    task_dir = workspace / "tasks" / task.task_id
+    if not task_dir.is_dir():
+        raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+    _ensure_proxy_ca_runtime_environment(task_dir)
+    tests_dir = task_dir / "tests"
+    test_files = (
+        sorted(
+            path.relative_to(task_dir).as_posix()
+            for path in tests_dir.rglob("*")
+            if path.is_file() and path.name != "test.sh"
+        )
+        if tests_dir.is_dir()
+        else []
+    )
+    result = run_claude_code_session(
+        repo=task.repo,
+        pr_number=task.pr,
+        repo_path=task_dir,
+        task_dir=task_dir,
+        task_id=task.task_id,
+        dataset_path=workspace / "tasks",
+        test_files=test_files,
+        timeout=_environment_positive_integer(
+            "SWEGEN_REPAIR_TIMEOUT_SECONDS",
+            DEFAULT_REPAIR_TIMEOUT_SECONDS,
+        ),
+        verbose=False,
+        jobs_dir=workspace / ".swegen" / "repair-harbor-jobs",
+        validate=True,
+        repair=True,
+    )
+    _ensure_proxy_ca_runtime_environment(task_dir)
+    files = capture_task_files(task_dir)
+    if not files:
+        raise RuntimeError(f"repaired task directory is empty: {task.task_id}")
+    return StageExecution.succeeded(
+        {
+            "agent_reported_success": result.success,
+            "agent_nop_passed": result.nop_passed,
+            "agent_oracle_passed": result.oracle_passed,
+            "agent_error": (
+                _compact_safe_error_detail(result.error_message, 1000)
+                if result.error_message
+                else None
+            ),
+            "file_count": len(files),
+            "total_bytes": sum(task_file.size_bytes or 0 for task_file in files),
+        },
+        files,
+    )
+
+
 def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
     """Reject test bundles that the reward-hacking detector flags."""
 
@@ -524,6 +581,7 @@ def action_for_stage(
     actions = {
         PipelineStage.GENERATE: generate_action,
         PipelineStage.VALIDATE: validation_action,
+        PipelineStage.REPAIR: repair_action,
         PipelineStage.REWARD: reward_action,
         PipelineStage.PUSH: push_action,
     }
@@ -535,6 +593,7 @@ __all__ = [
     "build_generate_command",
     "generate_action",
     "push_action",
+    "repair_action",
     "reward_action",
     "validate_action",
 ]

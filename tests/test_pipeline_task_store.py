@@ -121,6 +121,13 @@ CLEAR_STAGE_ACTIVITY_SQL = normalize_sql(
     WHERE task_id = %s AND task_version = %s AND stage = %s AND pgmq_msg_id = %s
     """
 )
+NEXT_STAGE_ATTEMPT_SQL = normalize_sql(
+    """
+    SELECT COALESCE(MAX(attempt), 0) + 1 AS next_attempt
+    FROM pipeline_stage_results
+    WHERE task_id = %s AND task_version = %s AND stage = %s
+    """
+)
 
 
 @dataclass(frozen=True)
@@ -865,6 +872,67 @@ def test_load_files_decodes_rows_and_returns_path_order() -> None:
     assert connection.calls == [(LOAD_FILES_SQL, ("owner__repo-123", 1))]
 
 
+def test_next_stage_attempt_uses_durable_stage_history() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    connection = RecordingConnection([{"next_attempt": 4}])
+
+    assert TaskStore().next_stage_attempt(
+        connection,
+        "owner__repo-123",
+        1,
+        PipelineStage.VALIDATE,
+    ) == 4
+    assert connection.calls == [
+        (
+            NEXT_STAGE_ATTEMPT_SQL,
+            ("owner__repo-123", 1, "validate"),
+        )
+    ]
+
+
+def test_reserve_repair_candidate_returns_bounded_attempt_message() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    connection = RecordingConnection(
+        [("owner__repo-123", 1, TRACE_ID, 2)]
+    )
+
+    message = TaskStore().reserve_repair_candidate(
+        connection,
+        max_repair_attempts=3,
+        event_id=EVENT_ID,
+        enqueued_at=ENQUEUED_AT,
+    )
+
+    assert message == QueueMessage(
+        event_id=EVENT_ID,
+        task_id="owner__repo-123",
+        task_version=1,
+        stage=PipelineStage.REPAIR,
+        attempt=2,
+        trace_id=TRACE_ID,
+        enqueued_at=ENQUEUED_AT,
+    )
+    query, params = connection.calls[0]
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert "current_stage IN ('validate', 'repair')" in query
+    assert params == (3, ENQUEUED_AT)
+
+
+def test_reserve_repair_candidate_returns_none_after_attempt_cap() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    connection = RecordingConnection([])
+
+    assert TaskStore().reserve_repair_candidate(
+        connection,
+        max_repair_attempts=3,
+        event_id=EVENT_ID,
+        enqueued_at=ENQUEUED_AT,
+    ) is None
+
+
 def test_replace_files_deletes_then_inserts_every_file_without_committing() -> None:
     from swegen.pipeline.task_store import TaskStore
 
@@ -966,6 +1034,50 @@ def test_record_generate_success_replaces_files_and_queues_validate_state() -> N
             ),
         ),
     ]
+
+
+def test_record_repair_success_replaces_files_and_requeues_validation() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.REPAIR, attempt=2)
+    repaired_file = make_task_file(content=b"repaired\n")
+    execution = StageExecution.succeeded({"repaired": True}, (repaired_file,))
+    connection = RecordingConnection(
+        inserted_stage_result(claim),
+        CursorResult(),
+        CursorResult(),
+        CursorResult(rowcount=1),
+    )
+
+    assert TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+        connection,
+        claim,
+        execution,
+        started_at=STARTED_AT,
+        worker_id="repair-1",
+        node_name="node-a",
+    )
+
+    assert connection.calls[1] == (
+        DELETE_FILES_SQL,
+        (claim.message.task_id, claim.message.task_version),
+    )
+    assert connection.calls[2][0] == INSERT_FILE_SQL
+    assert connection.calls[3] == (
+        UPDATE_TASK_SQL,
+        (
+            "queued",
+            "validate",
+            FINISHED_AT,
+            None,
+            None,
+            None,
+            claim.message.task_id,
+            claim.message.task_version,
+            claim.message.trace_id,
+            "repair",
+        ),
+    )
 
 
 def test_record_generate_success_rejects_digest_mismatch_before_sql() -> None:

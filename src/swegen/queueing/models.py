@@ -13,6 +13,7 @@ class PipelineStage(StrEnum):
 
     GENERATE = "generate"
     VALIDATE = "validate"
+    REPAIR = "repair"
     REWARD = "reward"
     PUSH = "push"
 
@@ -28,6 +29,7 @@ class QueueName(StrEnum):
 
     GENERATE = "swegen_generate"
     VALIDATE = "swegen_validate"
+    REPAIR = "swegen_repair"
     REWARD = "swegen_reward"
     PUSH = "swegen_push"
     DEAD = "swegen_dead"
@@ -43,6 +45,7 @@ class RetryDisposition(StrEnum):
 _NEXT_STAGE: dict[PipelineStage, PipelineStage | None] = {
     PipelineStage.GENERATE: PipelineStage.VALIDATE,
     PipelineStage.VALIDATE: PipelineStage.REWARD,
+    PipelineStage.REPAIR: PipelineStage.VALIDATE,
     PipelineStage.REWARD: PipelineStage.PUSH,
     PipelineStage.PUSH: None,
 }
@@ -50,6 +53,7 @@ _NEXT_STAGE: dict[PipelineStage, PipelineStage | None] = {
 _QUEUE_BY_STAGE: dict[PipelineStage, QueueName] = {
     PipelineStage.GENERATE: QueueName.GENERATE,
     PipelineStage.VALIDATE: QueueName.VALIDATE,
+    PipelineStage.REPAIR: QueueName.REPAIR,
     PipelineStage.REWARD: QueueName.REWARD,
     PipelineStage.PUSH: QueueName.PUSH,
 }

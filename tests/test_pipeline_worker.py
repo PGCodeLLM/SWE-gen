@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -122,6 +122,14 @@ class FakeConnection:
         self.exited = True
         self.events.append(f"{self.name}:exit")
 
+    @contextmanager
+    def transaction(self):
+        self.events.append(f"{self.name}:transaction-enter")
+        try:
+            yield self
+        finally:
+            self.events.append(f"{self.name}:transaction-exit")
+
 
 class RecordingConnectionFactory:
     def __init__(self) -> None:
@@ -148,6 +156,19 @@ class FakeQueue:
         self.completed_terminal: list[ClaimedMessage] = []
         self.retries: list[ClaimedMessage] = []
         self.dead_letters: list[ClaimedMessage] = []
+        self.sent: list[QueueMessage] = []
+
+    def send(
+        self,
+        connection: FakeConnection,
+        message: QueueMessage,
+        *,
+        delay_seconds: int = 0,
+    ) -> int:
+        del connection
+        assert delay_seconds == 0
+        self.sent.append(message)
+        return 500 + len(self.sent)
 
     def claim(
         self,
@@ -255,6 +276,33 @@ class FakeStore:
             tuple[FakeConnection, ClaimedMessage, datetime, str]
         ] = []
         self.cleared_activities: list[tuple[FakeConnection, ClaimedMessage]] = []
+        self.next_attempt = 1
+        self.next_attempt_calls: list[tuple[FakeConnection, str, int, PipelineStage]] = []
+        self.repair_candidate: QueueMessage | None = None
+        self.repair_reservations: list[tuple[FakeConnection, int, UUID, datetime]] = []
+
+    def next_stage_attempt(
+        self,
+        connection: FakeConnection,
+        task_id: str,
+        task_version: int,
+        stage: PipelineStage,
+    ) -> int:
+        self.next_attempt_calls.append((connection, task_id, task_version, stage))
+        return self.next_attempt
+
+    def reserve_repair_candidate(
+        self,
+        connection: FakeConnection,
+        *,
+        max_repair_attempts: int,
+        event_id: UUID,
+        enqueued_at: datetime,
+    ) -> QueueMessage | None:
+        self.repair_reservations.append(
+            (connection, max_repair_attempts, event_id, enqueued_at)
+        )
+        return self.repair_candidate
 
     def record_stage_activity(
         self,
@@ -460,6 +508,7 @@ def test_worker_settings_use_resilient_defaults(tmp_path: Path) -> None:
     assert settings.heartbeat_interval_seconds == 60
     assert settings.poll_seconds == 10
     assert settings.max_deliveries == 3
+    assert settings.max_repair_attempts == 3
     assert settings.retry_visibility_timeout_seconds == 300
     assert settings.workspace_root == tmp_path
 
@@ -472,6 +521,7 @@ def test_worker_settings_use_resilient_defaults(tmp_path: Path) -> None:
         ("heartbeat_interval_seconds", 0),
         ("poll_seconds", -1),
         ("max_deliveries", 0),
+        ("max_repair_attempts", 0),
         ("retry_visibility_timeout_seconds", 0),
     ],
 )
@@ -509,6 +559,7 @@ def test_worker_settings_reject_a_non_finite_heartbeat_interval(tmp_path: Path) 
         ("visibility_timeout_seconds", MAX_VISIBILITY_TIMEOUT_SECONDS + 1),
         ("poll_seconds", MAX_POLL_SECONDS + 1),
         ("max_deliveries", MAX_DELIVERIES + 1),
+        ("max_repair_attempts", MAX_DELIVERIES + 1),
         ("retry_visibility_timeout_seconds", MAX_VISIBILITY_TIMEOUT_SECONDS + 1),
     ],
 )
@@ -567,6 +618,36 @@ def test_empty_poll_returns_false_without_loading_a_task(tmp_path: Path) -> None
         "max_poll_seconds": 10,
     }
     assert worker.connection_factory.connections[0].exited is True
+
+
+def test_repair_poll_reserves_and_enqueues_one_candidate_before_claiming(
+    tmp_path: Path,
+) -> None:
+    worker = make_worker(
+        tmp_path,
+        stage=PipelineStage.REPAIR,
+        task=pipeline_task(PipelineStage.REPAIR),
+    )
+    candidate = QueueMessage(
+        event_id=NEXT_EVENT_ID,
+        task_id="owner__repo-123",
+        task_version=1,
+        stage=PipelineStage.REPAIR,
+        attempt=2,
+        trace_id=TRACE_ID,
+        enqueued_at=STARTED_AT,
+    )
+    worker.store.repair_candidate = candidate
+
+    assert worker.run_once() is False
+
+    assert worker.queue.sent == [candidate]
+    assert worker.store.repair_reservations[0][1:] == (
+        3,
+        NEXT_EVENT_ID,
+        STARTED_AT,
+    )
+    assert len(worker.queue.claim_calls) == 1
 
 
 def test_claim_and_load_connections_close_before_stage_execution(tmp_path: Path) -> None:
@@ -1092,6 +1173,33 @@ def test_success_records_result_and_constructs_the_exact_sole_successor(
             "node-a",
         )
     ]
+
+
+def test_repair_success_uses_next_validation_attempt_number(tmp_path: Path) -> None:
+    claim = pipeline_claim(PipelineStage.REPAIR)
+    repaired_file = task_file()
+    worker = make_worker(
+        tmp_path,
+        stage=PipelineStage.REPAIR,
+        task=pipeline_task(PipelineStage.REPAIR),
+        files=[repaired_file],
+        claim=claim,
+        action=FakeAction(StageExecution.succeeded({"repaired": True}, [repaired_file])),
+        clock=SequenceClock(STARTED_AT, STARTED_AT, HANDOFF_AT),
+    )
+    worker.store.next_attempt = 4
+
+    assert worker.run_once() is True
+
+    successor = worker.queue.handoffs[0][1]
+    assert successor is not None
+    assert successor.stage is PipelineStage.VALIDATE
+    assert successor.attempt == 4
+    assert worker.store.next_attempt_calls[0][1:] == (
+        claim.message.task_id,
+        claim.message.task_version,
+        PipelineStage.VALIDATE,
+    )
 
 
 def test_worker_records_activity_before_action_and_clears_it_on_success(
