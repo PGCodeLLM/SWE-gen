@@ -220,8 +220,8 @@ spec:
                   key: SWEGEN_NO_PROXY
           resources:
             requests:
-              cpu: "2"
-              memory: 4Gi
+              cpu: 250m
+              memory: 1200Mi
             limits:
               cpu: "8"
               memory: 16Gi
@@ -281,7 +281,10 @@ metadata:
 spec:
   replicas: 4
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 20%
   selector:
     matchLabels:
       app.kubernetes.io/name: swegen-worker
@@ -341,8 +344,8 @@ spec:
                   key: SWEGEN_NO_PROXY
           resources:
             requests:
-              cpu: "2"
-              memory: 4Gi
+              cpu: 250m
+              memory: 1200Mi
             limits:
               cpu: "8"
               memory: 16Gi
@@ -550,7 +553,7 @@ spec:
           resources:
             requests:
               cpu: "2"
-              memory: 4Gi
+              memory: 200Mi
             limits:
               cpu: "8"
               memory: 16Gi
