@@ -1056,6 +1056,7 @@ class K3sStatusCollector:
         self._last_disk_io_poll_monotonic: float | None = None
         self._disk_io_counters: dict[str, dict[str, Any]] = {}
         self._disk_io_metrics: dict[str, dict[str, Any]] = {}
+        self._last_build_slot_metrics: dict[str, dict[str, Any]] = {}
 
     def _get(self, args: list[str]) -> dict[str, Any]:
         completed = self.runner(
@@ -1114,6 +1115,7 @@ class K3sStatusCollector:
             for stage in STAGES
         }
         pods_by_node: dict[str, list[dict[str, Any]]] = {}
+        slot_probe_pod_by_node: dict[str, str] = {}
         storage_mounts: list[dict[str, Any]] = []
         for item in workload_doc.get("items", []):
             stage = item.get("metadata", {}).get("labels", {}).get("swegen.pgcode/stage")
@@ -1183,9 +1185,21 @@ class K3sStatusCollector:
                 node = item.get("spec", {}).get("nodeName") or "unscheduled"
                 stages[stage]["nodes"][node] = stages[stage]["nodes"].get(node, 0) + 1
                 if node != "unscheduled":
+                    pod_name = item.get("metadata", {}).get("name", "unknown")
+                    has_build_slot_mount = any(
+                        mount.get("mountPath") == "/run/swegen-build-slots"
+                        for container in item.get("spec", {}).get("containers", [])
+                        for mount in container.get("volumeMounts", [])
+                    )
+                    if (
+                        status.get("phase") == "Running"
+                        and pod_name != "unknown"
+                        and has_build_slot_mount
+                    ):
+                        slot_probe_pod_by_node.setdefault(node, pod_name)
                     pods_by_node.setdefault(node, []).append(
                         {
-                            "name": item.get("metadata", {}).get("name", "unknown"),
+                            "name": pod_name,
                             "stage": stage,
                             "phase": status.get("phase", "Unknown"),
                             "ready": bool(container_statuses) and pod_ready,
@@ -1204,10 +1218,12 @@ class K3sStatusCollector:
             node["pods_by_stage"] = dict(
                 sorted(Counter(pod["stage"] for pod in scheduled_pods).items())
             )
+        build_slots_by_node = self._collect_build_slot_metrics(slot_probe_pod_by_node)
         resource_metrics = self._collect_resource_metrics(
             node_doc,
             all_pod_doc=all_pod_doc,
             allocation_error=allocation_error,
+            build_slots_by_node=build_slots_by_node,
         )
         workspace_mounts = [
             mount
@@ -1259,6 +1275,7 @@ class K3sStatusCollector:
         *,
         all_pod_doc: dict[str, Any] | None,
         allocation_error: str | None,
+        build_slots_by_node: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         try:
             completed = self.runner(
@@ -1361,6 +1378,19 @@ class K3sStatusCollector:
                                 "error": "disk I/O metrics unavailable",
                             },
                         ),
+                        "build_slots": build_slots_by_node.get(
+                            name,
+                            {
+                                "available": False,
+                                "used": None,
+                                "total": None,
+                                "free": None,
+                                "utilization_percent": None,
+                                "waiters": None,
+                                "waiters_source": None,
+                                "error": "node-local slot state unavailable",
+                            },
+                        ),
                     }
                 )
             all_available = not missing
@@ -1416,6 +1446,117 @@ class K3sStatusCollector:
                 "aggregate": {},
                 "nodes": [],
             }
+
+    def _collect_build_slot_metrics(
+        self,
+        probe_pods: dict[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        probe = """import fcntl,json,os,pathlib
+d=pathlib.Path('/run/swegen-build-slots')
+n=int((d/'count').read_text().strip())
+used=0
+for i in range(n):
+ fd=os.open(d/str(i),os.O_RDWR)
+ try:
+  fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  fcntl.flock(fd,fcntl.LOCK_UN)
+ except BlockingIOError:
+  used+=1
+waiters=None
+source=None
+for name in ('waiters','waiting','queue_depth','queue'):
+ path=d/name
+ if path.is_file():
+  try:
+   waiters=max(0,int(path.read_text().strip()))
+   source=name
+   break
+  except (OSError,ValueError):
+   pass
+print(json.dumps({'total':n,'used':used,'free':n-used,'waiters':waiters,'waiters_source':source}))"""
+        sampled_at = datetime.now(UTC).isoformat()
+        result: dict[str, dict[str, Any]] = {}
+        for node, pod in probe_pods.items():
+            completed = self.runner(
+                [
+                    "kubectl",
+                    "--request-timeout=3s",
+                    "-n",
+                    self.namespace,
+                    "exec",
+                    pod,
+                    "--",
+                    "python",
+                    "-c",
+                    probe,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if completed.returncode != 0:
+                previous = dict(self._last_build_slot_metrics.get(node, {}))
+                if previous:
+                    previous.update(
+                        stale=True,
+                        error=(completed.stderr or "slot probe failed")[:300],
+                    )
+                    result[node] = previous
+                else:
+                    result[node] = {
+                        "available": False,
+                        "used": None,
+                        "total": None,
+                        "free": None,
+                        "utilization_percent": None,
+                        "waiters": None,
+                        "waiters_source": None,
+                        "sampled_at": None,
+                        "stale": False,
+                        "error": (completed.stderr or "slot probe failed")[:300],
+                    }
+                continue
+            try:
+                payload = json.loads(completed.stdout)
+                total = _optional_nonnegative_int(payload.get("total"))
+                used = _optional_nonnegative_int(payload.get("used"))
+                free = _optional_nonnegative_int(payload.get("free"))
+                if total is None or total <= 0 or used is None or used > total:
+                    raise ValueError("invalid slot probe counts")
+                waiters = _optional_nonnegative_int(payload.get("waiters"))
+                waiters_source = payload.get("waiters_source")
+                result[node] = {
+                    "available": True,
+                    "used": used,
+                    "total": total,
+                    "free": free if free is not None else total - used,
+                    "utilization_percent": round(used * 100 / total, 1),
+                    "waiters": waiters,
+                    "waiters_source": (
+                        waiters_source if isinstance(waiters_source, str) else None
+                    ),
+                    "sampled_at": sampled_at,
+                    "stale": False,
+                    "error": None,
+                }
+            except (AttributeError, json.JSONDecodeError, TypeError, ValueError) as error:
+                result[node] = {
+                    "available": False,
+                    "used": None,
+                    "total": None,
+                    "free": None,
+                    "utilization_percent": None,
+                    "waiters": None,
+                    "waiters_source": None,
+                    "sampled_at": sampled_at,
+                    "stale": False,
+                    "error": f"{type(error).__name__}: {str(error)[:240]}",
+                }
+        self._last_build_slot_metrics = {
+            node: metrics for node, metrics in result.items() if metrics.get("available")
+        }
+        return result
 
     @staticmethod
     def _counter_rate(current: float, previous: float, elapsed: float) -> float | None:

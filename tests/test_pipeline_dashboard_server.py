@@ -187,6 +187,17 @@ def test_local_and_remote_node_disk_io_views_are_compact_and_graceful() -> None:
     assert "rateBytes(row.read_bytes_per_second)" in HTML
 
 
+def test_local_buildkit_slots_are_shown_per_node_with_unknown_waiters() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert "Local BuildKit slots / waiters" in HTML
+    assert "formatBuildSlots(node.build_slots)" in HTML
+    assert "${slots.used}/${slots.total} used" in HTML
+    assert "waiters ${slots.waiters??'unknown'}" in HTML
+    assert "Wrapper does not persist waiter depth; unknown is explicit." in HTML
+    assert "td.colSpan=5" in HTML
+
+
 def test_top_stage_cards_use_display_names_and_omit_dead_letters() -> None:
     from swegen.dashboard.server import HTML
 

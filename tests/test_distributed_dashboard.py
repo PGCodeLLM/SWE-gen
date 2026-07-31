@@ -638,6 +638,80 @@ def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:
     assert stage["available"] == 96
 
 
+def test_k3s_collector_reads_authoritative_local_build_slots() -> None:
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        calls.append(command)
+        return CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "total": 48,
+                    "used": 7,
+                    "free": 41,
+                    "waiters": None,
+                    "waiters_source": None,
+                }
+            ),
+            stderr="",
+        )
+
+    metrics = K3sStatusCollector(runner=runner)._collect_build_slot_metrics(
+        {"node-a": "validate-a"}
+    )
+
+    assert metrics["node-a"] | {"sampled_at": None} == {
+        "available": True,
+        "used": 7,
+        "total": 48,
+        "free": 41,
+        "utilization_percent": 14.6,
+        "waiters": None,
+        "waiters_source": None,
+        "sampled_at": None,
+        "stale": False,
+        "error": None,
+    }
+    assert calls[0][:7] == [
+        "kubectl",
+        "--request-timeout=3s",
+        "-n",
+        "swegen-pipeline",
+        "exec",
+        "validate-a",
+        "--",
+    ]
+    assert "flock" in calls[0][-1]
+
+
+def test_k3s_collector_does_not_render_failed_slot_probe_as_zero() -> None:
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        return CompletedProcess(command, 1, stdout="", stderr="slot directory unavailable")
+
+    metrics = K3sStatusCollector(runner=runner)._collect_build_slot_metrics(
+        {"node-a": "validate-a"}
+    )
+
+    assert metrics["node-a"] == {
+        "available": False,
+        "used": None,
+        "total": None,
+        "free": None,
+        "utilization_percent": None,
+        "waiters": None,
+        "waiters_source": None,
+        "sampled_at": None,
+        "stale": False,
+        "error": "slot directory unavailable",
+    }
+
+
 def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> None:
     from swegen.dashboard.distributed_status import K3sStatusCollector
 
@@ -684,7 +758,17 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
                 },
                 "spec": {
                     "nodeName": "node-a",
-                    "containers": [{"resources": {"requests": {"cpu": "0.25"}}}],
+                    "containers": [
+                        {
+                            "resources": {"requests": {"cpu": "0.25"}},
+                            "volumeMounts": [
+                                {
+                                    "name": "build-slots",
+                                    "mountPath": "/run/swegen-build-slots",
+                                }
+                            ],
+                        }
+                    ],
                 },
                 "status": {
                     "phase": "Running",
@@ -709,8 +793,25 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
         ]
     }
     fail_top = False
+    exec_calls: list[list[str]] = []
 
     def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "exec" in command:
+            exec_calls.append(command)
+            return CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "total": 48,
+                        "used": 7,
+                        "free": 41,
+                        "waiters": None,
+                        "waiters_source": None,
+                    }
+                ),
+                stderr="",
+            )
         if "top" in command:
             if fail_top:
                 return CompletedProcess(command, 1, stdout="", stderr="metrics unavailable")
@@ -738,6 +839,11 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
     assert metrics["nodes"][0]["ip"] == "10.0.0.1"
     assert metrics["nodes"][0]["cpu_allocated_millicores"] == 750
     assert metrics["nodes"][0]["cpu_allocated_percent"] == 18.8
+    assert metrics["nodes"][0]["build_slots"]["used"] == 7
+    assert metrics["nodes"][0]["build_slots"]["total"] == 48
+    assert metrics["nodes"][0]["build_slots"]["waiters"] is None
+    assert metrics["nodes"][1]["build_slots"]["available"] is False
+    assert exec_calls[0][5] == "reward-a"
     assert first_snapshot["nodes"][0]["pod_count"] == 2
     assert first_snapshot["nodes"][0]["pods_by_stage"] == {
         "generate": 1,
