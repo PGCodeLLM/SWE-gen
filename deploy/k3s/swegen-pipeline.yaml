@@ -437,7 +437,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: swegen-reward-credentials
-                  key: OPENAI_API_KEY
+                  key: SWEGEN_REWARD_API_KEY
             - name: POD_NAME
               valueFrom:
                 fieldRef:
