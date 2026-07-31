@@ -55,6 +55,34 @@ def evaluate_cpu_triple(
     return completed.stdout
 
 
+def evaluate_chart_tooltip() -> dict[str, object]:
+    from swegen.dashboard.server import HTML
+
+    functions = "function positionChartTooltip" + HTML.split(
+        "function positionChartTooltip", 1
+    )[1].split("function scaleControls", 1)[0]
+    script = """
+const tooltip={hidden:true,textContent:'',style:{},offsetWidth:100,offsetHeight:30};
+const el=id=>tooltip;
+function setText(node,value){node.textContent=value==null?'—':String(value)}
+const window={innerWidth:500,innerHeight:300};
+const event={type:'mouseenter',clientX:40,clientY:50,currentTarget:{getBoundingClientRect(){return {left:0,top:0,width:10}}}};
+showChartTooltip(event,'Jul 31 · success 3 · failed 1');
+const shown={hidden:tooltip.hidden,text:tooltip.textContent,left:tooltip.style.left,top:tooltip.style.top};
+hideChartTooltip();
+process.stdout.write(JSON.stringify({shown,hiddenAfterLeave:tooltip.hidden}));
+"""
+    completed = run(
+        ["node", "-e", functions + script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    import json
+
+    return json.loads(completed.stdout)
+
+
 def test_chart_first_render_defaults_to_the_rightmost_position() -> None:
     from swegen.dashboard.server import HTML
 
@@ -70,6 +98,26 @@ def test_chart_refresh_preserves_a_user_selected_scroll_position() -> None:
     assert evaluate_chart_scroll_target(0, 417) == 0
     assert "hasOwnProperty.call(uiState.chartScroll,stage)" in HTML
     assert "uiState.chartScroll[stage]=chart.scrollLeft" in HTML
+
+
+def test_chart_tooltip_appears_immediately_and_hides_on_leave() -> None:
+    from swegen.dashboard.server import HTML
+
+    result = evaluate_chart_tooltip()
+
+    assert result == {
+        "shown": {
+            "hidden": False,
+            "text": "Jul 31 · success 3 · failed 1",
+            "left": "52px",
+            "top": "62px",
+        },
+        "hiddenAfterLeave": True,
+    }
+    assert "bucket.title=" not in HTML
+    assert "bucket.addEventListener('mouseenter'" in HTML
+    assert "bucket.addEventListener('mousemove',positionChartTooltip)" in HTML
+    assert 'id="chart-tooltip"' in HTML
 
 
 def test_cpu_triple_formats_used_allocated_and_allocatable_in_order() -> None:
