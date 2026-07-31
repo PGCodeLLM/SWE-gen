@@ -32,6 +32,7 @@ from swegen.model_settings import load_github_tokens
 from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
+from swegen.tools.dockerfile_mirrors import rewrite_ubuntu_mirrors
 from swegen.tools.harbor_runner import parse_harbor_outcome, run_harbor_agent
 from swegen.tools.remote_buildkit import (
     RemoteBuildkitConfig,
@@ -346,7 +347,9 @@ def validate_action(
 ) -> StageExecution:
     """Require Harbor's NOP baseline to fail and Oracle solution to pass."""
 
-    _ensure_proxy_ca_runtime_environment(workspace / "tasks" / task.task_id)
+    task_dir = workspace / "tasks" / task.task_id
+    rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
+    _ensure_proxy_ca_runtime_environment(task_dir)
     local_tag = local_image_tag(task.task_id)
     try:
         nop_reward = _validation_reward(
@@ -391,6 +394,7 @@ def repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
     task_dir = workspace / "tasks" / task.task_id
     if not task_dir.is_dir():
         raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+    rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
     tests_dir = task_dir / "tests"
     test_files = (
@@ -419,6 +423,7 @@ def repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
         validate=True,
         repair=True,
     )
+    rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
     files = capture_task_files(task_dir)
     if not files:

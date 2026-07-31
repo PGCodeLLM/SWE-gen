@@ -51,6 +51,12 @@ data:
   SWEGEN_REMOTE_BUILDKIT_PERCENT: "75"
   SWEGEN_REMOTE_BUILDKIT_TIMEOUT_SECONDS: "3600"
   SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL: "true"
+  SWEGEN_UBUNTU_ARCHIVE_MIRROR: http://mirrors.tools.huawei.com/ubuntu/
+  SWEGEN_UBUNTU_CDIMAGE_MIRROR: http://mirrors.tools.huawei.com/ubuntu-cdimage/
+  SWEGEN_UBUNTU_CLOUD_IMAGES_MIRROR: http://mirrors.tools.huawei.com/ubuntu-cloud-images/
+  SWEGEN_UBUNTU_PORTS_MIRROR: http://mirrors.tools.huawei.com/ubuntu-ports/
+  SWEGEN_UBUNTU_RELEASES_MIRROR: http://mirrors.tools.huawei.com/ubuntu-releases/
+  SWEGEN_NPM_REGISTRY: http://mirrors.tools.huawei.com/npm/
   SWEGEN_NO_PROXY: ".myhuaweicloud.com,.huaweicloud.com,.huawei.com,127.0.0.1,localhost,7.156.122.134,7.237.95.141,7.244.3.251,7.244.3.200,7.244.3.78,7.244.2.110,7.244.1.209,10.42.0.0/16,10.43.0.0/16,100.*,10.*"
 ---
 apiVersion: apps/v1
@@ -177,7 +183,7 @@ spec:
               swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
+          image: swegen-worker:package-mirrors-20260731
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           envFrom:
@@ -299,7 +305,7 @@ spec:
       terminationGracePeriodSeconds: 18000
       containers:
         - name: worker
-          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
+          image: swegen-worker:package-mirrors-20260731
           imagePullPolicy: Never
           args: ["--stage", "repair"]
           envFrom:
