@@ -1,21 +1,57 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-image="${SWEGEN_WORKER_IMAGE:-swegen-worker:e2e}"
-nodes_text="${SWEGEN_K3S_NODES:-7.244.3.200 7.244.3.78 7.244.2.110 7.244.1.209}"
-read -r -a nodes <<< "${nodes_text}"
-ssh_user="${SWEGEN_K3S_SSH_USER:-root}"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-build_ca="${SWEGEN_BUILD_CA:-/etc/ssl/certs/ca-certificates.crt}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd -- "${script_dir}/../.." && pwd)"
+swegen_config="${SWEGEN_CONFIG_SOURCE:-${repository_root}/swegen.toml}"
 temporary_directory="$(mktemp -d)"
 archive="${temporary_directory}/swegen-worker.tar"
 remote_staging_archive="/tmp/swegen-worker-current.tar"
 remote_archive_name="swegen-worker-current.tar"
 
-if ((${#nodes[@]} == 0)); then
-    printf 'SWEGEN_K3S_NODES must contain at least one node.\n' >&2
+cleanup() {
+    rm -rf -- "${temporary_directory}"
+}
+trap cleanup EXIT
+
+if [[ ! -r "${swegen_config}" ]]; then
+    printf 'SWE-gen configuration is not readable: %s\n' "${swegen_config}" >&2
     exit 1
 fi
+if ! command -v uv >/dev/null 2>&1; then
+    printf 'uv is required to load swegen.toml.\n' >&2
+    exit 1
+fi
+
+mapfile -d '' -t build_settings < <(
+    SWEGEN_CONFIG="${swegen_config}" \
+        uv --directory "${repository_root}" run python - <<'PY'
+import sys
+
+from swegen.model_settings import load_pipeline_settings
+
+pipeline = load_pipeline_settings()
+for value in (
+    pipeline.worker_image,
+    pipeline.k3s_ssh_user,
+    str(pipeline.build_ca_path),
+    *pipeline.k3s_nodes,
+):
+    sys.stdout.write(value)
+    sys.stdout.write("\0")
+PY
+)
+if [[ "${#build_settings[@]}" -lt 4 ]]; then
+    printf 'Could not load worker image build settings from %s.\n' "${swegen_config}" >&2
+    exit 1
+fi
+
+image="${build_settings[0]}"
+ssh_user="${build_settings[1]}"
+build_ca="${build_settings[2]}"
+nodes=("${build_settings[@]:3}")
+unset build_settings
 
 normalize_image_reference() {
     local reference="$1"
@@ -36,11 +72,6 @@ normalize_image_reference() {
 
 runtime_image="$(normalize_image_reference "${image}")"
 
-cleanup() {
-    rm -rf -- "${temporary_directory}"
-}
-trap cleanup EXIT
-
 if [[ ! -r "${build_ca}" ]]; then
     printf 'Build CA bundle is not readable: %s\n' "${build_ca}" >&2
     exit 1
@@ -54,9 +85,9 @@ docker build \
     --build-arg https_proxy \
     --build-arg no_proxy \
     --secret "id=combined_ca,src=${build_ca}" \
-    --file "${repo_root}/deploy/k3s/Dockerfile.worker" \
+    --file "${repository_root}/deploy/k3s/Dockerfile.worker" \
     --tag "${image}" \
-    "${repo_root}"
+    "${repository_root}"
 docker save --output "${archive}" "${image}"
 archive_sha256="$(sha256sum "${archive}" | awk '{print $1}')"
 

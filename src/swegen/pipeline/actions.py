@@ -38,7 +38,7 @@ from swegen.model_settings import (
     load_hacking_settings,
     load_swr_target,
 )
-from swegen.pipeline.completion import export_completed_task, load_minddistiller_login
+from swegen.pipeline.completion import export_completed_task
 from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
@@ -442,8 +442,9 @@ def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
 
 
 @contextmanager
-def minddistiller_docker_environment(credentials_csv: Path, host: str):
-    username, password = load_minddistiller_login(credentials_csv, expected_host=host)
+def minddistiller_docker_environment(host: str, username: str, password: str):
+    if not host.strip() or not username.strip() or not password:
+        raise ValueError("MindDistiller host, username, and password must be non-empty")
     with tempfile.TemporaryDirectory(prefix="swegen-minddistiller-docker-") as temporary:
         config_dir = Path(temporary)
         source_dir = Path(os.environ.get("DOCKER_CONFIG", "/root/.docker"))
@@ -475,8 +476,8 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
 
     primary = load_swr_target("primary")
     minddistiller = load_swr_target("minddistiller")
-    if minddistiller.credentials_csv is None:
-        raise RuntimeError("[swr.minddistiller].credentials_csv is required")
+    if minddistiller.username is None or minddistiller.password is None:
+        raise RuntimeError("[swr.minddistiller].username and password are required")
     primary_tag = primary.image_reference(task.task_id)
     minddistiller_tag = minddistiller.image_reference(task.task_id)
     if primary_tag == minddistiller_tag:
@@ -492,8 +493,9 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
     cleanup_tags = [expected_local_tag, primary_tag, minddistiller_tag]
     try:
         with minddistiller_docker_environment(
-            minddistiller.credentials_csv,
             minddistiller.host,
+            minddistiller.username,
+            minddistiller.password,
         ) as minddistiller_env:
             primary_exists = image_exists_in_registry(primary_tag)
             minddistiller_exists = image_exists_in_registry(

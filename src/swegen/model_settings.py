@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil, isfinite
 from pathlib import Path
 from typing import Any
@@ -81,7 +82,8 @@ class SWRTargetSettings:
     repository: str
     registry: str
     suffix: str
-    credentials_csv: Path | None = None
+    username: str | None = field(default=None, repr=False)
+    password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.host.strip().strip("/"):
@@ -90,6 +92,8 @@ class SWRTargetSettings:
             raise ValueError("SWR repository must be non-empty")
         if not self.registry.strip():
             raise ValueError("SWR registry label must be non-empty")
+        if (self.username is None) != (self.password is None):
+            raise ValueError("SWR username and password must be configured together")
 
     @property
     def repository_prefix(self) -> str:
@@ -110,7 +114,6 @@ class AutoqueueSettings:
     poll_seconds: float = 30.0
     task_version: int = 1
     max_retries: int = 3
-    require_obs: bool = True
     pr_categories: tuple[str, ...] = ("feature",)
     exclude_languages: tuple[str, ...] = ()
 
@@ -141,6 +144,74 @@ class AutoqueueSettings:
             return self.max_queued
         # Round up so fractional per-worker limits never under-provision a worker.
         return max(1, ceil(self.max_queued_per_generate_worker * self.generate_workers))
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineSettings:
+    namespace: str
+    secret_source_namespace: str
+    worker_image: str
+    workspace_host_path: Path
+    repo_cache_host_path: Path
+    successful_tasks_host_path: Path
+    k3s_nodes: tuple[str, ...]
+    k3s_ssh_user: str
+    build_ca_path: Path
+    build_worker_image_on_start: bool
+    autoqueue_workers: int
+    generate_workers: int
+    validate_workers: int
+    reward_workers: int
+    push_workers: int
+    rollout_timeout_seconds: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "autoqueue_workers",
+            "generate_workers",
+            "validate_workers",
+            "reward_workers",
+            "push_workers",
+            "rollout_timeout_seconds",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"[pipeline].{field_name} must be an integer >= 1")
+        if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", self.namespace):
+            raise ValueError("[pipeline].namespace must be a Kubernetes DNS label")
+        if not re.fullmatch(
+            r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?",
+            self.secret_source_namespace,
+        ):
+            raise ValueError(
+                "[pipeline].secret_source_namespace must be a Kubernetes DNS label"
+            )
+        if self.namespace == self.secret_source_namespace:
+            raise ValueError(
+                "[pipeline].namespace must differ from secret_source_namespace"
+            )
+        if not self.worker_image.strip() or any(character.isspace() for character in self.worker_image):
+            raise ValueError("[pipeline].worker_image must be a non-empty image reference")
+        for field_name in (
+            "workspace_host_path",
+            "repo_cache_host_path",
+            "successful_tasks_host_path",
+            "build_ca_path",
+        ):
+            if not getattr(self, field_name).is_absolute():
+                raise ValueError(f"[pipeline].{field_name} must be an absolute path")
+        if len(
+            {
+                self.workspace_host_path,
+                self.repo_cache_host_path,
+                self.successful_tasks_host_path,
+            }
+        ) != 3:
+            raise ValueError("[pipeline] host storage paths must be distinct")
+        if not self.k3s_nodes:
+            raise ValueError("[pipeline].k3s_nodes must contain at least one node")
+        if not self.k3s_ssh_user.strip():
+            raise ValueError("[pipeline].k3s_ssh_user must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +272,33 @@ def _optional_string(table: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string when configured")
     return value.strip()
+
+
+def _optional_secret(table: dict[str, Any], key: str) -> str | None:
+    value = table.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string when configured")
+    return value
+
+
+def _required_integer(table: dict[str, Any], section: str, key: str) -> int:
+    value = table.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"[{section}].{key} must be an integer >= 1")
+    return value
+
+
+def _required_boolean(table: dict[str, Any], section: str, key: str) -> bool:
+    value = table.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"[{section}].{key} must be a boolean")
+    return value
+
+
+def _required_path(table: dict[str, Any], section: str, key: str) -> Path:
+    return Path(_required_string(table, section, key)).expanduser()
 
 
 def _string_tuple(value: object, field: str, *, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -311,9 +409,14 @@ def load_hacking_settings() -> tuple[HackingLLMSettings, ...]:
 
 def load_swr_target(name: str) -> SWRTargetSettings:
     table = _nested_table("swr", name, required=True)
-    csv_path = _optional_string(table, "credentials_csv")
     registry = table.get("registry", name)
     suffix = table.get("suffix", "")
+    username = _optional_string(table, "username")
+    password = _optional_secret(table, "password")
+    if name == "minddistiller" and (username is None or password is None):
+        raise ValueError(
+            f"[swr.minddistiller] must define username and password in {config_path()}"
+        )
     if not isinstance(registry, str) or not registry.strip():
         raise ValueError(f"[swr.{name}].registry must be a non-empty string")
     if not isinstance(suffix, str):
@@ -323,12 +426,14 @@ def load_swr_target(name: str) -> SWRTargetSettings:
         repository=_required_string(table, f"swr.{name}", "repository").strip("/"),
         registry=registry.strip(),
         suffix=suffix.strip(),
-        credentials_csv=_config_relative_path(csv_path) if csv_path else None,
+        username=username,
+        password=password,
     )
 
 
 def load_autoqueue_settings() -> AutoqueueSettings:
     table = _table("autoqueue", required_config=True)
+    pipeline = load_pipeline_settings()
     raw_max = table.get("max_queued")
     max_queued: int | None
     if raw_max is None:
@@ -341,11 +446,10 @@ def load_autoqueue_settings() -> AutoqueueSettings:
         source_table=str(table.get("source_table") or "public.pr_tasks").strip(),
         max_queued=max_queued,
         max_queued_per_generate_worker=float(table.get("max_queued_per_generate_worker", 1.5)),
-        generate_workers=int(table.get("generate_workers", 1)),
+        generate_workers=pipeline.generate_workers,
         poll_seconds=float(table.get("poll_seconds", 30.0)),
         task_version=int(table.get("task_version", 1)),
         max_retries=int(table.get("max_retries", 3)),
-        require_obs=bool(table.get("require_obs", True)),
         pr_categories=_string_tuple(
             table.get("pr_categories"),
             "[autoqueue].pr_categories",
@@ -355,6 +459,48 @@ def load_autoqueue_settings() -> AutoqueueSettings:
             table.get("exclude_languages"),
             "[autoqueue].exclude_languages",
             default=(),
+        ),
+    )
+
+
+def load_pipeline_settings() -> PipelineSettings:
+    table = _table("pipeline", required_config=True)
+    return PipelineSettings(
+        namespace=_required_string(table, "pipeline", "namespace"),
+        secret_source_namespace=_required_string(
+            table,
+            "pipeline",
+            "secret_source_namespace",
+        ),
+        worker_image=_required_string(table, "pipeline", "worker_image"),
+        workspace_host_path=_required_path(table, "pipeline", "workspace_host_path"),
+        repo_cache_host_path=_required_path(table, "pipeline", "repo_cache_host_path"),
+        successful_tasks_host_path=_required_path(
+            table,
+            "pipeline",
+            "successful_tasks_host_path",
+        ),
+        k3s_nodes=_string_tuple(
+            table.get("k3s_nodes"),
+            "[pipeline].k3s_nodes",
+            default=(),
+        ),
+        k3s_ssh_user=_required_string(table, "pipeline", "k3s_ssh_user"),
+        build_ca_path=_required_path(table, "pipeline", "build_ca_path"),
+        build_worker_image_on_start=_required_boolean(
+            table,
+            "pipeline",
+            "build_worker_image_on_start",
+        ),
+        autoqueue_workers=_required_integer(table, "pipeline", "autoqueue_workers"),
+        generate_workers=_required_integer(table, "pipeline", "generate_workers"),
+        validate_workers=_required_integer(table, "pipeline", "validate_workers"),
+        reward_workers=_required_integer(table, "pipeline", "reward_workers"),
+        push_workers=_required_integer(table, "pipeline", "push_workers"),
+        rollout_timeout_seconds=_required_integer(
+            table,
+            "pipeline",
+            "rollout_timeout_seconds",
         ),
     )
 

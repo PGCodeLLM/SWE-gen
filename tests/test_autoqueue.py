@@ -88,7 +88,7 @@ def test_fill_generate_queue_counts_and_enqueues_under_one_outer_transaction() -
         queued=1,
         candidates=[("Owner/Repo", 9), ("Other/Repo", 8)],
     )
-    settings = AutoqueueSettings(max_queued=3, require_obs=False)
+    settings = AutoqueueSettings(max_queued=3)
 
     result = fill_generate_queue(connection, settings)
 
@@ -117,7 +117,7 @@ def test_fill_generate_queue_respects_remaining_capacity() -> None:
         queued=4,
         candidates=[("Owner/One", 1), ("Owner/Two", 2)],
     )
-    settings = AutoqueueSettings(max_queued=5, require_obs=False)
+    settings = AutoqueueSettings(max_queued=5)
 
     result = fill_generate_queue(connection, settings)
 
@@ -131,7 +131,7 @@ def test_fill_generate_queue_does_nothing_when_backlog_is_full() -> None:
 
     result = fill_generate_queue(
         connection,
-        AutoqueueSettings(max_queued=5, require_obs=False),
+        AutoqueueSettings(max_queued=5),
     )
 
     assert result.enqueued == ()
@@ -148,7 +148,7 @@ def test_manual_enqueue_race_is_skipped_without_consuming_an_extra_slot() -> Non
 
     result = fill_generate_queue(
         connection,
-        AutoqueueSettings(max_queued=2, require_obs=False),
+        AutoqueueSettings(max_queued=2),
     )
 
     assert result.enqueued == ("owner__fresh-2",)

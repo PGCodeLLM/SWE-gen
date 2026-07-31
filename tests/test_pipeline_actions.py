@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
 import signal
 import sys
@@ -39,10 +41,6 @@ _ACTION_ENVIRONMENT_NAMES = (
 def configure_pipeline_actions(tmp_path: Path, monkeypatch) -> None:
     for name in _ACTION_ENVIRONMENT_NAMES:
         monkeypatch.delenv(name, raising=False)
-    credentials = tmp_path / "minddistiller.csv"
-    credentials.write_text(
-        "用户名,test-user\n密码,test-password\n镜像访问凭证,docker login mind.example\n"
-    )
     config = tmp_path / "swegen.toml"
     config.write_text(
         "[model]\n"
@@ -76,7 +74,8 @@ def configure_pipeline_actions(tmp_path: Path, monkeypatch) -> None:
         'repository = "team/mind"\n'
         'registry = "trajectory"\n'
         'suffix = ""\n'
-        f'credentials_csv = "{credentials}"\n'
+        'username = "test-user"\n'
+        'password = "test-password"\n'
         "\n[completed_tasks]\n"
         f'output_dir = "{tmp_path / "successful"}"\n'
     )
@@ -892,6 +891,34 @@ def test_reward_action_succeeds_when_all_configured_checkers_are_clean(
 
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json()["models"] == ["checker-model-a", "checker-model-b"]
+
+
+def test_minddistiller_docker_environment_uses_direct_credentials(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline.actions import minddistiller_docker_environment
+
+    source_config_dir = tmp_path / "docker"
+    source_config_dir.mkdir()
+    (source_config_dir / "config.json").write_text(
+        json.dumps({"auths": {"primary.example": {"auth": "primary-auth"}}})
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(source_config_dir))
+
+    with minddistiller_docker_environment(
+        "mind.example",
+        "configured-user",
+        "configured-password",
+    ) as environment:
+        generated_dir = Path(environment["DOCKER_CONFIG"])
+        generated = json.loads((generated_dir / "config.json").read_text())
+        expected_auth = base64.b64encode(b"configured-user:configured-password").decode("ascii")
+        assert generated["auths"]["primary.example"] == {"auth": "primary-auth"}
+        assert generated["auths"]["mind.example"] == {"auth": expected_auth}
+        assert (generated_dir / "config.json").stat().st_mode & 0o777 == 0o600
+
+    assert not generated_dir.exists()
 
 
 def test_push_action_skips_build_when_remote_manifest_exists(

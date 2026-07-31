@@ -23,8 +23,8 @@ verdict_model = "gpt-5.6-terra"
 
 [analysis]
 # Harbor agent trials and Claude-based trial classification.
-agent_model = "anthropic/claude-sonnet-4-5"
-classifier_model = "claude-sonnet-4-5"
+agent_model = "gpt-5.6-sol"
+classifier_model = "gpt-5.6-sol"
 
 [github]
 # A token is selected from this pool for each process/task.
@@ -38,16 +38,32 @@ endpoint = "https://reward-checker.example"
 model = "gpt-5.6-sol"
 api_key = "replace-me"
 
+[pipeline]
+namespace = "swegen-pipeline-tester"
+secret_source_namespace = "swegen-pipeline"
+worker_image = "swegen-worker:arthur-tester-20260731"
+workspace_host_path = "/data/swegen-k3s-tester/workspaces"
+repo_cache_host_path = "/data/swegen-k3s-tester/cache"
+successful_tasks_host_path = "/data/swegen-k3s-tester/successful-harbor-tasks"
+k3s_nodes = ["7.244.3.78", "7.244.3.200", "7.244.2.110", "7.244.1.209"]
+k3s_ssh_user = "root"
+build_ca_path = "/etc/ssl/certs/ca-certificates.crt"
+build_worker_image_on_start = true
+autoqueue_workers = 1
+generate_workers = 48
+validate_workers = 168
+reward_workers = 16
+push_workers = 1
+rollout_timeout_seconds = 1800
+
 [autoqueue]
 source_table = "public.pr_tasks"
 # An explicit max_queued has priority over the per-worker calculation.
 # max_queued = 100
 max_queued_per_generate_worker = 1.5
-generate_workers = 48
 poll_seconds = 30.0
 task_version = 1
 max_retries = 3
-require_obs = true
 pr_categories = ["feature"]
 exclude_languages = []
 
@@ -62,10 +78,8 @@ host = "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"
 repository = "aifm.coder.exp/swegen/generated"
 registry = "trajectory"
 suffix = ""
-# Relative paths are resolved from the directory containing swegen.toml.
-# In K3s, use /etc/swegen/minddistiller_swr.csv instead.
-credentials_csv = "swr_credentials/minddistiller_swr.csv"
+username = "replace-me"
+password = "replace-me"
 
 [completed_tasks]
-# In K3s, use /app/data_cache/successful_harbor_tasks.
-output_dir = "data_cache/successful_harbor_tasks"
+output_dir = "/app/data_cache/successful_harbor_tasks"

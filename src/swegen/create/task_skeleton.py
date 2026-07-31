@@ -12,6 +12,8 @@ from harbor.models.task.config import (
 
 from .utils import strip_tests_prefix
 
+DEFAULT_TASK_TIMEOUT_SECONDS = 7200.0
+
 
 @dataclass
 class SkeletonParams:
@@ -273,10 +275,10 @@ def generate_task_toml(instruction_data: dict) -> str:
             "category": instruction_data.get("category", "bugfix"),
             "tags": instruction_data.get("tags", []),
         },
-        verifier=VerifierConfig(timeout_sec=1800.0),
-        agent=AgentConfig(timeout_sec=1800.0),
+        verifier=VerifierConfig(timeout_sec=DEFAULT_TASK_TIMEOUT_SECONDS),
+        agent=AgentConfig(timeout_sec=DEFAULT_TASK_TIMEOUT_SECONDS),
         environment=EnvironmentConfig(
-            build_timeout_sec=1800.0,
+            build_timeout_sec=DEFAULT_TASK_TIMEOUT_SECONDS,
             cpus=1,
             memory_mb=2048,
             storage_mb=10240,

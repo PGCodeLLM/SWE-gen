@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: swegen-pipeline
+  name: swegen-pipeline-tester
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: swegen-pipeline-config
-  namespace: swegen-pipeline
+  namespace: swegen-pipeline-tester
 data:
   SWEGEN_PG_HOST: "7.237.95.141"
   SWEGEN_PG_PORT: "5432"
@@ -37,7 +37,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swegen-autoqueue
-  namespace: swegen-pipeline
+  namespace: swegen-pipeline-tester
 spec:
   replicas: 0
   strategy:
@@ -55,7 +55,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: autoqueue
-          image: swegen-worker:e2e
+          image: swegen-worker:arthur-tester-20260731
           imagePullPolicy: Never
           command: ["python", "src/autoqueue.py"]
           envFrom:
@@ -85,7 +85,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swegen-generate
-  namespace: swegen-pipeline
+  namespace: swegen-pipeline-tester
 spec:
   replicas: 0
   strategy:
@@ -106,7 +106,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.2.110
       containers:
         - name: worker
-          image: swegen-worker:e2e
+          image: swegen-worker:arthur-tester-20260731
           imagePullPolicy: Never
           args: ["--stage", "generate"]
           envFrom:
@@ -158,11 +158,11 @@ spec:
       volumes:
         - name: workspace
           hostPath:
-            path: /data/swegen-k3s/workspaces
+            path: /data/swegen-k3s-tester/workspaces
             type: DirectoryOrCreate
         - name: repo-cache
           hostPath:
-            path: /data/swegen-k3s/cache
+            path: /data/swegen-k3s-tester/cache
             type: DirectoryOrCreate
         - name: private-files
           secret:
@@ -173,7 +173,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swegen-validate
-  namespace: swegen-pipeline
+  namespace: swegen-pipeline-tester
 spec:
   replicas: 0
   strategy:
@@ -195,7 +195,7 @@ spec:
       terminationGracePeriodSeconds: 7200
       containers:
         - name: worker
-          image: swegen-worker:e2e-observe-tail-activity-20260729
+          image: swegen-worker:arthur-tester-20260731
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           envFrom:
@@ -251,7 +251,7 @@ spec:
       volumes:
         - name: workspace
           hostPath:
-            path: /data/swegen-k3s/workspaces
+            path: /data/swegen-k3s-tester/workspaces
             type: DirectoryOrCreate
         - name: docker-sock
           hostPath:
@@ -270,7 +270,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swegen-reward
-  namespace: swegen-pipeline
+  namespace: swegen-pipeline-tester
 spec:
   replicas: 0
   strategy:
@@ -291,7 +291,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.1.209
       containers:
         - name: worker
-          image: swegen-worker:e2e
+          image: swegen-worker:arthur-tester-20260731
           imagePullPolicy: Never
           args: ["--stage", "reward"]
           envFrom:
@@ -341,7 +341,7 @@ spec:
       volumes:
         - name: workspace
           hostPath:
-            path: /data/swegen-k3s/workspaces
+            path: /data/swegen-k3s-tester/workspaces
             type: DirectoryOrCreate
         - name: private-files
           secret:
@@ -352,7 +352,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swegen-push
-  namespace: swegen-pipeline
+  namespace: swegen-pipeline-tester
 spec:
   replicas: 0
   strategy:
@@ -373,7 +373,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: worker
-          image: swegen-worker:e2e-ca-20260729
+          image: swegen-worker:arthur-tester-20260731
           imagePullPolicy: Never
           args: ["--stage", "push"]
           envFrom:
@@ -431,7 +431,7 @@ spec:
       volumes:
         - name: workspace
           hostPath:
-            path: /data/swegen-k3s/workspaces
+            path: /data/swegen-k3s-tester/workspaces
             type: DirectoryOrCreate
         - name: docker-sock
           hostPath:
@@ -447,5 +447,5 @@ spec:
             defaultMode: 0400
         - name: successful-harbor-tasks
           hostPath:
-            path: /data/swegen-k3s/successful-harbor-tasks
+            path: /data/swegen-k3s-tester/successful-harbor-tasks
             type: DirectoryOrCreate

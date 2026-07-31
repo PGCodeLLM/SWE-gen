@@ -46,8 +46,14 @@ def _run_script(
     dockerfile = task_root / "owner__repo-1" / "environment" / "Dockerfile"
     dockerfile.parent.mkdir(parents=True)
     dockerfile.write_text("FROM scratch\n")
-    credentials = tmp_path / "minddistiller.csv"
-    credentials.write_text("field,value\n用户名,test-user\n密码,test-password\n")
+    config = tmp_path / "swegen.toml"
+    config.write_text(
+        "[swr.minddistiller]\n"
+        'host = "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"\n'
+        'repository = "aifm.coder.exp/swegen/generated"\n'
+        'username = "test-user"\n'
+        'password = "test-password"\n'
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _write_fake_docker(fake_bin / "docker", fail_build=fail_build)
@@ -61,7 +67,7 @@ def _run_script(
             "PATH": f"{fake_bin}:{environment['PATH']}",
             "FAKE_DOCKER_LOG": str(docker_log),
             "FAKE_DOCKER_STATE": str(state_dir),
-            "SWR_CREDENTIALS_FILE": str(credentials),
+            "SWEGEN_CONFIG": str(config),
             "LOG_DIR": str(tmp_path / "logs"),
             "REPORT_FILE": str(report),
             "JOBS": "1",
@@ -104,6 +110,9 @@ def test_selector_builds_retained_local_tag_and_pushes_expected_remote_tag(
     assert f"push {remote}" in commands
     assert commands.count(f"manifest inspect {remote}") == 2
     assert "Failed:     0" in report.read_text()
+    assert "test-password" not in result.stdout
+    assert "test-password" not in result.stderr
+    assert "test-password" not in docker_log.read_text()
 
 
 def test_batch_script_returns_failure_when_an_individual_build_fails(tmp_path: Path) -> None:

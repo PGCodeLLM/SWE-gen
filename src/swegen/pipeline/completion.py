@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import os
 import re
 import shutil
@@ -213,30 +212,9 @@ def export_completed_task(
     return CompletedTaskExport(destination, dumped_dockerfile, dumped_config, dumped_test)
 
 
-def load_minddistiller_login(path: Path, *, expected_host: str) -> tuple[str, str]:
-    """Load username/password from the supplied Chinese-labelled credential CSV."""
-
-    try:
-        with path.open(encoding="utf-8-sig", newline="") as handle:
-            rows = {row[0].strip(): row[1] for row in csv.reader(handle) if len(row) >= 2}
-    except OSError as error:
-        raise RuntimeError(f"could not read MindDistiller SWR credentials: {error}") from error
-    username = rows.get("用户名", "").strip()
-    password = rows.get("密码", "")
-    login_command = rows.get("镜像访问凭证", "")
-    if not username or not password:
-        raise RuntimeError("MindDistiller SWR credential CSV is missing 用户名 or 密码")
-    if expected_host not in login_command:
-        raise RuntimeError(
-            "MindDistiller credential CSV login host does not match [swr.minddistiller].host"
-        )
-    return username, password
-
-
 __all__ = [
     "CompletedTaskExport",
     "append_cwm_metadata",
     "export_completed_task",
-    "load_minddistiller_login",
     "set_environment_docker_image",
 ]

@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_DIR = ROOT / "deploy" / "k3s"
 
 
-def _documents() -> list[dict[str, object]]:
-    manifest = DEPLOY_DIR / "swegen-pipeline.yaml"
+def _documents(name: str = "swegen-pipeline.yaml") -> list[dict[str, object]]:
+    manifest = DEPLOY_DIR / name
     return [document for document in yaml.safe_load_all(manifest.read_text()) if document]
 
 
@@ -72,11 +72,11 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         "swegen-push": "7.244.3.200",
     }
     expected_replicas = {
-        "swegen-autoqueue": 1,
-        "swegen-generate": 48,
-        "swegen-validate": 168,
-        "swegen-reward": 16,
-        "swegen-push": 1,
+        "swegen-autoqueue": 0,
+        "swegen-generate": 0,
+        "swegen-validate": 0,
+        "swegen-reward": 0,
+        "swegen-push": 0,
     }
     expected_images = {
         "swegen-autoqueue": "swegen-worker:e2e",
@@ -119,10 +119,7 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     push = deployments["swegen-push"]
     push_spec = push["spec"]["template"]["spec"]
     push_container = push_spec["containers"][0]
-    assert any(
-        mount["mountPath"] == "/etc/swegen/minddistiller_swr.csv"
-        for mount in push_container["volumeMounts"]
-    )
+    assert not any("minddistiller" in mount["name"] for mount in push_container["volumeMounts"])
     assert any(
         mount["mountPath"] == "/app/data_cache/successful_harbor_tasks"
         for mount in push_container["volumeMounts"]
@@ -150,7 +147,15 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert "--build-arg HTTPS_PROXY" in build_helper
     assert '--secret "id=combined_ca,src=${build_ca}"' in build_helper
     assert "k3s ctr -n k8s.io images import" in build_helper
-    assert "SWEGEN_K3S_NODES" in build_helper
+    assert "load_pipeline_settings" in build_helper
+    assert "pipeline.worker_image" in build_helper
+    assert "pipeline.k3s_nodes" in build_helper
+    assert "pipeline.k3s_ssh_user" in build_helper
+    assert "pipeline.build_ca_path" in build_helper
+    assert "SWEGEN_WORKER_IMAGE" not in build_helper
+    assert "SWEGEN_K3S_NODES" not in build_helper
+    assert "SWEGEN_K3S_SSH_USER" not in build_helper
+    assert "SWEGEN_BUILD_CA" not in build_helper
     assert "data-dir:" in build_helper
     assert "/agent/images/" in build_helper
     assert "k3s crictl inspecti" in build_helper
@@ -163,9 +168,38 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert '"httpsProxy"' in secret_helper
     assert '"noProxy"' in secret_helper
     assert '--from-file=config.json="${merged_docker_config}"' in secret_helper
-    assert '--from-file=minddistiller_swr.csv="${minddistiller_csv}"' in secret_helper
+    assert "minddistiller" not in secret_helper.lower()
     assert "swegen-model-credentials" not in secret_helper
     assert "swegen-reward-credentials" not in secret_helper
+
+
+def test_tester_manifest_isolated_from_existing_k3s_deployments() -> None:
+    documents = _documents("swegen-pipeline_tester.yaml")
+    namespace = next(document for document in documents if document["kind"] == "Namespace")
+    deployments = [document for document in documents if document["kind"] == "Deployment"]
+
+    assert namespace["metadata"]["name"] == "swegen-pipeline-tester"
+    assert all(
+        document.get("metadata", {}).get("namespace") == "swegen-pipeline-tester"
+        for document in documents
+        if document["kind"] != "Namespace"
+    )
+    assert {
+        deployment["spec"]["template"]["spec"]["containers"][0]["image"]
+        for deployment in deployments
+    } == {"swegen-worker:arthur-tester-20260731"}
+
+    host_paths = {
+        volume["hostPath"]["path"]
+        for deployment in deployments
+        for volume in deployment["spec"]["template"]["spec"].get("volumes", [])
+        if "hostPath" in volume and volume["name"] != "docker-sock"
+    }
+    assert host_paths == {
+        "/data/swegen-k3s-tester/workspaces",
+        "/data/swegen-k3s-tester/cache",
+        "/data/swegen-k3s-tester/successful-harbor-tasks",
+    }
 
 
 def test_from_scratch_guide_pins_runtime_and_documents_growth_controls() -> None:
@@ -176,7 +210,8 @@ def test_from_scratch_guide_pins_runtime_and_documents_growth_controls() -> None
     assert "PGMQ" in guide and "1.12.0" in guide and "SQL-only" in guide
     assert "src/swegen/queueing/bootstrap.sql" in guide
     assert "src/swegen/schema.sql" in guide
-    assert "SWEGEN_K3S_NODES='NEW_NODE_IP'" in guide
+    assert "[pipeline].k3s_nodes" in guide
+    assert "swegen-pipeline_tester.yaml" in guide
     assert "docker buildx prune" in guide
     assert "imageGCHighThresholdPercent: 70" in guide
     assert "public.pipeline_task_files" in guide

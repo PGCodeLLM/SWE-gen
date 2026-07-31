@@ -8,6 +8,8 @@ Usage: minddistiller_build_and_upload.sh <instance_ids.txt> <harbor_task_directo
 
 Select the listed Harbor tasks and invoke build_5k_js_ts_original_images.sh.
 Only each selected task's environment directory is copied to a temporary root.
+The SWR endpoint, repository, username, and password are read from
+[swr.minddistiller] in swegen.toml.
 JOBS, LOG_DIR, REPORT_FILE, SWR_RETRIES, BUILD_TIMEOUT_SECONDS, and
 PUSH_TIMEOUT_SECONDS may be set in the environment.
 EOF
@@ -19,10 +21,11 @@ if [[ "$#" -ne 2 ]]; then
 fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd -- "${script_dir}/.." && pwd)"
 instance_ids_file="$1"
 task_root="$2"
 build_script="${script_dir}/build_5k_js_ts_original_images.sh"
-credentials_file="${SWR_CREDENTIALS_FILE:-${script_dir}/minddistiller_swr.csv}"
+config_file="${SWEGEN_CONFIG:-${repository_root}/swegen.toml}"
 
 if [[ ! -f "${instance_ids_file}" || ! -r "${instance_ids_file}" ]]; then
     echo "Instance ID file is not readable: ${instance_ids_file}" >&2
@@ -34,6 +37,10 @@ if [[ ! -d "${task_root}" ]]; then
 fi
 if [[ ! -x "${build_script}" ]]; then
     echo "Build/upload script is not executable: ${build_script}" >&2
+    exit 1
+fi
+if [[ ! -r "${config_file}" ]]; then
+    echo "SWE-gen configuration is not readable: ${config_file}" >&2
     exit 1
 fi
 
@@ -84,5 +91,5 @@ if [[ "${selected}" -eq 0 ]]; then
 fi
 
 TASK_ROOT="${filtered_root}" \
-SWR_CREDENTIALS_FILE="${credentials_file}" \
+SWEGEN_CONFIG="${config_file}" \
     "${build_script}"

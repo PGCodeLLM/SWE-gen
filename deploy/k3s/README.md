@@ -313,20 +313,24 @@ git switch swegen-k3s
 uv sync --frozen
 ```
 
-Choose one immutable worker tag for a clean deployment and set all five
-Deployments in `swegen-pipeline.yaml` to that tag. The production manifest can
-temporarily contain different debugging tags; a rebuild should converge them.
+Choose one immutable worker tag for the isolated deployment. Configure it,
+the complete K3s node list, SSH user, and build CA path under `[pipeline]` in
+`swegen.toml`:
 
-Build once, checksum the archive, import it through K3s containerd on every
-node, and retain exactly one current archive under the node's configured K3s
-data directory:
+```toml
+[pipeline]
+worker_image = "swegen-worker:arthur-tester-REPLACE_WITH_IMMUTABLE_TAG"
+k3s_nodes = ["7.244.3.200", "7.244.3.78", "7.244.2.110", "7.244.1.209"]
+k3s_ssh_user = "root"
+build_ca_path = "/path/to/combined-ca.crt"
+build_worker_image_on_start = true
+```
+
+The master switch builds and imports this image during `start` when
+`build_worker_image_on_start` is true. To build and import it independently:
 
 ```bash
-SWEGEN_WORKER_IMAGE='swegen-worker:REPLACE_WITH_IMMUTABLE_TAG' \
-SWEGEN_K3S_NODES='7.244.3.200 7.244.3.78 7.244.2.110 7.244.1.209' \
-SWEGEN_K3S_SSH_USER='root' \
-SWEGEN_BUILD_CA='/path/to/combined-ca.crt' \
-  ./deploy/k3s/build-import-worker.sh
+./deploy/k3s/build-import-worker.sh
 ```
 
 The helper discovers `data-dir` from `/etc/rancher/k3s/config.yaml`, verifies
@@ -337,13 +341,28 @@ become schedulable later.
 
 ## Create Kubernetes secrets
 
-The helper requires these root-readable source files:
+For an isolated tester deployment, set distinct namespaces in `swegen.toml`:
 
-- `swegen.toml`, containing all model endpoints, model names, and API keys;
+```toml
+[pipeline]
+namespace = "swegen-pipeline-tester"
+secret_source_namespace = "swegen-pipeline"
+```
+
+If the target namespace does not already contain its runtime Secrets, the
+helper clones the four existing Secrets from `secret_source_namespace`, strips
+Kubernetes server metadata, changes only their namespace, and then replaces
+the cloned `swegen.toml` with the current file. It never decodes or prints
+Secret values.
+
+For a from-scratch deployment with no source Secrets, the helper requires
+these root-readable source files:
+
+- `swegen.toml`, containing all model/SWR endpoints, model names, API keys, and
+  the MindDistiller SWR username/password;
 - the combined proxy CA bundle;
 - an HTTP/HTTPS proxy environment file;
-- Docker `config.json` containing the primary wce1sr registry credentials;
-- `swr_credentials/minddistiller_swr.csv` for the second SWR.
+- Docker `config.json` containing the primary wce1sr registry credentials.
 
 Run it without printing secrets:
 
@@ -351,7 +370,6 @@ Run it without printing secrets:
 SWEGEN_SECRET_ROOT='/secure/swegen-secrets' \
 SWEGEN_PROXY_ENV='/secure/swegen-secrets/proxy.env' \
 SWEGEN_DOCKER_CONFIG='/root/.docker/config.json' \
-SWEGEN_MINDDISTILLER_SWR_CSV='/secure/swegen-secrets/minddistiller_swr.csv' \
   ./deploy/k3s/create-secrets.sh
 ```
 
@@ -362,38 +380,42 @@ to the repository.
 
 ## Configure and deploy the pipeline
 
-Review `deploy/k3s/swegen-pipeline.yaml` before applying it:
+Review `deploy/k3s/swegen-pipeline_tester.yaml` before starting it. The tester
+manifest deliberately uses a different namespace, worker image tag, and host
+storage roots from the existing `swegen-pipeline` deployment. PostgreSQL/PGMQ
+and the configured SWRs remain shared.
 
 1. Set the PostgreSQL host, port, user, and database.
 2. Update proxy and `NO_PROXY` values for the new network.
-3. Replace worker image tags with the tag imported above.
-4. Update or remove node selectors for Autoqueue, Generate, Reward, and Push.
+3. Set `[pipeline].worker_image` to the tag imported above.
+4. Update or remove node selectors for Autoqueue, Generate, Reward, and Push
+   in the tester manifest.
 5. Keep Validate without a node selector so the scheduler can use any node
    with sufficient requested resources.
-6. Set `[autoqueue].generate_workers` in `swegen.toml` to the Generate replica
-   count. An explicit `[autoqueue].max_queued` takes priority; otherwise the
-   limit is `max_queued_per_generate_worker * generate_workers`.
-7. Set `[swr.minddistiller].credentials_csv` to
-   `/etc/swegen/minddistiller_swr.csv` and `[completed_tasks].output_dir` to
-   `/app/data_cache/successful_harbor_tasks`. Set its repository to
-   `aifm.coder.exp/swegen/generated`; images use the instance ID as the tag.
-8. For the first smoke test, set every Deployment to one replica. Do not apply
-   large production replica counts to an unverified cluster.
+6. Set `namespace`, `secret_source_namespace`, all three isolated host paths,
+   the K3s build/import settings, and all worker counts under `[pipeline]` in
+   `swegen.toml`. An explicit
+   `[autoqueue].max_queued` takes priority; otherwise the limit is
+   `max_queued_per_generate_worker * pipeline.generate_workers`.
+7. Set `[swr.minddistiller].username` and `.password` in `swegen.toml`, and set
+   `[completed_tasks].output_dir` to `/app/data_cache/successful_harbor_tasks`.
+   Set its repository to `aifm.coder.exp/swegen/generated`; images use the
+   instance ID as the tag.
+8. For the first smoke test, set every `[pipeline]` worker count to one. The
+   manifest deliberately stores zero replicas; `master_switch.sh` applies the
+   counts from TOML.
 9. Confirm CPU and memory requests reflect observed usage. Kubernetes schedules
    against requests, not live utilization.
 
-Validate and apply:
+Validate and start:
 
 ```bash
-kubectl apply --dry-run=server -f deploy/k3s/swegen-pipeline.yaml
-kubectl apply -f deploy/k3s/swegen-pipeline.yaml
-kubectl -n swegen-pipeline get deploy,pods -o wide
-kubectl -n swegen-pipeline rollout status deploy/swegen-autoqueue --timeout=10m
-kubectl -n swegen-pipeline rollout status deploy/swegen-generate --timeout=10m
-kubectl -n swegen-pipeline rollout status deploy/swegen-validate --timeout=10m
-kubectl -n swegen-pipeline rollout status deploy/swegen-reward --timeout=10m
-kubectl -n swegen-pipeline rollout status deploy/swegen-push --timeout=10m
+./master_switch.sh
+kubectl -n swegen-pipeline-tester get deploy,pods -o wide
 ```
+
+`master_switch.sh` renders and server-side dry-runs the tester manifest before
+applying it. It does not update Deployments in `secret_source_namespace`.
 
 Do not force-delete workers performing long Harbor jobs. The Deployments use
 long termination grace periods so claimed work can finish or safely become
@@ -566,13 +588,11 @@ To add capacity:
 5. verify Docker, `crictl`, registry authentication, and proxy connectivity;
 6. uncordon the node and watch a one-Pod canary before increasing replicas.
 
-Import only to the new node with:
+Add the node to `[pipeline].k3s_nodes` in `swegen.toml`, temporarily narrow the
+list to that node if desired, and import the configured image with:
 
 ```bash
-SWEGEN_K3S_NODES='NEW_NODE_IP' \
-SWEGEN_WORKER_IMAGE='swegen-worker:CURRENT_TAG' \
-SWEGEN_BUILD_CA='/path/to/combined-ca.crt' \
-  ./deploy/k3s/build-import-worker.sh
+./deploy/k3s/build-import-worker.sh
 ```
 
 Validate has no node selector and can use new free capacity immediately. Other

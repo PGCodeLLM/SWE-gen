@@ -13,7 +13,7 @@ set -Eeuo pipefail
 #   REPORT_FILE Path for the final build report.
 #   DOCKER_BIN Docker command to invoke (default: docker).
 #   LOCAL_IMAGE_PREFIX Prefix for images retained locally (default: ea_sz_).
-#   SWR_CREDENTIALS_FILE Credential CSV also used by upload_built_images_to_swr.py.
+#   SWEGEN_CONFIG Path to swegen.toml (default: repository root/swegen.toml).
 #   SWR_RETRIES Number of login/check/push attempts (default: 3).
 #   BUILD_TIMEOUT_SECONDS Maximum time for each Docker build (default: 7200).
 #   PUSH_TIMEOUT_SECONDS Maximum time for each SWR push (default: 7200).
@@ -26,9 +26,7 @@ LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/docker-build-logs/5k_js_ts_original}"
 REPORT_FILE="${REPORT_FILE:-${LOG_DIR}/build-report.txt}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 LOCAL_IMAGE_PREFIX="${LOCAL_IMAGE_PREFIX:-ea_sz_}"
-SWR_REGISTRY="swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"
-SWR_REMOTE_REPOSITORY="${SWR_REGISTRY}/aifm.coder.exp/swegen/generated"
-SWR_CREDENTIALS_FILE="${SWR_CREDENTIALS_FILE:-${SCRIPT_DIR}/minddistiller_swr.csv}"
+SWEGEN_CONFIG="${SWEGEN_CONFIG:-${SCRIPT_DIR}/../swegen.toml}"
 SWR_RETRIES="${SWR_RETRIES:-3}"
 BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-7200}"
 PUSH_TIMEOUT_SECONDS="${PUSH_TIMEOUT_SECONDS:-7200}"
@@ -65,8 +63,8 @@ if [[ ! "${PUSH_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-if [[ ! -f "${SWR_CREDENTIALS_FILE}" ]]; then
-    echo "SWR credential CSV does not exist: ${SWR_CREDENTIALS_FILE}" >&2
+if [[ ! -r "${SWEGEN_CONFIG}" ]]; then
+    echo "SWE-gen configuration is not readable: ${SWEGEN_CONFIG}" >&2
     exit 1
 fi
 
@@ -86,49 +84,53 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "Python 3 is required to read the SWR credential CSV." >&2
+    echo "Python 3 is required to read swegen.toml." >&2
     exit 1
 fi
 
-mapfile -d '' -t swr_credentials < <(
-    python3 - "${SWR_CREDENTIALS_FILE}" <<'PY'
-import csv
+mapfile -d '' -t swr_settings < <(
+    python3 - "${SWEGEN_CONFIG}" <<'PY'
 import sys
+import tomllib
 from pathlib import Path
 
 path = Path(sys.argv[1])
-with path.open(newline="", encoding="utf-8-sig") as handle:
-    rows = list(csv.reader(handle))
-values = {
-    row[0].strip(): row[1].strip()
-    for row in rows[1:]
-    if len(row) >= 2 and row[0].strip()
-}
-for key in ("用户名", "密码"):
-    value = values.get(key, "")
-    if not value:
-        raise SystemExit(f"credential CSV is missing {key}")
+with path.open("rb") as handle:
+    document = tomllib.load(handle)
+table = document.get("swr", {}).get("minddistiller", {})
+if not isinstance(table, dict):
+    raise SystemExit("[swr.minddistiller] must be a TOML table")
+for key in ("host", "repository", "username", "password"):
+    value = table.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"[swr.minddistiller].{key} must be a non-empty string")
+    if key == "host":
+        value = value.strip().rstrip("/")
+    elif key == "repository":
+        value = value.strip().strip("/")
+    elif key != "password":
+        value = value.strip()
     sys.stdout.write(value)
     sys.stdout.write("\0")
 PY
 )
-if [[ "${#swr_credentials[@]}" -ne 2 \
-    || -z "${swr_credentials[0]}" \
-    || -z "${swr_credentials[1]}" ]]; then
-    echo "Could not load 用户名 and 密码 from ${SWR_CREDENTIALS_FILE}" >&2
+if [[ "${#swr_settings[@]}" -ne 4 ]]; then
+    echo "Could not load [swr.minddistiller] from ${SWEGEN_CONFIG}" >&2
     exit 1
 fi
-SWR_USERNAME="${swr_credentials[0]}"
-SWR_PASSWORD="${swr_credentials[1]}"
-unset swr_credentials
+SWR_REGISTRY="${swr_settings[0]}"
+SWR_REMOTE_REPOSITORY="${SWR_REGISTRY}/${swr_settings[1]}"
+SWR_USERNAME="${swr_settings[2]}"
+SWR_PASSWORD="${swr_settings[3]}"
+unset swr_settings
 
 mkdir -p "${LOG_DIR}"
 mkdir -p "$(dirname -- "${REPORT_FILE}")"
 STATUS_DIR="$(mktemp -d)"
 DOCKER_CONFIG_DIR="$(mktemp -d)"
 export DOCKER_CONFIG="${DOCKER_CONFIG_DIR}"
-export no_proxy="${no_proxy:-},*.myhuaweicloud.com"
-export NO_PROXY="${NO_PROXY:-},*.myhuaweicloud.com"
+export no_proxy="${no_proxy:+${no_proxy},}${SWR_REGISTRY}"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${SWR_REGISTRY}"
 trap 'rm -rf -- "${STATUS_DIR}" "${DOCKER_CONFIG_DIR}"' EXIT
 
 format_duration() {

@@ -87,8 +87,6 @@ def _candidate_sql(settings: AutoqueueSettings) -> tuple[str, tuple[object, ...]
         list(settings.pr_categories),
         settings.task_version,
     ]
-    if settings.require_obs:
-        clauses.append("source.obs_exists = TRUE")
     if settings.exclude_languages:
         clauses.append("NOT (LOWER(COALESCE(source.primary_language, '')) = ANY(%s))")
         params.append(list(settings.exclude_languages))

@@ -65,6 +65,23 @@ API keys, reward-hacking checkers, autoqueue limits, and SWR targets.
 For the PostgreSQL/PGMQ distributed worker pipeline, see the
 [K3s deployment and migration guide](deploy/k3s/README.md).
 
+Once `swegen.toml`, PostgreSQL/PGMQ, node images, and the secret source files
+are prepared, control the complete K3s pipeline from one entry point:
+
+```bash
+./master_switch.sh          # start workers, then autoqueue
+./master_switch.sh pause    # stop accepting new PRs
+./master_switch.sh resume   # resume autoqueue
+./master_switch.sh stop     # scale the complete pipeline to zero
+./master_switch.sh status
+```
+
+The target/source namespaces, worker image, isolated host paths, K3s image
+import settings, worker replica counts, and rollout timeout are all read from
+the `[pipeline]` section of `swegen.toml`. The switch defaults to the isolated
+`deploy/k3s/swegen-pipeline_tester.yaml` manifest and contains no independent
+runtime sizing defaults.
+
 ## Usage
 
 **Commands:**
@@ -104,8 +121,8 @@ eligible rows from `public.pr_tasks` and atomically enqueues them into the PGMQ
 pipeline. Run one polling process with `./run_autoqueue.sh`, or use
 `./run_autoqueue.sh --once` for a single fill operation.
 
-For a manual MindDistiller batch upload, place its credential CSV under
-`swr_credentials/` and run:
+For a manual MindDistiller batch upload, configure its endpoint, repository,
+username, and password under `[swr.minddistiller]` in `swegen.toml`, then run:
 
 ```bash
 swr_credentials/minddistiller_build_and_upload.sh ids.txt tasks/
