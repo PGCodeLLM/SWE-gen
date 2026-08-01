@@ -1,0 +1,18 @@
+model_list:
+  - model_name: gpt-5.6-sol
+    litellm_params:
+      model: openai/gpt-5.6-sol
+      api_base: http://127.0.0.1:3130/v1
+      api_key: os.environ/ARC_API_KEY
+
+litellm_settings:
+  drop_params: true
+  modify_params: true
+  request_timeout: 14400
+  # The pooled gateway owns transport retries. Avoid retry multiplication in
+  # LiteLLM and in the calling worker.
+  num_retries: 0
+  telemetry: false
+
+general_settings:
+  disable_spend_logs: true
