@@ -70,7 +70,9 @@ def _connection_string() -> str:
 
 
 def _task_directory(task_id: str, task_version: int) -> str:
-    return f"tasks/{task_id}__v{task_version}"
+    # Task directories sit at the archive root so extraction yields the Harbor
+    # tasks directly, with no wrapper directory to strip first.
+    return f"{task_id}__v{task_version}"
 
 
 def export(destination: Path) -> dict[str, object]:

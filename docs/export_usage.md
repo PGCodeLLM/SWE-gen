@@ -46,9 +46,13 @@ two directories.
 
 ## Archive layout
 
+Task directories sit at the archive root, so unpacking yields the Harbor tasks
+directly with no wrapper directory to strip. `manifest.json` is their only
+sibling.
+
 ```text
 manifest.json
-tasks/<task_id>__v<task_version>/
+<task_id>__v<task_version>/
     environment/Dockerfile
     environment/bug.patch
     instruction.md
@@ -69,7 +73,7 @@ executable after extraction.
   "task_version": 1,
   "repo": "01mf02/jaq",
   "pr": 100,
-  "directory": "tasks/01mf02__jaq-100__v1",
+  "directory": "01mf02__jaq-100__v1",
   "pushed_at": "2026-08-02T11:04:53.918273+00:00",
   "swr_image": "REGISTRY_HOST/NAMESPACE/REPOSITORY:sha256-...",
   "registry": "platform",
@@ -90,11 +94,11 @@ successful push without a `remote_tag`, which points at a Push stage that
 completed without publishing.
 
 ```text
-tasks              : 2959
-files              : 34188
-uncompressed bytes : 1,311,186,292
+tasks              : 2968
+files              : 34278
+uncompressed bytes : 1,313,303,449
 tasks missing image: 0
-archive bytes      : 737,748,436
+archive bytes      : 738,390,050
 archive            : /data/swegen-exports/pushed-harbor-tasks-20260803.zip
 ```
 
@@ -107,8 +111,8 @@ import json, zipfile
 archive = zipfile.ZipFile("/data/swegen-exports/pushed-harbor-tasks-20260803.zip")
 print("corrupt entry:", archive.testzip() or "none")
 manifest = json.loads(archive.read("manifest.json"))
-names = archive.namelist()
-directories = {name.split("/")[1] for name in names if name.startswith("tasks/")}
+# Task directories are top level, so anything with a "/" belongs to one.
+directories = {name.split("/")[0] for name in archive.namelist() if "/" in name}
 print("manifest task_count:", manifest["task_count"])
 print("task directories   :", len(directories))
 PY
