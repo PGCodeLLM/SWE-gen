@@ -14,6 +14,10 @@ DEFAULT_UBUNTU_CLOUD_IMAGES_MIRROR = "http://mirrors.tools.huawei.com/ubuntu-clo
 DEFAULT_UBUNTU_PORTS_MIRROR = "http://mirrors.tools.huawei.com/ubuntu-ports/"
 DEFAULT_UBUNTU_RELEASES_MIRROR = "http://mirrors.tools.huawei.com/ubuntu-releases/"
 DEFAULT_NPM_REGISTRY = "https://registry.npmmirror.com/"
+DEFAULT_GO_PROXY = "http://mirrors.tools.huawei.com/goproxy/"
+# Stored bare so it passes the shared HTTP(S) validation; Cargo's required
+# "sparse+" scheme prefix is added where the config is emitted.
+DEFAULT_CARGO_REGISTRY = "http://mirrors.tools.huawei.com/cargo/"
 
 _MIRROR_BLOCK_MARKER = "# SWEGEN_UBUNTU_MIRRORS"
 _NPM_BLOCK_MARKER = "# SWEGEN_NPM_MIRROR"
@@ -77,6 +81,12 @@ _NPM_CI_FALLBACK_MARKER = "# SWEGEN_NPM_CI_FALLBACK"
 _PNPM_FROZEN_LOCKFILE_FALLBACK_MARKER = "# SWEGEN_PNPM_FROZEN_LOCKFILE_FALLBACK"
 _BUN_ENV_MARKER = "# SWEGEN_BUN_ENV"
 _PNPM_REGISTRY_MARKER = "# SWEGEN_PNPM_REGISTRY"
+_GO_PROXY_MARKER = "# SWEGEN_GO_PROXY"
+_CARGO_MIRROR_MARKER = "# SWEGEN_CARGO_MIRROR"
+_GO_COMMAND = re.compile(r"(?<![/A-Za-z0-9_.-])go[ \t]+(?:mod|get|build|install|test|run)\b")
+_CARGO_COMMAND = re.compile(
+    r"(?<![/A-Za-z0-9_.-])cargo[ \t]+(?:fetch|build|test|install|run|check|update|vendor)\b"
+)
 _BUN_COMMAND = re.compile(r"(?<![/A-Za-z0-9_.-])bun[ \t]+(?:install|add|ci)\b")
 _PNPM_COMMAND = re.compile(r"(?<![/A-Za-z0-9_.-])pnpm[ \t]+(?:install|add|import)\b")
 # Captures the trailing flags that belong to the pnpm invocation itself, so the
@@ -189,6 +199,14 @@ def _configured_mirrors() -> dict[str, str]:
         "npm": _mirror_url(
             "SWEGEN_NPM_REGISTRY",
             DEFAULT_NPM_REGISTRY,
+        ),
+        "go": _mirror_url(
+            "SWEGEN_GO_PROXY",
+            DEFAULT_GO_PROXY,
+        ),
+        "cargo": _mirror_url(
+            "SWEGEN_CARGO_REGISTRY",
+            DEFAULT_CARGO_REGISTRY,
         ),
     }
 
@@ -710,6 +728,92 @@ def _rewrite_pnpm_registry(content: str, registry: str) -> str:
     return _rewrite_stages(content, rewrite_stage)
 
 
+def _rewrite_go_proxy(content: str, proxy: str) -> str:
+    """Point the Go toolchain at the internal module proxy.
+
+    Go does not read the npm or apt mirrors: it fetches from proxy.golang.org
+    and sum.golang.org directly through the corporate proxy, which is the
+    single largest source of validator build failures.
+
+    GOSUMDB=off and GONOSUMDB disable checksum verification, which the mirror
+    does not serve. GOPRIVATE is deliberately NOT set: it makes Go bypass the
+    proxy and clone from the origin over git, which is exactly the unreachable
+    path being routed around. A measured fetch took 61s and failed with
+    "dial tcp ... i/o timeout" direct, 164s and failed with GOPRIVATE=*, and
+    977ms through the proxy alone.
+    """
+
+    def rewrite_stage(stage_units: list[str]) -> list[str]:
+        stage_content = "".join(stage_units)
+        if _GO_PROXY_MARKER in stage_content or not _GO_COMMAND.search(stage_content):
+            return stage_units
+        for index, unit in enumerate(stage_units):
+            if _instruction_name(unit) != "RUN" or not _GO_COMMAND.search(unit):
+                continue
+            indent = re.match(r"^[ \t]*", unit).group(0)
+            return [
+                *stage_units[:index],
+                f"{indent}{_GO_PROXY_MARKER}\n",
+                f"{indent}ENV GO111MODULE=on \\\n"
+                f"{indent}    GOPROXY={proxy} \\\n"
+                f"{indent}    GOSUMDB=off \\\n"
+                f"{indent}    GONOSUMDB=* \\\n"
+                f"{indent}    GONOSUMCHECK=1\n",
+                *stage_units[index:],
+            ]
+        return stage_units
+
+    return _rewrite_stages(content, rewrite_stage)
+
+
+def _rewrite_cargo_mirror(content: str, registry: str) -> str:
+    """Point Cargo at the internal sparse registry mirror.
+
+    Like Go, Cargo bypasses every other mirror and reaches crates.io directly.
+    The config is written to /usr/local/cargo/config.toml and ~/.cargo/config
+    both: the former is what CARGO_HOME-based images read, the latter covers
+    images that leave CARGO_HOME unset. The mirror publishes its own download
+    endpoint in config.json, so only the registry needs replacing here.
+    """
+
+    def rewrite_stage(stage_units: list[str]) -> list[str]:
+        stage_content = "".join(stage_units)
+        if _CARGO_MIRROR_MARKER in stage_content or not _CARGO_COMMAND.search(stage_content):
+            return stage_units
+        for index, unit in enumerate(stage_units):
+            if _instruction_name(unit) != "RUN" or not _CARGO_COMMAND.search(unit):
+                continue
+            indent = re.match(r"^[ \t]*", unit).group(0)
+            # Cargo needs a trailing slash on a sparse index and the "sparse+"
+            # scheme prefix to skip the git index protocol entirely. Both TOML
+            # strings use double quotes: the printf body is single-quoted for
+            # the shell, so a nested single quote would be eaten and yield an
+            # unquoted, invalid `replace-with = mirror`.
+            config = (
+                "[source.crates-io]\\n"
+                'replace-with = "mirror"\\n'
+                "[source.mirror]\\n"
+                f'registry = "sparse+{registry}/"\\n'
+            )
+            return [
+                *stage_units[:index],
+                f"{indent}{_CARGO_MIRROR_MARKER}\n",
+                # Only config.toml is written. Cargo warns "both config and
+                # config.toml exist" and then silently ignores config.toml,
+                # so emitting both would leave the mirror unapplied on any
+                # image that already ships a legacy ~/.cargo/config.
+                f'{indent}RUN mkdir -p "${{CARGO_HOME:-/usr/local/cargo}}" "$HOME/.cargo" && '
+                f"printf '{config}' | tee "
+                f'"${{CARGO_HOME:-/usr/local/cargo}}/config.toml" '
+                f'"$HOME/.cargo/config.toml" >/dev/null && '
+                f'rm -f "${{CARGO_HOME:-/usr/local/cargo}}/config" "$HOME/.cargo/config"\n',
+                *stage_units[index:],
+            ]
+        return stage_units
+
+    return _rewrite_stages(content, rewrite_stage)
+
+
 def _strip_unresolved_env_templates(content: str) -> str:
     """Remove unresolved template-valued ENV assignments that Docker cannot parse."""
 
@@ -845,6 +949,8 @@ def rewrite_ubuntu_mirrors(dockerfile: Path) -> bool:
     updated = _rewrite_bun_registry_and_ca(updated, mirrors["npm"])
     updated = _rewrite_pnpm_registry(updated, mirrors["npm"])
     updated = _rewrite_pnpm_frozen_lockfile_fallback(updated)
+    updated = _rewrite_go_proxy(updated, mirrors["go"])
+    updated = _rewrite_cargo_mirror(updated, mirrors["cargo"])
     updated = _rewrite_playwright_download_retry(updated)
 
     if updated == original:

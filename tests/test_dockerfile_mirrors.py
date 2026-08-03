@@ -637,3 +637,82 @@ def test_bun_and_pnpm_rewrites_skip_unrelated_dockerfiles(tmp_path: Path) -> Non
     rendered = dockerfile.read_text()
     assert "SWEGEN_BUN_ENV" not in rendered
     assert "SWEGEN_PNPM_REGISTRY" not in rendered
+
+
+def test_go_toolchain_gets_the_internal_module_proxy(tmp_path: Path) -> None:
+    # Go reads neither the npm nor the apt mirror: it reaches proxy.golang.org
+    # directly through the corporate proxy, which is the largest single source
+    # of validator build failures.
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM golang:1.22\nRUN go mod download && go build ./...\n")
+
+    assert rewrite_ubuntu_mirrors(dockerfile) is True
+    assert rewrite_ubuntu_mirrors(dockerfile) is False
+
+    rendered = dockerfile.read_text()
+    assert rendered.count("# SWEGEN_GO_PROXY") == 1
+    assert "GOPROXY=http://mirrors.tools.huawei.com/goproxy" in rendered
+    assert "GO111MODULE=on" in rendered
+    # The mirror does not serve the public checksum database.
+    assert "GOSUMDB=off" in rendered
+    # GOPRIVATE would make Go bypass the proxy and clone from the origin over
+    # git, which is the unreachable path this rewrite exists to avoid: measured
+    # 977ms through the proxy versus a 164s failure with GOPRIVATE=*.
+    assert "GOPRIVATE" not in rendered
+    assert rendered.index("# SWEGEN_GO_PROXY") < rendered.index("RUN go mod download")
+
+
+def test_cargo_gets_the_internal_sparse_registry(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM rust:1.80\nRUN cargo fetch && cargo build\n")
+
+    assert rewrite_ubuntu_mirrors(dockerfile) is True
+    assert rewrite_ubuntu_mirrors(dockerfile) is False
+
+    rendered = dockerfile.read_text()
+    assert rendered.count("# SWEGEN_CARGO_MIRROR") == 1
+    assert 'registry = \\"sparse+http://mirrors.tools.huawei.com/cargo/\\"' in rendered.replace(
+        '"', '\\"'
+    )
+    assert rendered.index("# SWEGEN_CARGO_MIRROR") < rendered.index("RUN cargo fetch")
+
+
+def test_cargo_config_is_valid_toml_after_the_shell_expands_it(tmp_path: Path) -> None:
+    # The printf body is single-quoted for the shell, so a nested single quote
+    # would be eaten and produce an unquoted `replace-with = mirror`.
+    import os
+    import tomllib
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM rust:1.80\nRUN cargo fetch\n")
+    rewrite_ubuntu_mirrors(dockerfile)
+
+    command = next(
+        line for line in dockerfile.read_text().splitlines() if line.startswith("RUN mkdir -p")
+    )
+    # Cargo ignores config.toml when a legacy config sits beside it, so the
+    # rewrite must remove the legacy file rather than write both.
+    assert '"$HOME/.cargo/config"' not in command.split("&& rm -f")[0]
+    assert "rm -f" in command
+    home = tmp_path / "home"
+    home.mkdir()
+    completed = subprocess.run(
+        ["sh", "-c", command[len("RUN ") :]],
+        env={**os.environ, "HOME": str(home), "CARGO_HOME": str(home / "cargo")},
+    )
+
+    assert completed.returncode == 0
+    parsed = tomllib.loads((home / ".cargo" / "config.toml").read_text())
+    assert parsed["source"]["crates-io"]["replace-with"] == "mirror"
+    assert parsed["source"]["mirror"]["registry"].startswith("sparse+http")
+
+
+def test_go_and_cargo_rewrites_skip_unrelated_dockerfiles(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM python:3.12\nRUN pip install -r requirements.txt\n")
+
+    rewrite_ubuntu_mirrors(dockerfile)
+
+    rendered = dockerfile.read_text()
+    assert "SWEGEN_GO_PROXY" not in rendered
+    assert "SWEGEN_CARGO_MIRROR" not in rendered

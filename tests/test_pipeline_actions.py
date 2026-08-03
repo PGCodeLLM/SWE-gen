@@ -709,8 +709,8 @@ def test_reward_action_raises_when_detector_returns_infrastructure_error(
 
     async def fake_check(test_bundle, primary, fallback, task_id, instance_dir):
         assert test_bundle == "test bundle"
-        assert primary.endpoint == "https://arcyleung-ubuntu.tailb940e6.ts.net"
-        assert primary.model == "gpt-5.3-codex-spark"
+        assert primary.endpoint == "http://1.95.77.23:3000"
+        assert primary.model == "gpt-5.6-sol"
         assert fallback.model == "gpt-5.6-sol"
         assert primary.api_key == fallback.api_key == "dedicated-secret"
         assert task_id == task.task_id
