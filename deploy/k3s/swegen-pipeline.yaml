@@ -42,7 +42,7 @@ data:
   SWEGEN_MAX_REPAIR_ATTEMPTS: "3"
   SWEGEN_REWARD_REPAIR_TIMEOUT_SECONDS: "14400"
   SWEGEN_MAX_REWARD_REPAIR_ATTEMPTS: "3"
-  SWEGEN_REWARD_ENDPOINT: https://arcyleung-ubuntu.tailb940e6.ts.net
+  SWEGEN_REWARD_ENDPOINT: http://1.95.77.23:3000
   SWEGEN_REWARD_PRIMARY_MODEL: gpt-5.6-sol
   SWEGEN_REWARD_FALLBACK_MODEL: gpt-5.6-sol
   SWEGEN_SWR_HOST: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
@@ -252,9 +252,14 @@ spec:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
           resources:
+            # Sized from measured usage across 400 live pods: median 12m CPU /
+            # 254Mi, p90 78m / 462Mi. The old 250m/1200Mi reserved roughly 20x
+            # the CPU and 5x the memory actually used, which reserved capacity
+            # no pod ever consumed. Limits are unchanged, so a heavy task can
+            # still burst.
             requests:
-              cpu: 250m
-              memory: 1200Mi
+              cpu: 50m
+              memory: 384Mi
             limits:
               cpu: "8"
               memory: 16Gi
@@ -380,9 +385,14 @@ spec:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
           resources:
+            # Sized from measured usage across 400 live pods: median 12m CPU /
+            # 254Mi, p90 78m / 462Mi. The old 250m/1200Mi reserved roughly 20x
+            # the CPU and 5x the memory actually used, which reserved capacity
+            # no pod ever consumed. Limits are unchanged, so a heavy task can
+            # still burst.
             requests:
-              cpu: 250m
-              memory: 1200Mi
+              cpu: 50m
+              memory: 384Mi
             limits:
               cpu: "8"
               memory: 16Gi
@@ -515,9 +525,14 @@ spec:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
           resources:
+            # Sized from measured usage across 400 live pods: median 12m CPU /
+            # 254Mi, p90 78m / 462Mi. The old 250m/1200Mi reserved roughly 20x
+            # the CPU and 5x the memory actually used, which reserved capacity
+            # no pod ever consumed. Limits are unchanged, so a heavy task can
+            # still burst.
             requests:
-              cpu: 250m
-              memory: 1200Mi
+              cpu: 50m
+              memory: 384Mi
             limits:
               cpu: "8"
               memory: 16Gi
@@ -611,7 +626,7 @@ spec:
             - name: SWEGEN_REWARD_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: swegen-reward-credentials-arcyleung-20260801
+                  name: swegen-reward-credentials-gpt56sol-20260803
                   key: SWEGEN_REWARD_API_KEY
             - name: POD_NAME
               valueFrom:
@@ -632,9 +647,11 @@ spec:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
           resources:
+            # Measured median 1m CPU / 92Mi across 8 live pods; limits unchanged
+            # so a heavy reward run can still burst.
             requests:
-              cpu: "1"
-              memory: 2Gi
+              cpu: 100m
+              memory: 256Mi
             limits:
               cpu: "4"
               memory: 8Gi
@@ -732,9 +749,11 @@ spec:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
           resources:
+            # Measured median 1m CPU / 91Mi across 16 live pods. The old 2-CPU
+            # request reserved 32 cores cluster-wide that were never used.
             requests:
-              cpu: "2"
-              memory: 200Mi
+              cpu: 100m
+              memory: 256Mi
             limits:
               cpu: "8"
               memory: 16Gi

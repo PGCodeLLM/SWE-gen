@@ -53,6 +53,7 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert config_map["data"]["SWEGEN_GITHUB_MAX_WAIT_SECONDS"] == "300"
     assert config_map["data"]["SWEGEN_REWARD_PRIMARY_MODEL"] == "gpt-5.6-sol"
     assert config_map["data"]["SWEGEN_REWARD_FALLBACK_MODEL"] == "gpt-5.6-sol"
+    assert config_map["data"]["SWEGEN_REWARD_ENDPOINT"] == "http://1.95.77.23:3000"
     assert config_map["data"]["SWEGEN_MAX_REPAIR_ATTEMPTS"] == "3"
     assert config_map["data"]["SWEGEN_REPAIR_TIMEOUT_SECONDS"] == "14400"
     assert config_map["data"]["SWEGEN_MAX_REWARD_REPAIR_ATTEMPTS"] == "3"
@@ -84,6 +85,7 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert ".huaweicloud.com" in no_proxy
     assert ".tailb940e6.ts.net" not in no_proxy.split(",")
     assert "7.244.3.251" in no_proxy.split(",")
+    assert "1.95.77.23" not in no_proxy.split(",")
     assert "7.156.122.134" in no_proxy.split(",")
     assert set(deployments) == {
         "swegen-generate",
@@ -217,6 +219,16 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
             assert "COMPOSE_BAKE" not in env_map
             assert "SWEGEN_BUILD_SLOT_DIR" not in env_map
 
+    reward_env = {
+        item["name"]: item
+        for item in deployments["swegen-reward"]["spec"]["template"]["spec"][
+            "containers"
+        ][0]["env"]
+    }
+    assert reward_env["SWEGEN_REWARD_API_KEY"]["valueFrom"]["secretKeyRef"]["name"] == (
+        "swegen-reward-credentials-gpt56sol-20260803"
+    )
+
 
 def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert (DEPLOY_DIR / "create-secrets.sh").is_file()
@@ -266,8 +278,15 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
         'generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-moedsa-20260802-v2}"'
         in secret_helper
     )
+    assert (
+        'reward_model_secret_name="${SWEGEN_REWARD_MODEL_SECRET_NAME:-swegen-reward-credentials-gpt56sol-20260803}"'
+        in secret_helper
+    )
     assert 'ensure_immutable_env_secret "${model_secret_name}"' in secret_helper
     assert 'ensure_immutable_env_secret "${generate_glm_secret_name}"' in secret_helper
+    assert 'ensure_immutable_env_secret "${reward_model_secret_name}"' in secret_helper
+    assert 'os.environ.get("SWEGEN_REWARD_MODEL_NAME", "gpt-5.6-sol")' in secret_helper
+    assert 'f"SWEGEN_REWARD_API_KEY={api_key}\\n"' in secret_helper
     assert '"OPENAI_API_KEY": api_key' in secret_helper
     assert '"OPENAI_BASE_URL": api_base' in secret_helper
     assert '"OPENAI_MODEL": model' in secret_helper
