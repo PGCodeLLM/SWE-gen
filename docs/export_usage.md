@@ -154,3 +154,49 @@ FROM pipeline_stage_results
 WHERE stage = 'push'
 GROUP BY status;
 ```
+
+## Skill-variant archives
+
+`deploy/k3s/exporter/build_skill_variants.py` turns one baseline export into a
+set of otherwise-identical archives that differ only in which Agent Skills each
+task carries. This exists to A/B whether a given skill combination changes agent
+success rates, so everything except the skill set must stay byte-identical.
+
+```bash
+.venv/bin/python deploy/k3s/exporter/build_skill_variants.py \
+  --baseline /data/swegen-exports/harbor-tasks-skills-20260803-baseline.zip \
+  --output-dir /data/swegen-exports \
+  --prefix harbor-tasks-skills-20260803
+```
+
+Variants are built by streaming the baseline zip, not by re-querying PostgreSQL
+once per variant. The task bodies are identical across variants and total well
+over a gigabyte, so re-reading them from the database N times would be far
+slower and would load the pipeline's live database for no benefit.
+
+Which subsets get built comes from `deploy/k3s/exporter/skill_map.yaml`:
+`skills` is the pool, `always-on` is forced into every subset, and
+`--min-enabled` (default 4) filters the powerset. With four skills, one
+always-on, and a minimum of four, that yields exactly five variants.
+
+Each variant writes `skills/<name>/...` into every task directory and appends
+one line to `instruction.md` naming the enabled skills. Per `agent-skills.md`,
+the platform injects the Dockerfile `COPY` steps itself at image build time and
+defaults `skills_dir` to `/skills` whenever a non-empty `skills/` is present, so
+this script deliberately edits neither the Dockerfile nor `task.toml`.
+
+Two constraints from that spec are enforced here rather than left to fail at
+build time: the entry point must be spelled exactly `SKILL.md`, and symlinks
+under `skills/` are dropped, since the platform rejects them.
+
+### Verifying a variant
+
+```bash
+unzip -Z1 variant.zip | grep -c '/skills/.*/SKILL\.md$'   # == tasks x skills
+unzip -p variant.zip '<task>/instruction.md' | tail -2    # skills line present
+unzip -t variant.zip                                      # integrity
+```
+
+The `SKILL.md` count divided by the task-directory count must equal the number
+of skills in that variant. `name` in each `SKILL.md` frontmatter must match its
+directory name, or OpenCode silently fails to discover the skill.
