@@ -732,6 +732,32 @@ credentials, never put secrets in a Dockerfile or metadata, and never register
 the final task-specific derived image as an intermediate. Intermediate reuse is
 only a build optimization: authoritative NOP=0 and Oracle=1 are still required.
 
+Known failures in these base builds, and their fixes:
+
+- `cargo fetch` stuck on `Updating crates.io index` for tens of minutes: use
+  the sparse index (`CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse`). This is the
+  most common cause of a base build exceeding its ceiling.
+- crates.io index or a git dependency stalls behind the proxy: set
+  `CARGO_NET_GIT_FETCH_WITH_CLI=true` and build with `--network=host`.
+- base build killed on memory or open files: set `CARGO_BUILD_JOBS` to a small
+  value and raise `ulimit -n`.
+- `cargo fetch --all-features` rejected by an old toolchain: use
+  `cargo fetch --locked`.
+- `go mod download` timing out on proxy.golang.org: the mirror env is injected
+  automatically; do not set `GOPRIVATE`, which makes Go bypass the proxy and
+  clone over git instead.
+- `rustup` download stalls on static.rust-lang.org: add a retry loop. Pass each
+  component separately (`--component rustfmt --component clippy`).
+- `npm ci` postinstall reaching GitHub: use `--ignore-scripts` and install the
+  binary dependency explicitly. On Yarn Berry use `yarn config get KEY`.
+- Editing the base Dockerfile changes its SHA-256, so the build key changes:
+  fail the old claim and claim again with the new key.
+
+Give up and fail the claim when cold dependency work is already under 600
+seconds, when the pinned toolchain cannot build its own dependencies (edition
+or MSRV conflict), or after two different fixes both exceed the ceiling. A
+failed claim frees the key for another worker and costs nothing.
+
 Run the validations synchronously and keep their output under `{jobs_dir}`:
 
 ```bash
