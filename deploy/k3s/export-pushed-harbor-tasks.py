@@ -22,6 +22,14 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 
+_ENVIRONMENT_DOCKERFILE = "environment/Dockerfile"
+_ENVIRONMENT_DOCKERFILE_SOURCE = "environment/Dockerfile.source"
+# The pushed SWR image already contains the built environment, so the exported
+# Dockerfile only has to pull it. Dockerfile.source keeps the original
+# build-from-source recipe alongside, since the image is the only other record
+# of how the environment was produced.
+_THIN_DOCKERFILE = 'FROM {image}\nWORKDIR /app/src\nCMD ["sleep", "infinity"]\n'
+
 _PUSHED_TASKS_SQL = """
     SELECT DISTINCT ON (result.task_id, result.task_version)
         result.task_id,
@@ -98,8 +106,16 @@ def export(destination: Path) -> dict[str, object]:
             with connection.cursor(name="pushed_task_files") as cursor:
                 cursor.itersize = 200
                 for row in cursor.execute(_TASK_FILES_SQL):
-                    directory = _task_directory(row["task_id"], row["task_version"])
-                    info = zipfile.ZipInfo(f"{directory}/{row['path']}")
+                    key = (row["task_id"], row["task_version"])
+                    directory = _task_directory(*key)
+                    path = row["path"]
+                    # The stored Dockerfile builds the environment from source.
+                    # These images are already in SWR, so it is kept as
+                    # Dockerfile.source for reproducibility and the thin
+                    # pull-only form takes its place below.
+                    if path == _ENVIRONMENT_DOCKERFILE:
+                        path = _ENVIRONMENT_DOCKERFILE_SOURCE
+                    info = zipfile.ZipInfo(f"{directory}/{path}")
                     # Preserve the stored mode so solve.sh and friends stay
                     # executable after extraction.
                     info.external_attr = (row["mode"] & 0o7777) << 16
@@ -127,6 +143,12 @@ def export(destination: Path) -> dict[str, object]:
                     f"{entry['directory']}/swr-image.json",
                     json.dumps(entry, indent=2, sort_keys=True) + "\n",
                 )
+                if entry["swr_image"]:
+                    archive.writestr(
+                        f"{entry['directory']}/{_ENVIRONMENT_DOCKERFILE}",
+                        _THIN_DOCKERFILE.format(image=entry["swr_image"]),
+                    )
+                    file_count += 1
 
             manifest = {
                 "generated_at": datetime.now(UTC).isoformat(),

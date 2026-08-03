@@ -53,7 +53,8 @@ sibling.
 ```text
 manifest.json
 <task_id>__v<task_version>/
-    environment/Dockerfile
+    environment/Dockerfile          <- thin, pulls the pushed SWR image
+    environment/Dockerfile.source   <- original build-from-source recipe
     environment/bug.patch
     instruction.md
     solution/fix.patch
@@ -64,6 +65,20 @@ manifest.json
 
 Stored file modes are preserved, so `solve.sh` and other scripts remain
 executable after extraction.
+
+The image is already built and in SWR, so `environment/Dockerfile` only pulls
+it rather than rebuilding the environment from source:
+
+```dockerfile
+FROM REGISTRY_HOST/NAMESPACE/REPOSITORY:<task_id>
+WORKDIR /app/src
+CMD ["sleep", "infinity"]
+```
+
+The original recipe is kept beside it as `environment/Dockerfile.source`. It is
+the only record of how the environment was produced, so it stays available for
+rebuilding if an image is ever removed from the registry or the registry is
+unreachable.
 
 `swr-image.json` carries the per-task registry metadata:
 
