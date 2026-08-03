@@ -18,15 +18,20 @@ from swegen import db as db_module
 from swegen.pipeline import worker as worker_module
 from swegen.pipeline.models import PipelineTask, StageExecution, TaskFile
 from swegen.pipeline.worker import (
+    _DEFAULT_MAX_DELIVERIES,
+    MAX_WORKER_ERROR_CHARS,
     ClaimHeartbeat,
     PipelineWorker,
     WorkerSettings,
+    _environment_boolean,
+    _initial_validate_queue,
     _safe_error_text,
 )
 from swegen.queueing.models import (
     ClaimedMessage,
     PipelineStage,
     QueueMessage,
+    QueueName,
     RetryDisposition,
     queue_for_stage,
 )
@@ -43,6 +48,16 @@ ENQUEUED_AT = datetime(2026, 7, 28, 11, 59, tzinfo=UTC)
 VISIBLE_AT = datetime(2026, 7, 28, 12, 5, tzinfo=UTC)
 STARTED_AT = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 HANDOFF_AT = datetime(2026, 7, 28, 12, 1, tzinfo=UTC)
+
+
+def test_initial_validate_queue_splits_worker_identities_stably() -> None:
+    assignments = [_initial_validate_queue(f"validate-worker-{index}") for index in range(64)]
+
+    assert assignments == [
+        _initial_validate_queue(f"validate-worker-{index}") for index in range(64)
+    ]
+    assert set(assignments) == {QueueName.VALIDATE_REPAIRED, QueueName.VALIDATE}
+    assert 24 <= assignments.count(QueueName.VALIDATE_REPAIRED) <= 40
 
 
 def pipeline_task(stage: PipelineStage = PipelineStage.GENERATE) -> PipelineTask:
@@ -269,17 +284,15 @@ class FakeStore:
         self.terminal_failures: list[
             tuple[FakeConnection, ClaimedMessage, str, datetime, str, str]
         ] = []
-        self.stage_activities: list[
-            tuple[FakeConnection, ClaimedMessage, datetime, str, str]
-        ] = []
-        self.activity_heartbeats: list[
-            tuple[FakeConnection, ClaimedMessage, datetime, str]
-        ] = []
+        self.stage_activities: list[tuple[FakeConnection, ClaimedMessage, datetime, str, str]] = []
+        self.activity_heartbeats: list[tuple[FakeConnection, ClaimedMessage, datetime, str]] = []
         self.cleared_activities: list[tuple[FakeConnection, ClaimedMessage]] = []
         self.next_attempt = 1
         self.next_attempt_calls: list[tuple[FakeConnection, str, int, PipelineStage]] = []
         self.repair_candidate: QueueMessage | None = None
         self.repair_reservations: list[tuple[FakeConnection, int, UUID, datetime]] = []
+        self.reward_repair_candidate: QueueMessage | None = None
+        self.reward_repair_reservations: list[tuple[FakeConnection, int, UUID, datetime]] = []
 
     def next_stage_attempt(
         self,
@@ -299,10 +312,21 @@ class FakeStore:
         event_id: UUID,
         enqueued_at: datetime,
     ) -> QueueMessage | None:
-        self.repair_reservations.append(
-            (connection, max_repair_attempts, event_id, enqueued_at)
-        )
+        self.repair_reservations.append((connection, max_repair_attempts, event_id, enqueued_at))
         return self.repair_candidate
+
+    def reserve_reward_repair_candidate(
+        self,
+        connection: FakeConnection,
+        *,
+        max_reward_repair_attempts: int,
+        event_id: UUID,
+        enqueued_at: datetime,
+    ) -> QueueMessage | None:
+        self.reward_repair_reservations.append(
+            (connection, max_reward_repair_attempts, event_id, enqueued_at)
+        )
+        return self.reward_repair_candidate
 
     def record_stage_activity(
         self,
@@ -313,9 +337,7 @@ class FakeStore:
         worker_id: str,
         node_name: str,
     ) -> None:
-        self.stage_activities.append(
-            (connection, claim, started_at, worker_id, node_name)
-        )
+        self.stage_activities.append((connection, claim, started_at, worker_id, node_name))
 
     def heartbeat_stage_activity(
         self,
@@ -325,9 +347,7 @@ class FakeStore:
         heartbeat_at: datetime,
         worker_id: str,
     ) -> None:
-        self.activity_heartbeats.append(
-            (connection, claim, heartbeat_at, worker_id)
-        )
+        self.activity_heartbeats.append((connection, claim, heartbeat_at, worker_id))
 
     def clear_stage_activity(
         self,
@@ -479,6 +499,7 @@ def make_worker(
     heartbeat_factory: Callable[..., AbstractContextManager[object]] | None = None,
     queue: FakeQueue | None = None,
     workspace_factory: Callable[..., AbstractContextManager[Path]] | None = None,
+    settings: WorkerSettings | None = None,
 ) -> PipelineWorker:
     selected_claims = list(claims or ([] if claim is None else [claim]))
     queue = queue or FakeQueue(selected_claims)
@@ -489,7 +510,7 @@ def make_worker(
         queue=queue,
         store=store,
         action=action or FakeAction(),
-        settings=WorkerSettings(workspace_root=tmp_path),
+        settings=settings or WorkerSettings(workspace_root=tmp_path),
         worker_id="worker-1",
         node_name="node-a",
         clock=clock or (lambda: STARTED_AT),
@@ -507,8 +528,11 @@ def test_worker_settings_use_resilient_defaults(tmp_path: Path) -> None:
     assert settings.visibility_timeout_seconds == 300
     assert settings.heartbeat_interval_seconds == 60
     assert settings.poll_seconds == 10
-    assert settings.max_deliveries == 3
+    # Deliveries are attempts, not retries: one initial try plus one retry.
+    assert settings.max_deliveries == 2
     assert settings.max_repair_attempts == 3
+    assert settings.max_reward_repair_attempts == 3
+    assert settings.repair_autoseed is True
     assert settings.retry_visibility_timeout_seconds == 300
     assert settings.workspace_root == tmp_path
 
@@ -546,6 +570,35 @@ def test_worker_settings_require_heartbeat_before_visibility_expiry(tmp_path: Pa
 def test_worker_settings_enforce_the_single_claim_mvp(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="claim_quantity"):
         WorkerSettings(workspace_root=tmp_path, claim_quantity=2)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_environment_boolean_accepts_true_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("SWEGEN_TEST_BOOLEAN", value)
+
+    assert _environment_boolean("SWEGEN_TEST_BOOLEAN", default=False) is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
+def test_environment_boolean_accepts_false_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("SWEGEN_TEST_BOOLEAN", value)
+
+    assert _environment_boolean("SWEGEN_TEST_BOOLEAN", default=True) is False
+
+
+def test_environment_boolean_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SWEGEN_TEST_BOOLEAN", "sometimes")
+
+    with pytest.raises(ValueError, match="SWEGEN_TEST_BOOLEAN"):
+        _environment_boolean("SWEGEN_TEST_BOOLEAN", default=True)
 
 
 def test_worker_settings_reject_a_non_finite_heartbeat_interval(tmp_path: Path) -> None:
@@ -643,6 +696,51 @@ def test_repair_poll_reserves_and_enqueues_one_candidate_before_claiming(
 
     assert worker.queue.sent == [candidate]
     assert worker.store.repair_reservations[0][1:] == (
+        3,
+        NEXT_EVENT_ID,
+        STARTED_AT,
+    )
+    assert len(worker.queue.claim_calls) == 1
+
+
+def test_repair_poll_can_disable_automatic_candidate_seeding(tmp_path: Path) -> None:
+    worker = make_worker(
+        tmp_path,
+        stage=PipelineStage.REPAIR,
+        task=pipeline_task(PipelineStage.REPAIR),
+        settings=WorkerSettings(workspace_root=tmp_path, repair_autoseed=False),
+    )
+
+    assert worker.run_once() is False
+
+    assert worker.queue.sent == []
+    assert worker.store.repair_reservations == []
+    assert len(worker.queue.claim_calls) == 1
+
+
+def test_reward_repair_poll_reserves_and_enqueues_one_candidate_before_claiming(
+    tmp_path: Path,
+) -> None:
+    worker = make_worker(
+        tmp_path,
+        stage=PipelineStage.REWARD_REPAIR,
+        task=pipeline_task(PipelineStage.REWARD_REPAIR),
+    )
+    candidate = QueueMessage(
+        event_id=NEXT_EVENT_ID,
+        task_id="owner__repo-123",
+        task_version=1,
+        stage=PipelineStage.REWARD_REPAIR,
+        attempt=2,
+        trace_id=TRACE_ID,
+        enqueued_at=STARTED_AT,
+    )
+    worker.store.reward_repair_candidate = candidate
+
+    assert worker.run_once() is False
+
+    assert worker.queue.sent == [candidate]
+    assert worker.store.reward_repair_reservations[0][1:] == (
         3,
         NEXT_EVENT_ID,
         STARTED_AT,
@@ -1223,9 +1321,7 @@ def test_worker_records_activity_before_action_and_clears_it_on_success(
 
     activity = worker.store.stage_activities[0]
     assert activity[1:] == (claim, STARTED_AT, "worker-1", "node-a")
-    assert worker.store.cleared_activities == [
-        (worker.store.stage_results[0][0], claim)
-    ]
+    assert worker.store.cleared_activities == [(worker.store.stage_results[0][0], claim)]
 
 
 def test_worker_passes_an_activity_heartbeat_callback_to_the_lease_guard(
@@ -1270,13 +1366,13 @@ def test_rejected_execution_archives_without_handoff(tmp_path: Path) -> None:
     assert worker.run_once() is True
     assert worker.queue.completed_terminal == [reward_claim()]
     assert worker.queue.handoffs == []
-    assert worker.store.cleared_activities == [
-        (worker.store.stage_results[0][0], reward_claim())
-    ]
+    assert worker.store.cleared_activities == [(worker.store.stage_results[0][0], reward_claim())]
 
 
 def test_action_exception_retries_in_place_before_the_delivery_limit(tmp_path: Path) -> None:
-    claim = reward_claim(read_count=2)
+    # Derived from the configured limit so the boundary stays meaningful if the
+    # default delivery count changes.
+    claim = reward_claim(read_count=_DEFAULT_MAX_DELIVERIES - 1)
     worker = make_worker(
         tmp_path,
         action=FakeAction(error=RuntimeError("temporary outage")),
@@ -1296,7 +1392,7 @@ def test_action_exception_retries_in_place_before_the_delivery_limit(tmp_path: P
 def test_exhausted_action_exception_records_redacted_failure_and_dead_letters(
     tmp_path: Path,
 ) -> None:
-    claim = reward_claim(read_count=3)
+    claim = reward_claim(read_count=_DEFAULT_MAX_DELIVERIES)
     secret = "ghp_abcdefghijklmnopqrstuvwxyz"
     worker = make_worker(
         tmp_path,
@@ -1313,9 +1409,7 @@ def test_exhausted_action_exception_records_redacted_failure_and_dead_letters(
     assert secret not in stored_error
     assert "<REDACTED>" in stored_error
     assert len(stored_error) <= 4_000
-    assert worker.store.cleared_activities == [
-        (worker.store.terminal_failures[0][0], claim)
-    ]
+    assert worker.store.cleared_activities == [(worker.store.terminal_failures[0][0], claim)]
 
 
 def test_stop_request_during_action_allows_completion_but_prevents_future_claims(
@@ -1360,7 +1454,7 @@ def test_stop_request_that_interrupts_action_releases_claim_without_failure(
         raise RuntimeError("Harbor cancelled during worker shutdown")
 
     action = FakeAction(side_effect=interrupt_action)
-    claim = reward_claim(read_count=3)
+    claim = reward_claim(read_count=_DEFAULT_MAX_DELIVERIES)
     worker = make_worker(
         tmp_path,
         action=action,
@@ -1557,3 +1651,73 @@ def test_cleanup_failure_after_durable_completion_does_not_retry_or_dead_letter(
     assert len(worker.store.stage_results) == 1
     assert workspace_factory.path is not None
     assert workspace_factory.path.exists() is False
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [({}, 2), ({"SWEGEN_MAX_DELIVERIES": "1"}, 1), ({"SWEGEN_MAX_DELIVERIES": "5"}, 5)],
+)
+def test_runtime_worker_reads_max_deliveries_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    expected: int,
+) -> None:
+    class FakePool:
+        def connection(self, timeout: float | None = None) -> FakeConnection:
+            return FakeConnection("pool", [])
+
+    monkeypatch.delenv("SWEGEN_MAX_DELIVERIES", raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(db_module, "get_pool", lambda: FakePool())
+    monkeypatch.setattr(
+        worker_module,
+        "_load_stage_action",
+        lambda stage, **_kwargs: FakeAction(),
+    )
+
+    worker = worker_module._build_runtime_worker(PipelineStage.REWARD)
+
+    assert worker.settings.max_deliveries == expected
+
+
+def test_runtime_worker_prefers_stage_specific_max_deliveries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePool:
+        def connection(self, timeout: float | None = None) -> FakeConnection:
+            return FakeConnection("pool", [])
+
+    monkeypatch.setenv("SWEGEN_MAX_DELIVERIES", "2")
+    monkeypatch.setenv("SWEGEN_VALIDATE_MAX_DELIVERIES", "1")
+    monkeypatch.setattr(db_module, "get_pool", lambda: FakePool())
+    monkeypatch.setattr(
+        worker_module,
+        "_load_stage_action",
+        lambda stage, **_kwargs: FakeAction(),
+    )
+
+    validate_worker = worker_module._build_runtime_worker(PipelineStage.VALIDATE)
+    reward_worker = worker_module._build_runtime_worker(PipelineStage.REWARD)
+
+    assert validate_worker.settings.max_deliveries == 1
+    assert reward_worker.settings.max_deliveries == 2
+
+
+def test_safe_error_text_keeps_the_tail_of_a_long_traceback() -> None:
+    # A head slice drops the final exception line, which is the part that says
+    # what actually went wrong.
+    detail = ("context line that repeats " * 400) + "FATAL: the real cause"
+    summary = _safe_error_text(RuntimeError(detail))
+
+    assert summary.startswith("RuntimeError:")
+    assert summary.endswith("FATAL: the real cause")
+    assert " ... " in summary
+    assert len(summary) <= MAX_WORKER_ERROR_CHARS
+
+
+def test_safe_error_text_leaves_short_errors_intact() -> None:
+    summary = _safe_error_text(RuntimeError("boom"))
+
+    assert summary == "RuntimeError: boom"
+    assert " ... " not in summary

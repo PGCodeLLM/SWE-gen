@@ -311,8 +311,11 @@ SELECT * FROM pgmq.metrics('swegen_generate');
 
 Expected queues are `swegen_generate`, `swegen_validate`,
 `swegen_validate_repaired`, `swegen_repair`, `swegen_reward`, `swegen_push`,
-and `swegen_dead`. Validate workers always claim `swegen_validate_repaired`
-first and fall back to the normal FIFO only when no repaired task is visible.
+and `swegen_dead`. Validate workers split their initial preference
+deterministically across the repaired and fresh FIFOs, then alternate
+successful claims 50/50 between them. If the chosen queue is empty, they
+immediately fall back to the other queue and keep the missing side preferred
+so it is served as soon as work arrives.
 
 For an existing deployment, create the repaired-task priority FIFO, route old
 Repair worker handoffs into it, and move visible pending repaired tasks:
@@ -415,18 +418,18 @@ Review `deploy/k3s/swegen-pipeline.yaml` before applying it:
 4. Update or remove node selectors for Generate, Reward, and Push.
 5. Keep Validate and Repair without node selectors so the scheduler can use any node
    with sufficient requested resources.
-6. Keep Validate at 96 replicas on a four-node, 192-CPU-per-node cluster. Its
-   topology spread constraint places 24 validators on each node and prevents
-   one Docker daemon from absorbing most of the build load.
+6. Keep Validate and Repair at 144 replicas each on the four-node production
+   cluster. Their topology spread constraints target 36 Pods of each stage per
+   node and prevent one Docker daemon from absorbing most of the build load.
 7. For the first smoke test, set every Deployment to one replica. Do not apply
    large production replica counts to an unverified cluster.
 8. Confirm CPU and memory requests reflect observed usage. Kubernetes schedules
    against requests, not live utilization.
 
-Start Repair at four replicas. Measure the fraction of repaired tasks that pass
-their next authoritative validation attempt before increasing it. Do not scale
-toward 240 repair pods unless that yield is near or above 50% and Docker build
-throughput is stable; repair and validation share the node Docker daemons.
+For a fresh cluster, start Repair at four replicas and measure the fraction of
+repaired tasks that pass their next authoritative validation attempt before
+scaling to the production count. Repair and validation share the node Docker
+daemons even when builds can route to the remote farm.
 
 Validate and apply:
 
@@ -495,6 +498,29 @@ repository; after NOP/Oracle succeeds, the Push stage verifies the exact
 context digest and repository, records the already-pushed farm image, and skips
 the redundant local build/push. Local-routed or farm-fallback instances still
 use the normal task-ID tag and Push stage.
+
+### Sweeping orphaned remote build rows
+
+`pipeline_remote_builds` is written only by the worker that submitted the build.
+A worker killed mid-build — rollout, eviction, or OOM — never records a terminal
+status, so its row stays at `running` forever and inflates the dashboard's
+pending count long after the farm discarded the build. The farm's own
+`/build/drain-status` is the authority on real queue depth; a large dashboard
+pending number with `queued=0` across farm pods means stale rows, not a backlog.
+
+Sweep them by marking rows whose submitting Pod no longer exists as `orphaned`,
+which drops them from the pending statuses:
+
+```bash
+uv run swegen-pipeline sweep-remote-builds --dry-run
+uv run swegen-pipeline sweep-remote-builds
+```
+
+The sweep only touches rows untouched for at least `--min-age-seconds`
+(default 3600) whose `worker_id` is absent from a full Pod listing. It refuses
+to run when that listing is empty or unparsable, since an incomplete list would
+orphan builds that are still progressing. Rows with a NULL `worker_id` are never
+swept. Run it after any large worker rollout, or periodically as a CronJob.
 
 ## End-to-end smoke test
 
@@ -598,7 +624,7 @@ sudo du -sh /data/k3s /data/kubelet /data/docker
 A conservative BuildKit cleanup command for a large worker node is:
 
 ```bash
-docker buildx prune --force \
+docker buildx prune --builder default --force \
   --filter 'until=24h' \
   --reserved-space 20gb \
   --max-used-space 100gb \
@@ -619,11 +645,13 @@ kubectl -n swegen-pipeline logs \
   -l app.kubernetes.io/name=swegen-buildkit-pruner --tail=80 --prefix
 ```
 
-Each Pod runs immediately and then every 10 minutes. It includes all unused
-embedded BuildKit records, prunes the oldest toward a 100 GB maximum, reserves
-20 GB, and gives each prune at most 9 minutes. A lock under the node's
-`/run/lock` prevents overlapping cleanup after replacement or restart races.
-The Docker builder never removes cache records that are actively in use.
+Each Pod waits 10 minutes after startup and then runs every 10 minutes. It
+explicitly targets the Docker-driver Buildx builder named `default` rather than
+inheriting a selected builder such as `harbor-builder`. It includes all unused
+BuildKit records, prunes the oldest toward a 100 GB maximum, reserves 20 GB,
+and gives each prune at most one hour. A lock under the node's `/run/lock`
+prevents overlapping cleanup after replacement or restart races. The Docker
+builder never removes cache records that are actively in use.
 
 Remove the stopgap without changing the pipeline workers:
 
@@ -636,12 +664,23 @@ manually first, then automate it with a systemd timer and `flock` so only one
 cleanup runs at a time. BuildKit prunes unused cache records; it should not
 need to stop the daemon.
 
-Pause Validate and Push before a large maintenance prune. Both stages can run
+Pause Validate and Repair before a large maintenance prune. Both stages can run
 Docker builds, and active BuildKit records are protected from garbage
-collection. On the four-node production layout, restore Validate to 96 replicas
-afterward and confirm the scheduler has placed 24 Pods on each node.
+collection. On the four-node production layout, restore both stages to 144
+replicas afterward and confirm the scheduler targets 36 Pods of each stage on
+each node.
 
-Periodically remove stopped Harbor containers and old unused images:
+The pruner DaemonSet runs every ten minutes. It removes dangling images, stops
+and removes Docker containers older than two hours, prunes newly dangling
+images, and finally trims unused BuildKit cache while retaining the configured
+100 GB cache budget. A large BuildKit prune may run for up to one hour, and the
+per-node lock prevents a second cycle from overlapping it. A replacement
+pruner waits ten minutes before its first cycle so a maintenance rollout does
+not immediately repeat the just-completed manual prune. All worker Deployments
+cap graceful shutdown at ten minutes so a stalled process cannot hold a
+terminating Pod for hours.
+
+For a manual conservative image cleanup, use:
 
 ```bash
 docker container prune --force --filter 'until=24h'

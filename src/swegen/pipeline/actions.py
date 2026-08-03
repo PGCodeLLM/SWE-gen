@@ -38,7 +38,6 @@ from swegen.tools.remote_buildkit import (
     RemoteBuildkitConfig,
     context_digest,
     find_successful_remote_image,
-    select_build_route,
 )
 from swegen.tools.subprocess_utils import run_bounded_command
 
@@ -51,6 +50,7 @@ MAX_COMMAND_LOG_BYTES = 1024 * 1024
 DEFAULT_CC_TIMEOUT_SECONDS = 10800
 DEFAULT_GENERATE_TIMEOUT_SECONDS = 14400.0
 DEFAULT_REPAIR_TIMEOUT_SECONDS = 14400
+DEFAULT_REWARD_REPAIR_TIMEOUT_SECONDS = 14400
 DEFAULT_HARBOR_TIMEOUT_SECONDS = 3600.0
 DEFAULT_REWARD_ENDPOINT = "https://arcyleung-ubuntu.tailb940e6.ts.net"
 DEFAULT_REWARD_PRIMARY_MODEL = "gpt-5.3-codex-spark"
@@ -71,8 +71,11 @@ _COMMAND_STOP_GRACE_SECONDS = 10.0
 _PROXY_CA_FILENAME = "swegen-proxy-ca.crt"
 _PROXY_CA_TRUST_PATH = f"/usr/local/share/ca-certificates/{_PROXY_CA_FILENAME}"
 _PROXY_PACKAGE_MANAGER_ENVIRONMENT = (
+    ("GIT_SSL_CAINFO", _PROXY_CA_TRUST_PATH),
+    ("UV_NATIVE_TLS", "true"),
     ("NODE_EXTRA_CA_CERTS", _PROXY_CA_TRUST_PATH),
     ("NPM_CONFIG_CAFILE", _PROXY_CA_TRUST_PATH),
+    ("NPM_CONFIG_LEGACY_PEER_DEPS", "true"),
     ("NPM_CONFIG_FETCH_RETRIES", "5"),
     ("NPM_CONFIG_FETCH_RETRY_FACTOR", "2"),
     ("NPM_CONFIG_FETCH_RETRY_MINTIMEOUT", "20000"),
@@ -237,7 +240,31 @@ def _ensure_proxy_ca_runtime_environment(task_dir: Path) -> bool:
         return False
 
     text = dockerfile.read_text()
-    lines = text.splitlines(keepends=True)
+    updated = text
+    temporary_ca = f"/tmp/{_PROXY_CA_FILENAME}"
+    system_ca = "/etc/ssl/certs/ca-certificates.crt"
+    append_ca_command = f"cat {temporary_ca} >> {system_ca}"
+    if temporary_ca in updated and append_ca_command not in updated:
+        lines = updated.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if "update-ca-certificates" not in line:
+                continue
+            if line.rstrip().endswith("\\"):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.insert(index + 1, f"{indent}&& {append_ca_command} \\\n")
+                updated = "".join(lines)
+                break
+            inline = "&& update-ca-certificates &&"
+            if inline in line:
+                lines[index] = line.replace(
+                    inline,
+                    f"&& update-ca-certificates && {append_ca_command} &&",
+                    1,
+                )
+                updated = "".join(lines)
+                break
+
+    lines = updated.splitlines(keepends=True)
     ca_update_line = next(
         (index for index, line in enumerate(lines) if "update-ca-certificates" in line),
         None,
@@ -248,23 +275,23 @@ def _ensure_proxy_ca_runtime_environment(task_dir: Path) -> bool:
             instruction_start -= 1
         insertion_index = sum(len(line) for line in lines[:instruction_start])
     else:
-        workdir_index = text.find("WORKDIR ")
+        workdir_index = updated.find("WORKDIR ")
         if workdir_index < 0:
-            insertion_index = len(text.rstrip()) + 1
+            insertion_index = len(updated.rstrip()) + 1
         else:
             insertion_index = workdir_index
 
-    effective_prefix = text[:insertion_index]
+    effective_prefix = updated[:insertion_index]
     assignments = [
         f"{name}={value}"
         for name, value in _PROXY_PACKAGE_MANAGER_ENVIRONMENT
         if f"{name}=" not in effective_prefix
     ]
-    if not assignments:
+    if assignments:
+        environment = "ENV " + " \\\n    ".join(assignments) + "\n\n"
+        updated = updated[:insertion_index] + environment + updated[insertion_index:]
+    if updated == text:
         return False
-
-    environment = "ENV " + " \\\n    ".join(assignments) + "\n\n"
-    updated = text[:insertion_index] + environment + text[insertion_index:]
     dockerfile.write_text(updated)
     return True
 
@@ -388,14 +415,20 @@ def validate_action(
             )
 
 
-def repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
-    """Let Claude Code repair task packaging, then return it to validation."""
-
+def _task_repair_action_without_image_cleanup(
+    task: PipelineTask,
+    workspace: Path,
+    *,
+    reward_rejection_reason: str | None,
+) -> StageExecution:
     task_dir = workspace / "tasks" / task.task_id
     if not task_dir.is_dir():
         raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
     rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
+    original_files = capture_task_files(task_dir)
+    if not original_files:
+        raise RuntimeError(f"repair input task directory is empty: {task.task_id}")
     tests_dir = task_dir / "tests"
     test_files = (
         sorted(
@@ -415,33 +448,103 @@ def repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
         dataset_path=workspace / "tasks",
         test_files=test_files,
         timeout=_environment_positive_integer(
-            "SWEGEN_REPAIR_TIMEOUT_SECONDS",
-            DEFAULT_REPAIR_TIMEOUT_SECONDS,
+            (
+                "SWEGEN_REWARD_REPAIR_TIMEOUT_SECONDS"
+                if reward_rejection_reason is not None
+                else "SWEGEN_REPAIR_TIMEOUT_SECONDS"
+            ),
+            (
+                DEFAULT_REWARD_REPAIR_TIMEOUT_SECONDS
+                if reward_rejection_reason is not None
+                else DEFAULT_REPAIR_TIMEOUT_SECONDS
+            ),
         ),
         verbose=False,
-        jobs_dir=workspace / ".swegen" / "repair-harbor-jobs",
+        jobs_dir=(
+            workspace
+            / ".swegen"
+            / (
+                "reward-repair-harbor-jobs"
+                if reward_rejection_reason is not None
+                else "repair-harbor-jobs"
+            )
+        ),
         validate=True,
         repair=True,
+        repair_reason=reward_rejection_reason,
     )
     rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
     files = capture_task_files(task_dir)
     if not files:
         raise RuntimeError(f"repaired task directory is empty: {task.task_id}")
-    return StageExecution.succeeded(
-        {
-            "agent_reported_success": result.success,
-            "agent_nop_passed": result.nop_passed,
-            "agent_oracle_passed": result.oracle_passed,
-            "agent_error": (
-                _compact_safe_error_detail(result.error_message, 1000)
-                if result.error_message
-                else None
-            ),
-            "file_count": len(files),
-            "total_bytes": sum(task_file.size_bytes or 0 for task_file in files),
-        },
-        files,
+    agent_error = (
+        _compact_safe_error_detail(result.error_message, 1000) if result.error_message else None
+    )
+    files_changed = files != original_files
+    execution_result = {
+        "agent_reported_success": result.success,
+        "agent_nop_passed": result.nop_passed,
+        "agent_oracle_passed": result.oracle_passed,
+        "agent_changed_files": files_changed,
+        "agent_error": agent_error,
+        "file_count": len(files),
+        "total_bytes": sum(task_file.size_bytes or 0 for task_file in files),
+    }
+    if not (result.nop_passed and result.oracle_passed) and not files_changed:
+        return StageExecution.failed(
+            {
+                **execution_result,
+                "error": agent_error
+                or "repair agent failed validation without changing task artifacts",
+            }
+        )
+    return StageExecution.succeeded(execution_result, files)
+
+
+def _task_repair_action(
+    task: PipelineTask,
+    workspace: Path,
+    *,
+    reward_rejection_reason: str | None,
+) -> StageExecution:
+    local_tag = local_image_tag(task.task_id)
+    try:
+        return _task_repair_action_without_image_cleanup(
+            task,
+            workspace,
+            reward_rejection_reason=reward_rejection_reason,
+        )
+    finally:
+        try:
+            remove_local_image(local_tag)
+        except Exception as error:
+            LOGGER.warning(
+                "failed to remove repair image %s: %s",
+                local_tag,
+                _compact_safe_text(error),
+            )
+
+
+def repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
+    """Let Claude Code repair task packaging, then return it to validation."""
+
+    return _task_repair_action(task, workspace, reward_rejection_reason=None)
+
+
+def reward_repair_action(task: PipelineTask, workspace: Path) -> StageExecution:
+    """Repair a Reward-rejected verifier, then return it to NOP/Oracle."""
+
+    # The detector states its actual verdict at the end of a long explanation,
+    # so a head slice hands the repair model the preamble without the finding.
+    reason = _compact_safe_error_detail(
+        task.last_reason or "Reward-hacking detector rejected the verifier without a reason.",
+        4000,
+    )
+    return _task_repair_action(
+        task,
+        workspace,
+        reward_rejection_reason=reason,
     )
 
 
@@ -526,6 +629,13 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
         task_dir = workspace / "tasks" / task.task_id
         if not task_dir.is_dir():
             raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
+        # Validate/Repair normalize the build context before Harbor submits it
+        # to the remote farm.  Reproduce those deterministic edits before
+        # hashing here; hashing the raw Postgres materialization cannot match
+        # the successful remote-build row and incorrectly falls through to a
+        # fresh node-local build.
+        rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
+        _ensure_proxy_ca_runtime_environment(task_dir)
         remote_build_tag = _remote_buildkit_image_for_push(
             task.task_id,
             task_dir,
@@ -554,7 +664,6 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
                     "already_present": True,
                 }
             )
-        _ensure_proxy_ca_runtime_environment(task_dir)
         proxy_environment = {
             name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
         }
@@ -611,8 +720,12 @@ def _remote_buildkit_image_for_push(
         environment_dir,
         dockerfile_registry_rewrites=config.dockerfile_registry_rewrites,
     )
-    if select_build_route(config, digest) != "remote":
-        return None
+    # The exact successful build row is authoritative.  In local_overflow mode
+    # route selection happens dynamically after checking node-local slots, so
+    # select_build_route() cannot reconstruct whether this particular build
+    # overflowed to the farm.  Requiring a static "remote" route here caused
+    # Push to rebuild (and often fail) even though SWR already held the exact
+    # content-addressed image.
     image_ref = find_successful_remote_image(
         environment_name=task_id,
         context_digest=digest,
@@ -652,6 +765,7 @@ def action_for_stage(
         PipelineStage.VALIDATE: validation_action,
         PipelineStage.REPAIR: repair_action,
         PipelineStage.REWARD: reward_action,
+        PipelineStage.REWARD_REPAIR: reward_repair_action,
         PipelineStage.PUSH: push_action,
     }
     return actions[normalized_stage]
@@ -663,6 +777,7 @@ __all__ = [
     "generate_action",
     "push_action",
     "repair_action",
+    "reward_repair_action",
     "reward_action",
     "validate_action",
 ]

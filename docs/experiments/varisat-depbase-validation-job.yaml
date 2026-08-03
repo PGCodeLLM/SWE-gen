@@ -1,0 +1,162 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swegen-varisat-depbase-validation-20260802
+  namespace: swegen-pipeline
+data:
+  task.toml: |
+    version = "1.0"
+
+    [metadata]
+    difficulty = "medium"
+    category = "feature"
+    tags = [ "rust", "library", "sat",]
+
+    [verifier]
+    timeout_sec = 1800.0
+
+    [agent]
+    timeout_sec = 1800.0
+
+    [environment]
+    build_timeout_sec = 1800.0
+    docker_image = "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:sha256-c376306bb245eb3814ecc995882b2d5d6e13902a783110423260a7a091d5975c"
+    cpus = 1
+    memory_mb = 2048
+    storage_mb = 10240
+    gpus = 0
+    allow_internet = true
+
+    [verifier.env]
+
+    [solution.env]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: swegen-varisat-depbase-validation-20260802
+  namespace: swegen-pipeline
+  labels:
+    swegen.pgcode/experiment: varisat-depbase-validation-20260802
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 2400
+  template:
+    metadata:
+      labels:
+        swegen.pgcode/experiment: varisat-depbase-validation-20260802
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        swegen.pgcode/node-ip: 7.244.2.110
+      containers:
+        - name: validator
+          image: swegen-worker:targeted-repair-canary-20260802-0645
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              set -eu;
+              /usr/bin/docker pull
+              swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:sha256-c376306bb245eb3814ecc995882b2d5d6e13902a783110423260a7a091d5975c;
+              exec /app/.venv/bin/swegen validate
+              /data/swegen-k3s/workspaces/varisat-depbase-20260802/task
+              --agent both
+              --jobs-dir /data/swegen-k3s/workspaces/varisat-depbase-20260802/validation-jobs
+              --verbose
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+          env:
+            - name: SWEGEN_BUILD_ROUTER_MODE
+              value: local
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: default
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1200Mi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/swegen-k3s/workspaces
+            - name: task-config
+              mountPath: /data/swegen-k3s/workspaces/varisat-depbase-20260802/task/task.toml
+              subPath: task.toml
+              readOnly: true
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/swegen-k3s/workspaces
+            type: DirectoryOrCreate
+        - name: task-config
+          configMap:
+            name: swegen-varisat-depbase-validation-20260802
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400
+

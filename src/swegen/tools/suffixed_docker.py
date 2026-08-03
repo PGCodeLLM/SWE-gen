@@ -20,6 +20,9 @@ from swegen.tools.remote_buildkit import (
 )
 
 DOCKER_IMAGE_SUFFIX = "-swegenimage"
+REMOTE_PULL_ATTEMPTS = 3
+REMOTE_PULL_RETRY_SECONDS = 5.0
+LOCAL_SLOTS_FULL_MARKER = "SWEGEN_BUILD_SLOTS_FULL"
 _IMAGE_COMPOSE_TEMPLATE = """services:
   main:
     image: ${MAIN_IMAGE_NAME}
@@ -99,9 +102,13 @@ class SwegenDockerEnvironment(DockerEnvironment):
             self.environment_dir,
             dockerfile_registry_rewrites=registry_rewrites,
         )
-        if select_build_route(config, digest) == "local":
+        route = select_build_route(config, digest)
+        if route == "local":
             await super().start(force_build)
             return
+        if route == "local_overflow":
+            if await self._start_local_if_slot_available(force_build):
+                return
 
         image_ref = config.image_ref(digest)
         lock = self._image_build_locks.setdefault(image_ref, asyncio.Lock())
@@ -163,24 +170,53 @@ class SwegenDockerEnvironment(DockerEnvironment):
             )
             await super().start(force_build)
 
-    async def _pull_image(self, image_ref: str, timeout_seconds: float) -> bool:
-        process = await asyncio.create_subprocess_exec(
-            "docker",
-            "pull",
-            image_ref,
-            env=os.environ.copy(),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+    async def _start_local_if_slot_available(self, force_build: bool) -> bool:
+        """Use local BuildKit only when a node slot is immediately available."""
+
+        variable = "SWEGEN_BUILD_SLOT_NONBLOCKING"
+        previous = os.environ.get(variable)
+        os.environ[variable] = "1"
         try:
-            await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-        except TimeoutError:
-            process.terminate()
             try:
-                await asyncio.wait_for(process.communicate(), timeout=5)
+                await super().start(force_build)
+            except RuntimeError as error:
+                if LOCAL_SLOTS_FULL_MARKER not in str(error):
+                    raise
+                self.logger.info(
+                    "Node-local BuildKit slots are full for %s; routing to remote farm",
+                    self.environment_name,
+                )
+                return False
+        finally:
+            if previous is None:
+                os.environ.pop(variable, None)
+            else:
+                os.environ[variable] = previous
+        return True
+
+    async def _pull_image(self, image_ref: str, timeout_seconds: float) -> bool:
+        for attempt in range(1, REMOTE_PULL_ATTEMPTS + 1):
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "pull",
+                image_ref,
+                env=os.environ.copy(),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
             except TimeoutError:
-                process.kill()
-                await process.communicate()
-            return False
-        return process.returncode == 0
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.communicate(), timeout=5)
+                except TimeoutError:
+                    process.kill()
+                    await process.communicate()
+            else:
+                if process.returncode == 0:
+                    return True
+            if attempt < REMOTE_PULL_ATTEMPTS:
+                await asyncio.sleep(REMOTE_PULL_RETRY_SECONDS)
+        return False

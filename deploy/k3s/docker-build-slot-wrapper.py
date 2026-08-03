@@ -20,9 +20,19 @@ from pathlib import Path
 
 REAL_DOCKER = os.environ.get("SWEGEN_REAL_DOCKER", "/usr/bin/docker")
 SLOT_DIR = Path(os.environ.get("SWEGEN_BUILD_SLOT_DIR", "/run/swegen-build-slots"))
+GC_LOCK_NAME = os.environ.get("SWEGEN_BUILD_GC_LOCK_NAME", "gc.lock")
 DEFAULT_SLOTS = int(os.environ.get("SWEGEN_BUILD_SLOTS", "32"))
 POLL_SECONDS = float(os.environ.get("SWEGEN_BUILD_SLOT_POLL_SECONDS", "0.25"))
 LOG = os.environ.get("SWEGEN_BUILD_SLOT_LOG", "")
+SLOTS_FULL_EXIT_CODE = 75
+SLOTS_FULL_MARKER = "SWEGEN_BUILD_SLOTS_FULL"
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _log(msg: str) -> None:
@@ -103,24 +113,55 @@ def ensure_slot_files(n: int) -> None:
             path.touch()
 
 
+def try_acquire_slot(n: int) -> tuple[int, int] | None:
+    """Acquire one slot without waiting, returning ``None`` when all are busy."""
+
+    ensure_slot_files(n)
+    for i in range(n):
+        path = SLOT_DIR / str(i)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        return i, fd
+    return None
+
+
+def acquire_gc_guard(*, nonblocking: bool) -> int | None:
+    """Hold a shared guard so BuildKit GC cannot overlap this build."""
+
+    SLOT_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(SLOT_DIR / GC_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    operation = fcntl.LOCK_SH | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        fcntl.flock(fd, operation)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def keep_across_exec(fd: int) -> None:
+    """Clear close-on-exec so an admission lock lives with the Docker child."""
+
+    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+    fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+
+
 def acquire_slot(n: int) -> tuple[int, int]:
     """Block until a slot is held; return (slot_index, fd)."""
 
-    ensure_slot_files(n)
     started = time.monotonic()
     logged_wait = False
     while True:
-        for i in range(n):
-            path = SLOT_DIR / str(i)
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                continue
+        acquired = try_acquire_slot(n)
+        if acquired is not None:
+            slot, fd = acquired
             waited = time.monotonic() - started
-            _log(f"acquired slot={i} waited_s={waited:.3f} n={n}")
-            return i, fd
+            _log(f"acquired slot={slot} waited_s={waited:.3f} n={n}")
+            return slot, fd
         if not logged_wait and time.monotonic() - started > 1.0:
             _log(f"waiting for build slot n={n}")
             logged_wait = True
@@ -133,11 +174,24 @@ def main(argv: list[str]) -> int:
         os.execv(REAL_DOCKER, [REAL_DOCKER, *docker_argv])
 
     n = slot_count()
-    _slot, fd = acquire_slot(n)
-    # Keep fd open across exec so the lock lives for the docker process.
-    # Close-on-exec would drop the lock; clear FD_CLOEXEC.
-    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
-    fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+    nonblocking = _env_bool("SWEGEN_BUILD_SLOT_NONBLOCKING")
+    if nonblocking:
+        acquired = try_acquire_slot(n)
+        if acquired is None:
+            print(f"{SLOTS_FULL_MARKER} slots={n}", file=sys.stderr)
+            return SLOTS_FULL_EXIT_CODE
+        _slot, fd = acquired
+    else:
+        _slot, fd = acquire_slot(n)
+    gc_fd = acquire_gc_guard(nonblocking=nonblocking)
+    if gc_fd is None:
+        os.close(fd)
+        print(f"{SLOTS_FULL_MARKER} buildkit_gc_active=1 slots={n}", file=sys.stderr)
+        return SLOTS_FULL_EXIT_CODE
+
+    # Keep both locks open across exec so they live for the Docker process.
+    keep_across_exec(fd)
+    keep_across_exec(gc_fd)
     os.execv(REAL_DOCKER, [REAL_DOCKER, *docker_argv])
     return 127
 

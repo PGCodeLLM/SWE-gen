@@ -129,6 +129,24 @@ def _require_boolean_callback_result(operation: str, result: object) -> bool:
 class PgmqQueue:
     """Execute PGMQ operations on a caller-owned PostgreSQL connection."""
 
+    def __init__(
+        self,
+        *,
+        validate_start_queue: QueueName = QueueName.VALIDATE_REPAIRED,
+        repair_claim_queue: QueueName = QueueName.REPAIR,
+    ) -> None:
+        # Validate has two independent FIFOs. Alternate the preferred queue
+        # after every successful claim so repaired/retried tasks cannot starve
+        # fresh Generate handoffs. If the preferred queue is empty, claim from
+        # the other queue immediately and keep preferring the missing side on
+        # the next call.
+        if validate_start_queue not in queues_for_stage(PipelineStage.VALIDATE):
+            raise ValueError("validate_start_queue must be a Validate queue")
+        if repair_claim_queue not in {QueueName.REPAIR, QueueName.REPAIR_CANARY}:
+            raise ValueError("repair_claim_queue must be a Repair queue")
+        self._next_validate_queue = validate_start_queue
+        self._repair_claim_queue = repair_claim_queue
+
     def send(
         self,
         connection: ConnectionLike,
@@ -181,26 +199,52 @@ class PgmqQueue:
         max_poll_seconds = _bounded_integer(
             "max_poll_seconds", max_poll_seconds, minimum=0, maximum=MAX_POLL_SECONDS
         )
-        accepted_queues = queues_for_stage(stage)
-        for priority_queue in accepted_queues[:-1]:
+        accepted_queues = (
+            (self._repair_claim_queue,)
+            if stage is PipelineStage.REPAIR
+            else queues_for_stage(stage)
+        )
+        claim_order = accepted_queues
+        if stage is PipelineStage.VALIDATE:
+            fallback_queue = (
+                QueueName.VALIDATE
+                if self._next_validate_queue is QueueName.VALIDATE_REPAIRED
+                else QueueName.VALIDATE_REPAIRED
+            )
+            claim_order = (self._next_validate_queue, fallback_queue)
+
+        for preferred_queue in claim_order[:-1]:
             claims = self._claim_from_queue(
                 connection,
-                priority_queue,
+                preferred_queue,
                 visibility_timeout_seconds=visibility_timeout_seconds,
                 quantity=quantity,
                 max_poll_seconds=0,
                 poll_interval_ms=poll_interval_ms,
             )
             if claims:
+                self._record_validate_claim(stage, claims[0].queue)
                 return claims
 
-        return self._claim_from_queue(
+        claims = self._claim_from_queue(
             connection,
-            accepted_queues[-1],
+            claim_order[-1],
             visibility_timeout_seconds=visibility_timeout_seconds,
             quantity=quantity,
             max_poll_seconds=max_poll_seconds,
             poll_interval_ms=poll_interval_ms,
+        )
+        if claims:
+            self._record_validate_claim(stage, claims[0].queue)
+        return claims
+
+    def _record_validate_claim(self, stage: PipelineStage, claimed_queue: QueueName) -> None:
+        if stage is not PipelineStage.VALIDATE:
+            return
+        self._next_validate_queue = (
+            QueueName.VALIDATE
+            if claimed_queue is QueueName.VALIDATE_REPAIRED
+            else QueueName.VALIDATE_REPAIRED
         )
 
     def _claim_from_queue(
@@ -429,7 +473,14 @@ class PgmqQueue:
     def _decode_claim(self, row: object, queue: QueueName) -> ClaimedMessage:
         message = _decode_payload(_row_value(row, 4, "message"))
         accepted_queues = queues_for_stage(message.stage)
-        if queue is not QueueName.DEAD and queue not in accepted_queues:
+        repair_canary_match = (
+            queue is QueueName.REPAIR_CANARY and message.stage is PipelineStage.REPAIR
+        )
+        if (
+            queue is not QueueName.DEAD
+            and queue not in accepted_queues
+            and not repair_canary_match
+        ):
             raise QueueOperationError(
                 f"Message stage {message.stage.value} does not match queue {queue.value}"
             )
@@ -446,7 +497,11 @@ class PgmqQueue:
     @staticmethod
     def _validate_current_claim(current: ClaimedMessage) -> None:
         accepted_queues = queues_for_stage(current.message.stage)
-        if current.queue not in accepted_queues:
+        repair_canary_match = (
+            current.queue is QueueName.REPAIR_CANARY
+            and current.message.stage is PipelineStage.REPAIR
+        )
+        if current.queue not in accepted_queues and not repair_canary_match:
             raise QueueOperationError(
                 f"Queue {current.queue.value} does not match current stage "
                 f"{current.message.stage.value}"

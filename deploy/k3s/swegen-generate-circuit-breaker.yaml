@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: swegen-generate-circuit-breaker
+  namespace: swegen-pipeline
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: swegen-generate-circuit-breaker
+  namespace: swegen-pipeline
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["swegen-generate"]
+    verbs: ["get", "patch"]
+  # Scaling the Deployment to zero only marks its Pods for deletion; they then
+  # run out Generate's 18000s grace. A crash-looping worker keeps claiming and
+  # failing tasks for that whole window, so the breaker force-deletes them.
+  # resourceNames cannot be used here: Pod names are generated, and list is a
+  # collection verb that ignores them. The label selector in the client keeps
+  # this to the Generate stage.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: swegen-generate-circuit-breaker
+  namespace: swegen-pipeline
+subjects:
+  - kind: ServiceAccount
+    name: swegen-generate-circuit-breaker
+    namespace: swegen-pipeline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: swegen-generate-circuit-breaker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swegen-generate-circuit-breaker
+  namespace: swegen-pipeline
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-generate-circuit-breaker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-generate-circuit-breaker
+    spec:
+      serviceAccountName: swegen-generate-circuit-breaker
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        swegen.pgcode/node-ip: 7.244.3.200
+      containers:
+        - name: controller
+          image: swegen-worker:generate-breaker-20260802-v2
+          imagePullPolicy: Never
+          command: ["python", "-m", "swegen.pipeline.generate_circuit_breaker"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+          env:
+            - name: SWEGEN_BREAKER_STAGE
+              value: generate
+            - name: SWEGEN_BREAKER_DEPLOYMENT_NAME
+              value: swegen-generate
+            - name: SWEGEN_BREAKER_NAMESPACE
+              value: swegen-pipeline
+            - name: SWEGEN_BREAKER_WINDOW_SECONDS
+              value: "300"
+            - name: SWEGEN_BREAKER_MINIMUM_SAMPLES
+              value: "20"
+            - name: SWEGEN_BREAKER_FAILURE_RATE_THRESHOLD
+              value: "0.5"
+            - name: SWEGEN_BREAKER_POLL_SECONDS
+              value: "15"
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

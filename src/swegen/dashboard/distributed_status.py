@@ -33,6 +33,13 @@ REMOTE_BUILDKIT_DEFAULT_URL = "http://7.156.122.134:32083"
 REMOTE_BUILDKIT_MIN_POLL_SECONDS = 30.0
 REMOTE_BUILDKIT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 LOCAL_DISK_IO_POLL_SECONDS = 30.0
+ACTIVITY_STALE_AFTER_SECONDS = 120.0
+TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
+# Display order for pod states; anything kubectl reports outside this list sorts alphabetically.
+POD_PHASE_ORDER = ("Running", "Pending", "Terminating", "Succeeded", "Failed", "Unknown")
+# Phase carrying evicted Pods. Excluded at the kubectl query so their records
+# never reach the collector: they are inert but unbounded in number.
+_EVICTED_POD_PHASE = "Failed"
 
 
 def _optional_nonnegative_float(value: object) -> float | None:
@@ -390,6 +397,28 @@ def _pod_cpu_request_millicores(pod: dict[str, Any]) -> int:
     return max(regular, init_max) + overhead
 
 
+def _pod_phase_sort_key(phase: str) -> tuple[int, str]:
+    order = POD_PHASE_ORDER.index(phase) if phase in POD_PHASE_ORDER else len(POD_PHASE_ORDER)
+    return order, phase
+
+
+def pod_display_phase(pod: dict[str, Any]) -> str:
+    """Report the pod state kubectl prints, including the Terminating pseudo-phase.
+
+    Terminating is not a phase: it is a non-terminal pod carrying a deletion timestamp.
+    Evicted is reported separately because a node under memory pressure accumulates
+    thousands of Failed/Evicted records that would otherwise dominate every count.
+    """
+
+    status = pod.get("status", {})
+    phase = str(status.get("phase") or "Unknown")
+    if phase == "Failed" and status.get("reason") == "Evicted":
+        return "Evicted"
+    if phase not in TERMINAL_POD_PHASES and pod.get("metadata", {}).get("deletionTimestamp"):
+        return "Terminating"
+    return phase
+
+
 def _allocated_cpu_by_node(pod_doc: dict[str, Any]) -> dict[str, int]:
     allocated: Counter[str] = Counter()
     for pod in pod_doc.get("items", []):
@@ -439,7 +468,8 @@ def aggregate_pipeline_snapshot(
     queue_rows: Iterable[dict[str, Any]],
     *,
     now: datetime | None = None,
-    activity_stale_after_seconds: float = 120.0,
+    activity_stale_after_seconds: float = ACTIVITY_STALE_AFTER_SECONDS,
+    activity_count_rows: Iterable[dict[str, Any]] = (),
     time_bucket_rows: Iterable[dict[str, Any]] = (),
     hourly_yield_rows: Iterable[dict[str, Any]] = (),
     lifetime_stage_rows: Iterable[dict[str, Any]] = (),
@@ -649,6 +679,18 @@ def aggregate_pipeline_snapshot(
         stage = row.get("stage")
         if stage in lifetime_processed:
             lifetime_processed[stage] = int(row.get("processed") or 0)
+    activity_counts = {stage: {"fresh": 0, "stale": 0, "total": 0} for stage in STAGES}
+    for row in activity_count_rows:
+        stage = row.get("stage")
+        if stage not in activity_counts:
+            continue
+        fresh = int(row.get("fresh") or 0)
+        stale = int(row.get("stale") or 0)
+        activity_counts[stage] = {
+            "fresh": fresh,
+            "stale": stale,
+            "total": fresh + stale,
+        }
     return {
         "generated_at": now.isoformat(),
         "queues": {
@@ -665,9 +707,13 @@ def aggregate_pipeline_snapshot(
             "windows": throughput,
             "lifetime_processed": lifetime_processed,
         },
+        "activity": {
+            "stale_after_seconds": activity_stale_after_seconds,
+            "stages": activity_counts,
+        },
         "stage_time_series": {
             "bucket_seconds": 900,
-            "lookback_hours": 6,
+            "lookback_hours": 48,
             "stages": stage_time_series,
         },
         "hourly_yield": {
@@ -759,6 +805,26 @@ class PipelineStatusCollector:
                         (self.recent_task_limit,),
                     ).fetchall()
                 )
+                activity_counts = list(
+                    connection.execute(
+                        """
+                        SELECT
+                            stage,
+                            count(*) FILTER (
+                                WHERE heartbeat_at >= now() - (%s * INTERVAL '1 second')
+                            ) AS fresh,
+                            count(*) FILTER (
+                                WHERE heartbeat_at < now() - (%s * INTERVAL '1 second')
+                            ) AS stale
+                        FROM pipeline_stage_activity
+                        GROUP BY stage
+                        """,
+                        (
+                            ACTIVITY_STALE_AFTER_SECONDS,
+                            ACTIVITY_STALE_AFTER_SECONDS,
+                        ),
+                    ).fetchall()
+                )
                 queues = list(connection.execute("SELECT * FROM pgmq.metrics_all()").fetchall())
                 time_buckets = list(
                     connection.execute(
@@ -773,7 +839,7 @@ class PipelineStatusCollector:
                             count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
                             count(*) FILTER (WHERE status <> 'succeeded') AS failed
                         FROM pipeline_stage_results
-                        WHERE finished_at >= now() - INTERVAL '6 hours'
+                        WHERE finished_at >= now() - INTERVAL '48 hours'
                         GROUP BY stage, bucket
                         ORDER BY bucket, stage
                         """
@@ -832,6 +898,7 @@ class PipelineStatusCollector:
             results,
             activity,
             queues,
+            activity_count_rows=activity_counts,
             time_bucket_rows=time_buckets,
             hourly_yield_rows=hourly_yields,
             lifetime_stage_rows=lifetime_stages,
@@ -1072,17 +1139,34 @@ class K3sStatusCollector:
 
     def collect(self) -> dict[str, Any]:
         node_doc = self._get(["get", "nodes"])
-        workload_doc = self._get(
+        # Deployments and Pods are fetched separately so the Pod query can carry
+        # a field selector. Evicted Pods linger as Failed records — a node under
+        # disk pressure accumulates them by the thousand — and including them
+        # grew this response past 140 MB, which blew the timeout above and took
+        # the whole k3s panel down. A combined "deployments,pods" query cannot
+        # be filtered: the selector applies to every type, and Deployments have
+        # no status.phase, so they are silently dropped from the result.
+        deployment_doc = self._get(["-n", self.namespace, "get", "deployments"])
+        pod_doc = self._get(
             [
                 "-n",
                 self.namespace,
                 "get",
-                "deployments,pods",
+                "pods",
+                f"--field-selector=status.phase!={_EVICTED_POD_PHASE}",
             ]
         )
+        workload_doc = {"items": [*deployment_doc.get("items", []), *pod_doc.get("items", [])]}
         allocation_error = None
         try:
-            all_pod_doc = self._get(["get", "pods", "-A"])
+            all_pod_doc = self._get(
+                [
+                    "get",
+                    "pods",
+                    "-A",
+                    f"--field-selector=status.phase!={_EVICTED_POD_PHASE}",
+                ]
+            )
         except Exception as error:
             all_pod_doc = None
             allocation_error = f"{type(error).__name__}: {str(error)[:300]}"
@@ -1090,10 +1174,14 @@ class K3sStatusCollector:
         for item in node_doc.get("items", []):
             conditions = {c["type"]: c for c in item.get("status", {}).get("conditions", [])}
             ready = conditions.get("Ready", {}).get("status") == "True"
+            allocatable_millicores = _cpu_millicores(
+                str(item.get("status", {}).get("allocatable", {}).get("cpu", "0"))
+            )
             nodes.append(
                 {
                     "name": item["metadata"]["name"],
                     "ready": ready,
+                    "build_slot_max": max(1, allocatable_millicores // 1_000),
                     "pressure": [
                         name
                         for name in ("MemoryPressure", "DiskPressure", "PIDPressure")
@@ -1105,10 +1193,8 @@ class K3sStatusCollector:
         stages = {
             stage: {
                 "desired": 0,
-                "ready": 0,
-                "available": 0,
-                "pods": 0,
-                "pods_ready": 0,
+                "pod_phases": {},
+                "evicted": 0,
                 "restarts": 0,
                 "nodes": {},
             }
@@ -1118,6 +1204,27 @@ class K3sStatusCollector:
         slot_probe_pod_by_node: dict[str, str] = {}
         storage_mounts: list[dict[str, Any]] = []
         for item in workload_doc.get("items", []):
+            if item.get("kind") == "Pod":
+                status = item.get("status", {})
+                node = item.get("spec", {}).get("nodeName") or "unscheduled"
+                pod_name = item.get("metadata", {}).get("name", "unknown")
+                has_build_slot_mount = any(
+                    mount.get("mountPath") == "/run/swegen-build-slots"
+                    for container in item.get("spec", {}).get("containers", [])
+                    for mount in container.get("volumeMounts", [])
+                )
+                if (
+                    node != "unscheduled"
+                    and status.get("phase") == "Running"
+                    and pod_name != "unknown"
+                    and has_build_slot_mount
+                ):
+                    is_pruner = (
+                        item.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name")
+                        == "swegen-buildkit-pruner"
+                    )
+                    if node not in slot_probe_pod_by_node or is_pruner:
+                        slot_probe_pod_by_node[node] = pod_name
             stage = item.get("metadata", {}).get("labels", {}).get("swegen.pgcode/stage")
             if item.get("kind") == "Deployment" and stage is None:
                 stage = (
@@ -1130,10 +1237,7 @@ class K3sStatusCollector:
                 continue
             if item.get("kind") == "Deployment":
                 spec = item.get("spec", {})
-                status = item.get("status", {})
                 stages[stage]["desired"] += int(spec.get("replicas") or 0)
-                stages[stage]["ready"] += int(status.get("readyReplicas") or 0)
-                stages[stage]["available"] += int(status.get("availableReplicas") or 0)
                 pod_spec = spec.get("template", {}).get("spec", {})
                 volumes = {volume.get("name"): volume for volume in pod_spec.get("volumes", [])}
                 node_selector = pod_spec.get("nodeSelector", {})
@@ -1173,12 +1277,18 @@ class K3sStatusCollector:
                         )
             elif item.get("kind") == "Pod":
                 status = item.get("status", {})
-                stages[stage]["pods"] += 1
+                phase = pod_display_phase(item)
+                if phase == "Evicted":
+                    # Eviction records survive their node indefinitely and reach five figures;
+                    # they are counted once and kept out of every other pod tally.
+                    stages[stage]["evicted"] += 1
+                    continue
+                phases = stages[stage]["pod_phases"]
+                phases[phase] = phases.get(phase, 0) + 1
                 container_statuses = status.get("containerStatuses", [])
                 pod_ready = status.get("phase") == "Running" and all(
                     entry.get("ready") for entry in container_statuses
                 )
-                stages[stage]["pods_ready"] += int(bool(container_statuses) and pod_ready)
                 stages[stage]["restarts"] += sum(
                     int(entry.get("restartCount") or 0) for entry in container_statuses
                 )
@@ -1186,28 +1296,22 @@ class K3sStatusCollector:
                 stages[stage]["nodes"][node] = stages[stage]["nodes"].get(node, 0) + 1
                 if node != "unscheduled":
                     pod_name = item.get("metadata", {}).get("name", "unknown")
-                    has_build_slot_mount = any(
-                        mount.get("mountPath") == "/run/swegen-build-slots"
-                        for container in item.get("spec", {}).get("containers", [])
-                        for mount in container.get("volumeMounts", [])
-                    )
-                    if (
-                        status.get("phase") == "Running"
-                        and pod_name != "unknown"
-                        and has_build_slot_mount
-                    ):
-                        slot_probe_pod_by_node.setdefault(node, pod_name)
                     pods_by_node.setdefault(node, []).append(
                         {
                             "name": pod_name,
                             "stage": stage,
-                            "phase": status.get("phase", "Unknown"),
+                            "phase": phase,
                             "ready": bool(container_statuses) and pod_ready,
                             "restarts": sum(
                                 int(entry.get("restartCount") or 0) for entry in container_statuses
                             ),
                         }
                     )
+        for stage_view in stages.values():
+            phases = stage_view["pod_phases"]
+            stage_view["pod_phases"] = {
+                phase: phases[phase] for phase in sorted(phases, key=_pod_phase_sort_key)
+            }
         for node in nodes:
             scheduled_pods = sorted(
                 pods_by_node.get(node["name"], []),
@@ -1218,7 +1322,12 @@ class K3sStatusCollector:
             node["pods_by_stage"] = dict(
                 sorted(Counter(pod["stage"] for pod in scheduled_pods).items())
             )
+            node["build_slot_probe_pod"] = slot_probe_pod_by_node.get(node["name"])
         build_slots_by_node = self._collect_build_slot_metrics(slot_probe_pod_by_node)
+        for node in nodes:
+            total = build_slots_by_node.get(node["name"], {}).get("total")
+            if isinstance(total, int):
+                node["build_slot_max"] = max(node["build_slot_max"], total)
         resource_metrics = self._collect_resource_metrics(
             node_doc,
             all_pod_doc=all_pod_doc,
@@ -1477,24 +1586,49 @@ print(json.dumps({'total':n,'used':used,'free':n-used,'waiters':waiters,'waiters
         sampled_at = datetime.now(UTC).isoformat()
         result: dict[str, dict[str, Any]] = {}
         for node, pod in probe_pods.items():
-            completed = self.runner(
-                [
-                    "kubectl",
-                    "--request-timeout=3s",
-                    "-n",
-                    self.namespace,
-                    "exec",
-                    pod,
-                    "--",
-                    "python",
-                    "-c",
-                    probe,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
+            command = [
+                "kubectl",
+                "--request-timeout=8s",
+                "-n",
+                self.namespace,
+                "exec",
+                pod,
+                "--",
+                "python",
+                "-c",
+                probe,
+            ]
+            try:
+                completed = self.runner(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                if isinstance(error, subprocess.TimeoutExpired):
+                    message = "BuildKit slot probe timed out after 10 seconds"
+                else:
+                    message = f"{type(error).__name__}: {str(error)[:240]}"
+                previous = dict(self._last_build_slot_metrics.get(node, {}))
+                if previous:
+                    previous.update(stale=True, error=message)
+                    result[node] = previous
+                else:
+                    result[node] = {
+                        "available": False,
+                        "used": None,
+                        "total": None,
+                        "free": None,
+                        "utilization_percent": None,
+                        "waiters": None,
+                        "waiters_source": None,
+                        "sampled_at": None,
+                        "stale": False,
+                        "error": message,
+                    }
+                continue
             if completed.returncode != 0:
                 previous = dict(self._last_build_slot_metrics.get(node, {}))
                 if previous:

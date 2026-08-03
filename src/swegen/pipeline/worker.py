@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from hashlib import sha256
 from math import isfinite
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -27,7 +28,9 @@ from swegen.queueing.models import (
     ClaimedMessage,
     PipelineStage,
     QueueMessage,
+    QueueName,
     RetryDisposition,
+    queues_for_stage,
 )
 from swegen.queueing.pgmq import (
     MAX_DELIVERIES,
@@ -155,6 +158,18 @@ def _positive_interval(name: str, value: object) -> float:
     return float(value)
 
 
+def _environment_boolean(name: str, *, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _safe_error_text(error: BaseException) -> str:
     """Return a bounded credential-redacted exception summary."""
 
@@ -171,7 +186,15 @@ def _safe_error_text(error: BaseException) -> str:
         lambda match: f"{match.group('prefix')}<REDACTED>",
         summary,
     )
-    return summary[:MAX_WORKER_ERROR_CHARS]
+    if len(summary) <= MAX_WORKER_ERROR_CHARS:
+        return summary
+    # A head slice drops the final exception line, which is the part that
+    # identifies the failure. Keep both ends: the leading type/context and the
+    # actionable tail.
+    separator = " ... "
+    head_chars = min(240, (MAX_WORKER_ERROR_CHARS - len(separator)) // 2)
+    tail_chars = MAX_WORKER_ERROR_CHARS - head_chars - len(separator)
+    return f"{summary[:head_chars]}{separator}{summary[-tail_chars:]}"
 
 
 def _first_identity(*environment_names: str) -> str:
@@ -194,6 +217,13 @@ def _temporary_workspace(*, root: Path, prefix: str):
         yield Path(temporary_directory)
 
 
+# Deliveries are attempts, not retries: 2 means one initial try plus one retry.
+# Most stage failures are deterministic (a task whose Dockerfile cannot build
+# fails identically every time), so a third delivery mostly re-burns build
+# capacity that newly enqueued tasks are waiting for.
+_DEFAULT_MAX_DELIVERIES = 2
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerSettings:
     """Timing, retry, and workspace settings for one stage worker."""
@@ -202,8 +232,10 @@ class WorkerSettings:
     visibility_timeout_seconds: int = 300
     heartbeat_interval_seconds: float = 60
     poll_seconds: int = 10
-    max_deliveries: int = 3
+    max_deliveries: int = _DEFAULT_MAX_DELIVERIES
     max_repair_attempts: int = 3
+    max_reward_repair_attempts: int = 3
+    repair_autoseed: bool = True
     retry_visibility_timeout_seconds: int = 300
     workspace_root: Path = field(default_factory=_default_workspace_root)
 
@@ -228,6 +260,13 @@ class WorkerSettings:
         max_repair_attempts = _bounded_positive_integer(
             "max_repair_attempts", self.max_repair_attempts, MAX_DELIVERIES
         )
+        max_reward_repair_attempts = _bounded_positive_integer(
+            "max_reward_repair_attempts",
+            self.max_reward_repair_attempts,
+            MAX_DELIVERIES,
+        )
+        if not isinstance(self.repair_autoseed, bool):
+            raise ValueError("repair_autoseed must be a boolean")
         retry_visibility = _bounded_positive_integer(
             "retry_visibility_timeout_seconds",
             self.retry_visibility_timeout_seconds,
@@ -248,6 +287,11 @@ class WorkerSettings:
         object.__setattr__(self, "poll_seconds", poll_seconds)
         object.__setattr__(self, "max_deliveries", max_deliveries)
         object.__setattr__(self, "max_repair_attempts", max_repair_attempts)
+        object.__setattr__(
+            self,
+            "max_reward_repair_attempts",
+            max_reward_repair_attempts,
+        )
         object.__setattr__(
             self,
             "retry_visibility_timeout_seconds",
@@ -475,8 +519,10 @@ class PipelineWorker:
         if self.stop_event.is_set():
             return False
 
-        if self.stage is PipelineStage.REPAIR:
+        if self.stage is PipelineStage.REPAIR and self.settings.repair_autoseed:
             self._seed_repair_candidate()
+        elif self.stage is PipelineStage.REWARD_REPAIR:
+            self._seed_reward_repair_candidate()
 
         with self.connection_factory() as connection:
             claims = self.queue.claim(
@@ -509,6 +555,23 @@ class PipelineWorker:
                 message = self.store.reserve_repair_candidate(
                     connection,
                     max_repair_attempts=self.settings.max_repair_attempts,
+                    event_id=self._uuid_factory(),
+                    enqueued_at=enqueued_at,
+                )
+                if message is None:
+                    return False
+                self.queue.send(connection, message)
+        return True
+
+    def _seed_reward_repair_candidate(self) -> bool:
+        """Atomically reserve and enqueue at most one rejected Reward task."""
+
+        enqueued_at = self._now()
+        with self.connection_factory() as connection:
+            with connection.transaction():
+                message = self.store.reserve_reward_repair_candidate(
+                    connection,
+                    max_reward_repair_attempts=(self.settings.max_reward_repair_attempts),
                     event_id=self._uuid_factory(),
                     enqueued_at=enqueued_at,
                 )
@@ -784,11 +847,31 @@ def _load_stage_action(
     return action_for_stage(stage, cancel_event=cancel_event)
 
 
+def _initial_validate_queue(worker_id: str) -> QueueName:
+    """Split worker startup preferences deterministically across both FIFOs."""
+
+    validate_queues = queues_for_stage(PipelineStage.VALIDATE)
+    bucket = sha256(worker_id.encode("utf-8")).digest()[0] % len(validate_queues)
+    return validate_queues[bucket]
+
+
 def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
     from swegen.db import get_pool
 
     pool = get_pool()
     stop_event = Event()
+    worker_id = _first_identity("SWEGEN_WORKER_ID", "POD_NAME", "HOSTNAME").strip()
+    stage_max_deliveries_name = f"SWEGEN_{stage.value.upper()}_MAX_DELIVERIES"
+    max_deliveries = int(
+        os.environ.get(
+            stage_max_deliveries_name,
+            os.environ.get("SWEGEN_MAX_DELIVERIES", str(_DEFAULT_MAX_DELIVERIES)),
+        )
+    )
+    repair_claim_queue = QueueName(
+        os.environ.get("SWEGEN_REPAIR_QUEUE", QueueName.REPAIR.value).strip()
+        or QueueName.REPAIR.value
+    )
 
     def connection_factory():
         return pool.connection(timeout=POOL_ACQUIRE_TIMEOUT_SECONDS)
@@ -796,12 +879,21 @@ def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
     return PipelineWorker(
         stage=stage,
         connection_factory=connection_factory,
-        queue=PgmqQueue(),
+        queue=PgmqQueue(
+            validate_start_queue=_initial_validate_queue(worker_id),
+            repair_claim_queue=repair_claim_queue,
+        ),
         store=TaskStore(),
         action=_load_stage_action(stage, cancel_event=stop_event),
         settings=WorkerSettings(
-            max_repair_attempts=int(os.environ.get("SWEGEN_MAX_REPAIR_ATTEMPTS", "3"))
+            max_deliveries=max_deliveries,
+            max_repair_attempts=int(os.environ.get("SWEGEN_MAX_REPAIR_ATTEMPTS", "3")),
+            max_reward_repair_attempts=int(
+                os.environ.get("SWEGEN_MAX_REWARD_REPAIR_ATTEMPTS", "3")
+            ),
+            repair_autoseed=_environment_boolean("SWEGEN_REPAIR_AUTOSEED", default=True),
         ),
+        worker_id=worker_id,
         stop_event=stop_event,
     )
 

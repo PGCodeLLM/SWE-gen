@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 
 NOW = datetime(2026, 7, 29, 12, 8, tzinfo=UTC)
+
+
+def _only_kinds(document: dict[str, object], kinds: set[str]) -> dict[str, object]:
+    """Return ``document`` narrowed to the requested kinds, as kubectl would."""
+
+    items = [item for item in document.get("items", []) if item.get("kind") in kinds]
+    return {**document, "items": items}
 
 
 def test_aggregate_pipeline_snapshot_builds_queue_task_and_stage_timing() -> None:
@@ -313,6 +320,35 @@ def test_aggregate_pipeline_snapshot_computes_completion_windows_and_stale_activ
     assert reward["stale"] is True
 
 
+def test_aggregate_pipeline_snapshot_separates_fresh_and_stale_global_activity() -> None:
+    from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot(
+        [],
+        [],
+        [],
+        [],
+        now=NOW,
+        activity_stale_after_seconds=90,
+        activity_count_rows=[
+            {"stage": "validate", "fresh": 144, "stale": 21},
+            {"stage": "repair", "fresh": 143, "stale": 182},
+            {"stage": "reward_repair", "fresh": 5, "stale": 0},
+        ],
+    )
+
+    assert snapshot["activity"] == {
+        "stale_after_seconds": 90,
+        "stages": {
+            "generate": {"fresh": 0, "stale": 0, "total": 0},
+            "validate": {"fresh": 144, "stale": 21, "total": 165},
+            "repair": {"fresh": 143, "stale": 182, "total": 325},
+            "reward": {"fresh": 0, "stale": 0, "total": 0},
+            "push": {"fresh": 0, "stale": 0, "total": 0},
+        },
+    }
+
+
 def test_aggregate_pipeline_snapshot_clamps_invalid_negative_durations() -> None:
     from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
 
@@ -394,6 +430,7 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
     )
 
     assert snapshot["stage_time_series"]["bucket_seconds"] == 900
+    assert snapshot["stage_time_series"]["lookback_hours"] == 48
     assert snapshot["stage_time_series"]["stages"]["validate"] == [
         {
             "bucket": (NOW - timedelta(minutes=15)).isoformat(),
@@ -628,14 +665,143 @@ def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:
     }
 
     def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
-        document = nodes if "nodes" in command else workloads
+        # The collector queries deployments and pods separately so the pod
+        # query can carry a field selector; mirror that split here.
+        if "nodes" in command:
+            document = nodes
+        elif "deployments" in command:
+            document = _only_kinds(workloads, {"Deployment"})
+        else:
+            document = _only_kinds(workloads, {"Pod"})
         return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
 
     stage = K3sStatusCollector(runner=runner).collect()["stages"]["generate"]
 
     assert stage["desired"] == 96
-    assert stage["ready"] == 96
-    assert stage["available"] == 96
+    assert "ready" not in stage
+    assert "available" not in stage
+    assert "pods_ready" not in stage
+    assert stage["pod_phases"] == {}
+
+
+def _pod(name: str, stage: str, status: dict[str, object], **metadata: object) -> dict[str, object]:
+    return {
+        "kind": "Pod",
+        "metadata": {"name": name, "labels": {"swegen.pgcode/stage": stage}, **metadata},
+        "spec": {"nodeName": "node-a", "containers": [{}]},
+        "status": {"containerStatuses": [{"ready": True, "restartCount": 0}], **status},
+    }
+
+
+def test_k3s_collector_counts_real_pod_phases_instead_of_a_ready_fraction() -> None:
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    nodes = {"items": [{"metadata": {"name": "node-a"}, "status": {"allocatable": {"cpu": "8"}}}]}
+    workloads = {
+        "items": [
+            {
+                "kind": "Deployment",
+                "metadata": {"name": "swegen-validate"},
+                "spec": {
+                    "replicas": 128,
+                    "selector": {"matchLabels": {"swegen.pgcode/stage": "validate"}},
+                },
+                "status": {"readyReplicas": 122, "availableReplicas": 122},
+            },
+            _pod("validate-running", "validate", {"phase": "Running"}),
+            _pod("validate-pending", "validate", {"phase": "Pending"}),
+            _pod("validate-succeeded", "validate", {"phase": "Succeeded"}),
+            # Terminating is not a phase: a Running pod carrying a deletion timestamp.
+            _pod(
+                "validate-terminating",
+                "validate",
+                {"phase": "Running"},
+                deletionTimestamp="2026-08-01T00:00:00Z",
+            ),
+            # A deletion timestamp on an already terminal pod must not read as Terminating.
+            _pod(
+                "validate-deleted-succeeded",
+                "validate",
+                {"phase": "Succeeded"},
+                deletionTimestamp="2026-08-01T00:00:00Z",
+            ),
+            *(
+                _pod(
+                    f"validate-evicted-{index}",
+                    "validate",
+                    {"phase": "Failed", "reason": "Evicted", "containerStatuses": []},
+                )
+                for index in range(2_000)
+            ),
+        ]
+    }
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "top" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="metrics unavailable")
+        # The collector queries deployments and pods separately so the pod
+        # query can carry a field selector; mirror that split here.
+        if "nodes" in command:
+            document = nodes
+        elif "deployments" in command:
+            document = _only_kinds(workloads, {"Deployment"})
+        else:
+            document = _only_kinds(workloads, {"Pod"})
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    snapshot = K3sStatusCollector(runner=runner).collect()
+    stage = snapshot["stages"]["validate"]
+
+    assert stage["desired"] == 128
+    assert stage["pod_phases"] == {
+        "Running": 1,
+        "Pending": 1,
+        "Terminating": 1,
+        "Succeeded": 2,
+    }
+    assert list(stage["pod_phases"]) == ["Running", "Pending", "Terminating", "Succeeded"]
+    assert stage["evicted"] == 2_000
+    # Eviction records stay out of the node pod list and the per-stage node histogram.
+    assert stage["nodes"] == {"node-a": 5}
+    assert [pod["name"] for pod in snapshot["nodes"][0]["pods"]] == [
+        "validate-deleted-succeeded",
+        "validate-pending",
+        "validate-running",
+        "validate-succeeded",
+        "validate-terminating",
+    ]
+    assert snapshot["nodes"][0]["pod_count"] == 5
+    terminating = next(
+        pod for pod in snapshot["nodes"][0]["pods"] if pod["name"] == "validate-terminating"
+    )
+    assert terminating["phase"] == "Terminating"
+
+
+def test_pod_display_phase_separates_terminating_and_evicted_from_phases() -> None:
+    from swegen.dashboard.distributed_status import pod_display_phase
+
+    assert pod_display_phase({"status": {"phase": "Running"}}) == "Running"
+    assert pod_display_phase({"status": {}}) == "Unknown"
+    assert (
+        pod_display_phase(
+            {
+                "metadata": {"deletionTimestamp": "2026-08-01T00:00:00Z"},
+                "status": {"phase": "Pending"},
+            }
+        )
+        == "Terminating"
+    )
+    assert pod_display_phase({"status": {"phase": "Failed", "reason": "Evicted"}}) == "Evicted"
+    assert pod_display_phase({"status": {"phase": "Failed", "reason": "OOMKilled"}}) == "Failed"
+    assert (
+        pod_display_phase(
+            {
+                "metadata": {"deletionTimestamp": "2026-08-01T00:00:00Z"},
+                "status": {"phase": "Failed"},
+            }
+        )
+        == "Failed"
+    )
 
 
 def test_k3s_collector_reads_authoritative_local_build_slots() -> None:
@@ -678,7 +844,7 @@ def test_k3s_collector_reads_authoritative_local_build_slots() -> None:
     }
     assert calls[0][:7] == [
         "kubectl",
-        "--request-timeout=3s",
+        "--request-timeout=8s",
         "-n",
         "swegen-pipeline",
         "exec",
@@ -712,6 +878,30 @@ def test_k3s_collector_does_not_render_failed_slot_probe_as_zero() -> None:
     }
 
 
+def test_k3s_collector_contains_slot_probe_timeout_to_the_node() -> None:
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        raise TimeoutExpired(command, 10)
+
+    metrics = K3sStatusCollector(runner=runner)._collect_build_slot_metrics(
+        {"node-a": "swegen-buildkit-pruner-a"}
+    )
+
+    assert metrics["node-a"] == {
+        "available": False,
+        "used": None,
+        "total": None,
+        "free": None,
+        "utilization_percent": None,
+        "waiters": None,
+        "waiters_source": None,
+        "sampled_at": None,
+        "stale": False,
+        "error": "BuildKit slot probe timed out after 10 seconds",
+    }
+
+
 def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> None:
     from swegen.dashboard.distributed_status import K3sStatusCollector
 
@@ -735,6 +925,30 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
     }
     workloads = {
         "items": [
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "swegen-buildkit-pruner-node-a",
+                    "labels": {"app.kubernetes.io/name": "swegen-buildkit-pruner"},
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [
+                        {
+                            "volumeMounts": [
+                                {
+                                    "name": "build-slots",
+                                    "mountPath": "/run/swegen-build-slots",
+                                }
+                            ]
+                        }
+                    ],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True, "restartCount": 0}],
+                },
+            },
             {
                 "kind": "Pod",
                 "metadata": {
@@ -821,7 +1035,14 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
                 stdout="node-a 1000m 25% 2Gi 25%\nnode-b 2000m 25% 4096Mi 25%\n",
                 stderr="",
             )
-        document = nodes if "nodes" in command else workloads
+        # The collector queries deployments and pods separately so the pod
+        # query can carry a field selector; mirror that split here.
+        if "nodes" in command:
+            document = nodes
+        elif "deployments" in command:
+            document = _only_kinds(workloads, {"Deployment"})
+        else:
+            document = _only_kinds(workloads, {"Pod"})
         return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
 
     collector = K3sStatusCollector(runner=runner)
@@ -843,8 +1064,10 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
     assert metrics["nodes"][0]["build_slots"]["total"] == 48
     assert metrics["nodes"][0]["build_slots"]["waiters"] is None
     assert metrics["nodes"][1]["build_slots"]["available"] is False
-    assert exec_calls[0][5] == "reward-a"
+    assert exec_calls[0][5] == "swegen-buildkit-pruner-node-a"
     assert first_snapshot["nodes"][0]["pod_count"] == 2
+    assert first_snapshot["nodes"][0]["build_slot_probe_pod"] == ("swegen-buildkit-pruner-node-a")
+    assert first_snapshot["nodes"][0]["build_slot_max"] == 48
     assert first_snapshot["nodes"][0]["pods_by_stage"] == {
         "generate": 1,
         "reward": 1,
@@ -870,3 +1093,56 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
     assert stale["stale"] is True
     assert "metrics unavailable" in stale["error"]
     assert stale["aggregate"] == metrics["aggregate"]
+
+
+def test_k3s_collector_excludes_evicted_pods_and_keeps_deployments() -> None:
+    """Evicted records must never reach the collector, and Deployments must survive.
+
+    A node under disk pressure accumulates Failed/Evicted Pods by the thousand,
+    which grew the old combined query past 140 MB and tripped its own timeout.
+    The selector cannot be applied to a combined ``deployments,pods`` query:
+    Deployments have no ``status.phase``, so kubectl silently drops them.
+    """
+
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    commands: list[list[str]] = []
+    nodes = {"items": []}
+    workloads = {
+        "items": [
+            {
+                "kind": "Deployment",
+                "metadata": {"name": "swegen-validate", "labels": {}},
+                "spec": {"replicas": 4},
+                "status": {},
+            },
+            {
+                "kind": "Pod",
+                "metadata": {"name": "swegen-validate-a", "labels": {}},
+                "status": {"phase": "Running"},
+            },
+        ]
+    }
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        commands.append(command)
+        if "top" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="metrics unavailable")
+        if "nodes" in command:
+            document = nodes
+        elif "deployments" in command:
+            document = _only_kinds(workloads, {"Deployment"})
+        else:
+            document = _only_kinds(workloads, {"Pod"})
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    K3sStatusCollector(runner=runner).collect()
+
+    pod_queries = [c for c in commands if "pods" in c and "top" not in c]
+    assert pod_queries, "collector never queried pods"
+    for command in pod_queries:
+        assert "--field-selector=status.phase!=Failed" in command
+    # Deployments are fetched on their own so the selector cannot drop them.
+    deployment_queries = [c for c in commands if "deployments" in c]
+    assert len(deployment_queries) == 1
+    assert not any("--field-selector" in argument for argument in deployment_queries[0])

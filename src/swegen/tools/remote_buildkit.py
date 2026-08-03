@@ -9,6 +9,7 @@ import os
 import stat
 import tarfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -25,7 +26,16 @@ _TERMINAL_FAILURE_STATUSES = {
 }
 _TERMINAL_STATUSES = {*_TERMINAL_FAILURE_STATUSES, "success"}
 _ACTIVE_STATUSES = {"queued", "running"}
-_ROUTER_MODES = {"hybrid", "local", "remote"}
+# Written by the sweep for rows whose submitting worker died before it could
+# record a terminal status. Deliberately outside _TERMINAL_STATUSES: the client
+# never produces it, so only the sweep can.
+ORPHANED_STATUS = "orphaned"
+_NON_TERMINAL_STATUSES = ("submitting", "queued", "running")
+DEFAULT_ORPHAN_MIN_AGE_SECONDS = 3600.0
+_ERROR_MESSAGE_LIMIT = 4000
+_ERROR_TRUNCATION_MARKER = "[truncated; showing final characters]\n"
+_ERROR_MESSAGE_BODY_LIMIT = _ERROR_MESSAGE_LIMIT - len(_ERROR_TRUNCATION_MARKER)
+_ROUTER_MODES = {"hybrid", "local", "local_overflow", "remote"}
 _PROXY_BUILD_ARG_NAMES = (
     "http_proxy",
     "https_proxy",
@@ -34,6 +44,7 @@ _PROXY_BUILD_ARG_NAMES = (
     "no_proxy",
     "NO_PROXY",
 )
+_REPO_BACKEND_MAP_ENV = "SWEGEN_REMOTE_BUILDKIT_REPO_BACKEND_MAP"
 
 
 class RemoteBuildkitError(RuntimeError):
@@ -154,6 +165,67 @@ class DatabaseBuildTracker:
             return
 
 
+# RETURNING reports post-UPDATE values, so the pre-UPDATE status is captured in
+# a CTE first. That also pins the target rows before the UPDATE runs.
+_SWEEP_SQL = f"""
+    WITH orphaned AS (
+        SELECT request_id, worker_id, status
+        FROM pipeline_remote_builds
+        WHERE route = 'remote'
+          AND status IN {_NON_TERMINAL_STATUSES}
+          AND updated_at < now() - make_interval(secs => %s)
+          AND NOT (worker_id = ANY(%s))
+        FOR UPDATE
+    )
+    UPDATE pipeline_remote_builds AS target
+    SET status = '{ORPHANED_STATUS}',
+        updated_at = now(),
+        finished_at = now(),
+        error = %s
+    FROM orphaned
+    WHERE target.request_id = orphaned.request_id
+    RETURNING target.request_id, target.worker_id, orphaned.status AS status
+"""
+
+
+def sweep_orphaned_builds(
+    connection: Any,
+    live_worker_ids: Iterable[str],
+    *,
+    min_age_seconds: float = DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+) -> list[dict[str, Any]]:
+    """Mark non-terminal builds whose submitting worker is gone as orphaned.
+
+    ``DatabaseBuildTracker.update`` only runs inside the worker that submitted
+    the build, so a worker killed mid-build (rollout, eviction, OOM) leaves its
+    row pinned at ``running`` forever. Those rows then inflate the dashboard's
+    pending count even though the farm has long since discarded the build.
+
+    ``live_worker_ids`` must be the *complete* set of currently existing worker
+    Pods. Passing a partial set would orphan rows that are still progressing, so
+    callers that cannot enumerate Pods reliably should skip the sweep entirely
+    rather than pass what they have. Rows with a NULL ``worker_id`` are never
+    swept because they cannot be proven dead.
+
+    ``min_age_seconds`` guards the window between a worker's first row insert
+    and the Pod becoming visible in the API server listing.
+    """
+
+    if min_age_seconds < 0:
+        raise ValueError("min_age_seconds must not be negative")
+    live = sorted({worker_id for worker_id in live_worker_ids if worker_id})
+    if not live:
+        # An empty set is far more likely to be a failed Pod listing than a
+        # genuinely empty cluster, and it would sweep every pending row.
+        raise ValueError("live_worker_ids is empty; refusing to sweep every pending build")
+    reason = (
+        "submitting worker disappeared before recording a terminal status; "
+        "swept by sweep_orphaned_builds"
+    )
+    rows = connection.execute(_SWEEP_SQL, (float(min_age_seconds), live, reason)).fetchall()
+    return [dict(row) for row in rows]
+
+
 @dataclass(frozen=True)
 class RemoteBuildkitConfig:
     mode: str
@@ -176,12 +248,15 @@ class RemoteBuildkitConfig:
     poll_interval_seconds: float = 5
     pull_timeout_seconds: float = 900
     fallback_local: bool = True
+    repo_backend_pools: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @classmethod
     def from_env(cls) -> RemoteBuildkitConfig | None:
         mode = os.environ.get("SWEGEN_BUILD_ROUTER_MODE", "local").strip().lower()
         if mode not in _ROUTER_MODES:
-            raise ValueError("SWEGEN_BUILD_ROUTER_MODE must be one of hybrid, local, or remote")
+            raise ValueError(
+                "SWEGEN_BUILD_ROUTER_MODE must be one of hybrid, local, local_overflow, or remote"
+            )
         if mode == "local":
             return None
 
@@ -189,9 +264,7 @@ class RemoteBuildkitConfig:
         registry_url = os.environ.get("SWEGEN_REMOTE_BUILDKIT_REGISTRY", "").strip()
         repository = os.environ.get("SWEGEN_REMOTE_BUILDKIT_REPOSITORY", "").strip()
         callback_url = os.environ.get("SWEGEN_REMOTE_BUILDKIT_CALLBACK_URL", "").strip()
-        pull_registry_url = os.environ.get(
-            "SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL", ""
-        ).strip()
+        pull_registry_url = os.environ.get("SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL", "").strip()
         registry_username = os.environ.get("SWEGEN_REMOTE_BUILDKIT_REGISTRY_USERNAME", "").strip()
         registry_password = os.environ.get("SWEGEN_REMOTE_BUILDKIT_REGISTRY_PASSWORD", "")
         pull_username = os.environ.get("SWEGEN_REMOTE_BUILDKIT_PULL_USERNAME", "").strip()
@@ -203,9 +276,7 @@ class RemoteBuildkitConfig:
             "SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY", ""
         ).strip()
         build_args = {
-            name: value
-            for name in _PROXY_BUILD_ARG_NAMES
-            if (value := os.environ.get(name, ""))
+            name: value for name in _PROXY_BUILD_ARG_NAMES if (value := os.environ.get(name, ""))
         }
         if not raw_url or not registry_url or not repository or not callback_url:
             raise ValueError(
@@ -256,6 +327,7 @@ class RemoteBuildkitConfig:
                 os.environ.get("SWEGEN_REMOTE_BUILDKIT_PULL_TIMEOUT_SECONDS", "900")
             ),
             fallback_local=_env_bool("SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL", default=True),
+            repo_backend_pools=_parse_repo_backend_pools(os.environ.get(_REPO_BACKEND_MAP_ENV, "")),
         )
 
     @property
@@ -273,6 +345,24 @@ class RemoteBuildkitConfig:
         if self.base_image_registry_source is None or self.base_image_registry_mirror is None:
             return ()
         return ((self.base_image_registry_source, self.base_image_registry_mirror),)
+
+    def preferred_backend_name(
+        self,
+        *,
+        environment_name: str,
+        context_digest: str,
+    ) -> str | None:
+        """Return a stable backend from a configured repository pool."""
+
+        repo = _repo_from_environment_name(environment_name)
+        if repo is None:
+            return None
+        for configured_repo, backend_pool in self.repo_backend_pools:
+            if configured_repo != repo:
+                continue
+            bucket = int(context_digest[:16], 16) % len(backend_pool)
+            return backend_pool[bucket]
+        return None
 
 
 @dataclass(frozen=True)
@@ -324,6 +414,52 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean value")
+
+
+def _parse_repo_backend_pools(
+    raw_value: str,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if not raw_value.strip():
+        return ()
+    try:
+        value = json.loads(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{_REPO_BACKEND_MAP_ENV} must be valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{_REPO_BACKEND_MAP_ENV} must be a JSON object")
+
+    parsed: list[tuple[str, tuple[str, ...]]] = []
+    for raw_repo, raw_backends in value.items():
+        if (
+            not isinstance(raw_repo, str)
+            or len(raw_repo.split("/")) != 2
+            or any(not part.strip() for part in raw_repo.split("/"))
+        ):
+            raise ValueError(f"{_REPO_BACKEND_MAP_ENV} keys must use the OWNER/REPO form")
+        candidates = [raw_backends] if isinstance(raw_backends, str) else raw_backends
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(
+                f"{_REPO_BACKEND_MAP_ENV} values must be a backend name or non-empty list"
+            )
+        backend_pool: list[str] = []
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.strip():
+                raise ValueError(f"{_REPO_BACKEND_MAP_ENV} backend names must be non-empty strings")
+            normalized = candidate.strip()
+            if normalized not in backend_pool:
+                backend_pool.append(normalized)
+        parsed.append((raw_repo.strip(), tuple(backend_pool)))
+    return tuple(sorted(parsed))
+
+
+def _repo_from_environment_name(environment_name: str) -> str | None:
+    task_prefix, separator, pr = environment_name.rpartition("-")
+    if not separator or not pr.isdigit() or "__" not in task_prefix:
+        return None
+    owner, repo = task_prefix.split("__", 1)
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}"
 
 
 def _validate_credential_pair(label: str, username: str, password: str) -> None:
@@ -433,7 +569,7 @@ def _transformed_file_bytes(
 
 
 def select_build_route(config: RemoteBuildkitConfig, digest: str) -> str:
-    if config.mode in {"local", "remote"}:
+    if config.mode in {"local", "local_overflow", "remote"}:
         return config.mode
     bucket = int(digest[:8], 16) % 100
     return "remote" if bucket < config.remote_percent else "local"
@@ -496,6 +632,14 @@ class RemoteBuildkitClient:
             "dockerfile_path": "environment/Dockerfile",
             "platform": "linux/amd64",
         }
+        preferred_backend_name = self.config.preferred_backend_name(
+            environment_name=environment_name,
+            context_digest=context_digest,
+        )
+        if preferred_backend_name is not None:
+            request_data["preferred_backend_name"] = preferred_backend_name
+            request_data["preferred_backend_required"] = False
+            request_data["callback_parameters"]["preferred_backend_name"] = preferred_backend_name
         optional_credentials = {
             "pull_registry_url": self.config.pull_registry_url,
             "registry_username": self.config.registry_username,
@@ -642,11 +786,20 @@ def _error_message(payload: dict[str, Any]) -> str | None:
     for key in ("error_message", "error", "detail", "message"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()[:4000]
+            text = value.strip()
+            if len(text) <= _ERROR_MESSAGE_LIMIT:
+                return text
+            # The farm returns whole build logs here. Keep the tail: the failing
+            # command and its diagnostics are last, while a head slice preserves
+            # only the base-image pull and apt progress noise common to every
+            # build, which is what makes stored failures unclassifiable.
+            return f"{_ERROR_TRUNCATION_MARKER}{text[-_ERROR_MESSAGE_BODY_LIMIT:]}"
     return None
 
 
 __all__ = [
+    "DEFAULT_ORPHAN_MIN_AGE_SECONDS",
+    "ORPHANED_STATUS",
     "BuildTracker",
     "DatabaseBuildTracker",
     "RemoteBuildResult",
@@ -657,4 +810,5 @@ __all__ = [
     "create_context_archive",
     "find_successful_remote_image",
     "select_build_route",
+    "sweep_orphaned_builds",
 ]

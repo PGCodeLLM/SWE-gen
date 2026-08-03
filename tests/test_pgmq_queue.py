@@ -188,25 +188,29 @@ def test_pipeline_stages_map_to_fixed_queues_in_order() -> None:
     assert queue_for_stage(PipelineStage.VALIDATE) is QueueName.VALIDATE
     assert queue_for_stage(PipelineStage.REPAIR) is QueueName.REPAIR
     assert queue_for_stage(PipelineStage.REWARD) is QueueName.REWARD
+    assert queue_for_stage(PipelineStage.REWARD_REPAIR) is QueueName.REWARD_REPAIR
     assert queue_for_stage(PipelineStage.PUSH) is QueueName.PUSH
     assert queues_for_stage(PipelineStage.VALIDATE) == (
         QueueName.VALIDATE_REPAIRED,
         QueueName.VALIDATE,
     )
     assert queues_for_stage(PipelineStage.REPAIR) == (QueueName.REPAIR,)
+    assert queues_for_stage(PipelineStage.REWARD_REPAIR) == (QueueName.REWARD_REPAIR,)
     assert (
         queue_for_handoff(PipelineStage.REPAIR, PipelineStage.VALIDATE)
         is QueueName.VALIDATE_REPAIRED
     )
+    assert queue_for_handoff(PipelineStage.GENERATE, PipelineStage.VALIDATE) is QueueName.VALIDATE
     assert (
-        queue_for_handoff(PipelineStage.GENERATE, PipelineStage.VALIDATE)
-        is QueueName.VALIDATE
+        queue_for_handoff(PipelineStage.REWARD_REPAIR, PipelineStage.VALIDATE)
+        is QueueName.VALIDATE_REPAIRED
     )
 
     assert PipelineStage.GENERATE.next_stage is PipelineStage.VALIDATE
     assert PipelineStage.VALIDATE.next_stage is PipelineStage.REWARD
     assert PipelineStage.REPAIR.next_stage is PipelineStage.VALIDATE
     assert PipelineStage.REWARD.next_stage is PipelineStage.PUSH
+    assert PipelineStage.REWARD_REPAIR.next_stage is PipelineStage.VALIDATE
     assert PipelineStage.PUSH.next_stage is None
 
 
@@ -216,7 +220,9 @@ def test_all_pgmq_queue_names_fit_the_extension_limit() -> None:
         "swegen_validate",
         "swegen_validate_repaired",
         "swegen_repair",
+        "swegen_repair_canary",
         "swegen_reward",
+        "swegen_reward_repair",
         "swegen_push",
         "swegen_dead",
     }
@@ -247,18 +253,63 @@ def test_send_rejects_a_negative_delay_before_executing_sql() -> None:
     assert connection.calls == []
 
 
-def test_validate_claim_checks_repaired_queue_first() -> None:
+def test_validate_claim_can_start_with_fresh_queue() -> None:
     message = queue_message(stage=PipelineStage.VALIDATE)
     connection = RecordingConnection([pgmq_row(message)])
 
-    claims = PgmqQueue().claim(
+    claims = PgmqQueue(validate_start_queue=QueueName.VALIDATE).claim(
+        connection,
+        PipelineStage.VALIDATE,
+        visibility_timeout_seconds=300,
+    )
+
+    assert claims[0].queue is QueueName.VALIDATE
+    assert connection.calls[0][1][0] == "swegen_validate"
+
+
+def test_validate_start_queue_rejects_unrelated_queue() -> None:
+    with pytest.raises(ValueError, match="Validate queue"):
+        PgmqQueue(validate_start_queue=QueueName.REPAIR)
+
+
+def test_repair_claim_queue_rejects_unrelated_queue() -> None:
+    with pytest.raises(ValueError, match="Repair queue"):
+        PgmqQueue(repair_claim_queue=QueueName.REWARD)
+
+
+def test_repair_claim_can_use_isolated_canary_queue() -> None:
+    message = queue_message(stage=PipelineStage.REPAIR)
+    connection = RecordingConnection([pgmq_row(message)])
+
+    claims = PgmqQueue(repair_claim_queue=QueueName.REPAIR_CANARY).claim(
+        connection,
+        PipelineStage.REPAIR,
+        visibility_timeout_seconds=300,
+    )
+
+    assert claims[0].queue is QueueName.REPAIR_CANARY
+    assert connection.calls[0][1][0] == "swegen_repair_canary"
+
+
+def test_validate_claim_alternates_repaired_and_fresh_queues() -> None:
+    message = queue_message(stage=PipelineStage.VALIDATE)
+    connection = RecordingConnection([pgmq_row(message)], [pgmq_row(message)])
+    queue = PgmqQueue()
+
+    repaired_claims = queue.claim(
+        connection,
+        PipelineStage.VALIDATE,
+        visibility_timeout_seconds=300,
+        quantity=1,
+    )
+    fresh_claims = queue.claim(
         connection,
         PipelineStage.VALIDATE,
         visibility_timeout_seconds=300,
         quantity=1,
     )
 
-    assert claims == [
+    assert repaired_claims == [
         ClaimedMessage(
             queue=QueueName.VALIDATE_REPAIRED,
             msg_id=71,
@@ -268,11 +319,52 @@ def test_validate_claim_checks_repaired_queue_first() -> None:
             message=message,
         )
     ]
+    assert fresh_claims[0].queue is QueueName.VALIDATE
     assert connection.calls == [
         (
             "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read(%s, %s, %s)",
             ("swegen_validate_repaired", 300, 1),
-        )
+        ),
+        (
+            "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read(%s, %s, %s)",
+            ("swegen_validate", 300, 1),
+        ),
+    ]
+
+
+def test_validate_claim_keeps_missing_side_preferred_after_fallback() -> None:
+    message = queue_message(stage=PipelineStage.VALIDATE)
+    connection = RecordingConnection(
+        [pgmq_row(message)],
+        [],
+        [pgmq_row(message)],
+        [pgmq_row(message)],
+    )
+    queue = PgmqQueue()
+
+    queue.claim(
+        connection,
+        PipelineStage.VALIDATE,
+        visibility_timeout_seconds=300,
+    )
+    fallback_claims = queue.claim(
+        connection,
+        PipelineStage.VALIDATE,
+        visibility_timeout_seconds=300,
+    )
+    fresh_claims = queue.claim(
+        connection,
+        PipelineStage.VALIDATE,
+        visibility_timeout_seconds=300,
+    )
+
+    assert fallback_claims[0].queue is QueueName.VALIDATE_REPAIRED
+    assert fresh_claims[0].queue is QueueName.VALIDATE
+    assert [params[0] for _query, params in connection.calls] == [
+        "swegen_validate_repaired",
+        "swegen_validate",
+        "swegen_validate_repaired",
+        "swegen_validate",
     ]
 
 
@@ -740,6 +832,26 @@ def test_retry_before_the_delivery_limit_only_changes_visibility() -> None:
     ]
 
 
+def test_repair_canary_claim_can_retry_in_its_isolated_queue() -> None:
+    current = claimed_message(
+        PipelineStage.REPAIR,
+        queue=QueueName.REPAIR_CANARY,
+        read_count=1,
+    )
+    retry_visible_at = datetime(2026, 7, 28, 12, 6, tzinfo=UTC)
+    connection = RecordingConnection([pgmq_row(current.message, vt=retry_visible_at)])
+
+    disposition = PgmqQueue(repair_claim_queue=QueueName.REPAIR_CANARY).retry_or_dead_letter(
+        connection,
+        current,
+        max_deliveries=2,
+        retry_visibility_timeout_seconds=60,
+    )
+
+    assert disposition is RetryDisposition.RETRY
+    assert connection.calls[0][1][0] == "swegen_repair_canary"
+
+
 def test_delivery_limit_dead_letters_and_archives_in_one_transaction() -> None:
     current = claimed_message(PipelineStage.REWARD, read_count=3)
     connection = RecordingConnection([(901,)], [(True,)])
@@ -884,7 +996,7 @@ def test_bootstrap_sql_accepts_supported_extension_or_complete_sql_only_api() ->
     assert "QUEUE_VISIBLE_LENGTH" in normalized_sql
     assert "SQL-ONLY" in normalized_sql
 
-    assert normalized_sql.count("SELECT PGMQ.CREATE(") == 7
+    assert normalized_sql.count("SELECT PGMQ.CREATE(") == len(QueueName)
     for queue in QueueName:
         assert f"'{queue.value}'" in sql
 

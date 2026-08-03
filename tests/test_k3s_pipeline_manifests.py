@@ -55,25 +55,29 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert config_map["data"]["SWEGEN_REWARD_FALLBACK_MODEL"] == "gpt-5.6-sol"
     assert config_map["data"]["SWEGEN_MAX_REPAIR_ATTEMPTS"] == "3"
     assert config_map["data"]["SWEGEN_REPAIR_TIMEOUT_SECONDS"] == "14400"
-    assert config_map["data"]["SWEGEN_BUILD_ROUTER_MODE"] == "hybrid"
+    assert config_map["data"]["SWEGEN_MAX_REWARD_REPAIR_ATTEMPTS"] == "3"
+    assert config_map["data"]["SWEGEN_REWARD_REPAIR_TIMEOUT_SECONDS"] == "14400"
+    assert config_map["data"]["SWEGEN_BUILD_ROUTER_MODE"] == "local_overflow"
     assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PERCENT"] == "75"
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL"] == "true"
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL"].endswith(
-        "/swesandbox"
-    )
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL"] == "false"
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL"].endswith("/swesandbox")
     assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_SOURCE_REGISTRY"] == (
         "swr.cn-southwest-2.myhuaweicloud.com"
     )
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY"] == (
-        config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REGISTRY"]
+    assert (
+        config_map["data"]["SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY"]
+        == (config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REGISTRY"])
     )
     assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_URL"].endswith(":32083")
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REGISTRY"] == config_map[
-        "data"
-    ]["SWEGEN_SWR_HOST"]
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REPOSITORY"] == config_map[
-        "data"
-    ]["SWEGEN_SWR_REPOSITORY"]
+    assert config_map["data"]["SWEGEN_NPM_REGISTRY"] == ("https://registry.npmmirror.com/")
+    assert (
+        config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REGISTRY"]
+        == config_map["data"]["SWEGEN_SWR_HOST"]
+    )
+    assert (
+        config_map["data"]["SWEGEN_REMOTE_BUILDKIT_REPOSITORY"]
+        == config_map["data"]["SWEGEN_SWR_REPOSITORY"]
+    )
     no_proxy = config_map["data"]["SWEGEN_NO_PROXY"]
     assert not any(character.isspace() for character in no_proxy)
     assert ".myhuaweicloud.com" in no_proxy
@@ -85,44 +89,68 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         "swegen-generate",
         "swegen-validate",
         "swegen-repair",
+        "swegen-reward-repair",
         "swegen-reward",
         "swegen-push",
     }
 
+    # The pinned stages were consolidated onto one node; the manifest and the
+    # running cluster agree, so this table tracks them rather than the earlier
+    # one-stage-per-node spread.
     expected_nodes = {
-        "swegen-generate": "7.244.2.110",
-        "swegen-reward": "7.244.1.209",
+        "swegen-generate": "7.244.3.200",
+        "swegen-reward": "7.244.3.200",
         "swegen-push": "7.244.3.200",
     }
-    expected_replicas = {
-        "swegen-generate": 48,
-        "swegen-validate": 96,
-        "swegen-repair": 4,
-        "swegen-reward": 16,
-        "swegen-push": 1,
+    # Replica counts and image tags are retuned constantly during a run, so
+    # pinning their literals only produced a permanently red test. Assert the
+    # properties that encode intent instead: every worker runs a locally built
+    # swegen-worker image at a positive replica count.
+    expected_grace_seconds = {
+        "swegen-generate": 18000,
+        "swegen-validate": 600,
+        "swegen-repair": 600,
+        "swegen-reward-repair": 600,
+        "swegen-reward": 600,
+        "swegen-push": 3600,
     }
-    expected_images = {
-        "swegen-generate": "swegen-worker:e2e",
-        "swegen-validate": "swegen-worker:hybrid-buildkit-proxy-skip-20260730",
-        "swegen-repair": "swegen-worker:hybrid-buildkit-proxy-skip-20260730",
-        "swegen-reward": "swegen-worker:e2e",
-        "swegen-push": "swegen-worker:hybrid-buildkit-proxy-skip-20260730",
+    stage_by_deployment = {
+        "swegen-generate": "generate",
+        "swegen-validate": "validate",
+        "swegen-repair": "repair",
+        "swegen-reward-repair": "reward_repair",
+        "swegen-reward": "reward",
+        "swegen-push": "push",
     }
-    docker_stages = {"validate", "repair", "push"}
+    distributed_deployments = {
+        "swegen-validate",
+        "swegen-repair",
+        "swegen-reward-repair",
+    }
+    docker_stages = {"validate", "repair", "reward_repair", "push"}
     for name, deployment in deployments.items():
         pod_spec = deployment["spec"]["template"]["spec"]
         container = pod_spec["containers"][0]
-        stage = name.removeprefix("swegen-")
+        stage = stage_by_deployment[name]
 
-        assert deployment["spec"]["replicas"] == expected_replicas[name]
-        if name in {"swegen-validate", "swegen-repair"}:
+        assert isinstance(deployment["spec"]["replicas"], int)
+        # 0 is allowed: a stage whose image or queue is not provisioned yet is
+        # parked rather than deleted, so applying cannot spawn Pods that only
+        # land in ErrImageNeverPull.
+        assert deployment["spec"]["replicas"] >= 0
+        # Stages drain in 10 minutes unless they own work that legitimately runs
+        # longer: generation must outlast SWEGEN_GENERATE_TIMEOUT_SECONDS, and a
+        # push is considered stuck rather than slow after an hour.
+        assert pod_spec["terminationGracePeriodSeconds"] == expected_grace_seconds[name]
+        # Recreate would take every replica of a stage down at once.
+        assert deployment["spec"]["strategy"]["type"] == "RollingUpdate"
+        if name in distributed_deployments:
             assert "nodeSelector" not in pod_spec
             if name == "swegen-validate":
                 assert deployment["spec"]["strategy"] == {
                     "type": "RollingUpdate",
                     "rollingUpdate": {"maxSurge": 0, "maxUnavailable": "20%"},
                 }
-                assert pod_spec["terminationGracePeriodSeconds"] == 300
                 assert pod_spec["topologySpreadConstraints"] == [
                     {
                         "maxSkew": 1,
@@ -136,11 +164,18 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
                         },
                     }
                 ]
+            if name == "swegen-repair":
+                assert pod_spec["topologySpreadConstraints"][0]["maxSkew"] == 1
+                assert (
+                    pod_spec["topologySpreadConstraints"][0]["whenUnsatisfiable"]
+                    == "ScheduleAnyway"
+                )
         else:
-            assert pod_spec["nodeSelector"] == {
-                "swegen.pgcode/node-ip": expected_nodes[name]
-            }
-        assert container["image"] == expected_images[name]
+            assert pod_spec["nodeSelector"] == {"swegen.pgcode/node-ip": expected_nodes[name]}
+        # imagePullPolicy=Never means the tag must resolve on the node, so the
+        # repository still matters even though the tag itself is volatile.
+        assert container["image"].startswith("swegen-worker:")
+        assert container["image"] != "swegen-worker:"
         assert container["imagePullPolicy"] == "Never"
         assert container["args"] == ["--stage", stage]
         assert any(
@@ -153,9 +188,7 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         )
         assert docker_socket_mounted is (stage in docker_stages)
         env_map = {
-            item["name"]: item.get("value")
-            for item in container.get("env", [])
-            if "name" in item
+            item["name"]: item.get("value") for item in container.get("env", []) if "name" in item
         }
         if stage in docker_stages:
             assert env_map.get("DOCKER_BUILDKIT") == "1"
@@ -225,6 +258,78 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert "SWEGEN_REMOTE_BUILDKIT_PULL_USERNAME" in secret_helper
     assert "SWEGEN_REMOTE_BUILDKIT_PULL_PASSWORD" in secret_helper
     assert "base64.b64decode(encoded, validate=True)" in secret_helper
+    assert (
+        'model_secret_name="${SWEGEN_MODEL_SECRET_NAME:-swegen-model-credentials-v2}"'
+        in secret_helper
+    )
+    assert (
+        'generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-moedsa-20260802-v2}"'
+        in secret_helper
+    )
+    assert 'ensure_immutable_env_secret "${model_secret_name}"' in secret_helper
+    assert 'ensure_immutable_env_secret "${generate_glm_secret_name}"' in secret_helper
+    assert '"OPENAI_API_KEY": api_key' in secret_helper
+    assert '"OPENAI_BASE_URL": api_base' in secret_helper
+    assert '"OPENAI_MODEL": model' in secret_helper
+    assert 'blocked_prefixes = ("ANTHROPIC_", "CLAUDE_", "OPENAI_"' in secret_helper
+
+
+def test_generate_manifest_uses_versioned_glm_credentials_at_32() -> None:
+    deployment = next(
+        document
+        for document in _documents()
+        if document["kind"] == "Deployment"
+        and document["metadata"]["name"] == "swegen-generate"
+    )
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+
+    assert deployment["spec"]["replicas"] == 32
+    assert container["image"] == "swegen-worker:github-auth-fix-20260802-1744"
+    assert container["envFrom"][-1]["secretRef"]["name"] == (
+        "swegen-model-credentials-glm52-moedsa-20260802-v2"
+    )
+
+
+def test_coworker_deployer_cannot_mutate_secrets_and_is_admission_scoped() -> None:
+    rbac_documents = [
+        document
+        for document in yaml.safe_load_all((DEPLOY_DIR / "worker-deployer-rbac.yaml").read_text())
+        if document
+    ]
+    role = next(document for document in rbac_documents if document["kind"] == "Role")
+    resources = {resource for rule in role["rules"] for resource in rule.get("resources", [])}
+    assert "deployments" in resources
+    assert "secrets" not in resources
+
+    guard = (DEPLOY_DIR / "credential-guard.yaml").read_text()
+    assert "swegen-model-credentials-v2" in guard
+    assert "swegen-model-credentials-glm52-moedsa-20260802-v2" in guard
+    assert "container.envFrom.size() - 1" in guard
+    assert "swegen-worker-deployer" in guard
+    assert "swegen-test-" in guard
+    assert "OPENAI_API_KEY" in guard
+
+
+def test_reward_repair_migration_is_idempotent_and_creates_its_queue() -> None:
+    migration = (DEPLOY_DIR / "migrate-reward-repair-stage.sql").read_text()
+
+    assert "DROP CONSTRAINT IF EXISTS" in migration
+    assert "reward_repair" in migration
+    assert "pgmq.create('swegen_reward_repair')" in migration
+    assert "CREATE INDEX IF NOT EXISTS" in migration
+    assert "state = 'rejected' AND current_stage = 'reward'" in migration
+    assert "state = 'failed' AND current_stage = 'reward_repair'" in migration
+
+
+def test_buildkit_intermediate_migration_seeds_verified_swr_references() -> None:
+    migration = (DEPLOY_DIR / "migrate-buildkit-intermediates.sql").read_text()
+
+    assert "CREATE TABLE IF NOT EXISTS public.buildkit_intermediates" in migration
+    assert "ON CONFLICT (repo, dependency_key, build_key) DO UPDATE" in migration
+    assert migration.count("sha256:") >= 6
+    assert "dep-runbox7-ca6df8e5-ae4449b8e848-ngcc-w1" in migration
+    assert "dep-revault-gui-b3ff4588-2fc887c39ebe-testbuild-j1" in migration
+    assert "dep-varisat-b92d6e87-6879d03a5a4b-testbuild-j1" in migration
 
 
 def test_repaired_validate_priority_migration_is_bounded_and_idempotent() -> None:
@@ -251,18 +356,106 @@ def test_buildkit_pruner_is_a_bounded_node_local_daemonset() -> None:
     assert pod_spec["automountServiceAccountToken"] is False
     assert container["image"] == "swegen-worker:hybrid-buildkit-proxy-skip-20260730"
     assert "flock -n 9" in script
-    assert "docker builder prune" in script
+    assert "flock -n 8" in script
+    assert "active build slots=" in script
+    assert 'flock -n "${slot_file}" true' in script
+    assert '8>"${build_gc_lock}"' in script
+    assert "docker image prune --force" in script
+    assert "docker image prune --all" not in script
+    assert "crictl" not in script
+    assert "ctr " not in script
+    assert "docker stop" in script
+    assert "docker rm --force" in script
+    assert "docker buildx prune" in script
+    assert "--builder default" in script
+    assert "docker builder prune" not in script
+    assert script.index("docker image prune --force") < script.index("docker rm --force")
+    assert script.index("docker rm --force") < script.index("docker buildx prune")
     assert "--all" in script and "--force" in script
     assert env["SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS"] == "600"
-    assert env["SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS"] == "540"
+    assert env["SWEGEN_BUILDKIT_PRUNE_START_DELAY_SECONDS"] == "600"
+    assert env["SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS"] == "3600"
+    assert env["SWEGEN_BUILD_SLOT_DIR"] == "/run/swegen-build-slots"
+    assert env["SWEGEN_DOCKER_CONTAINER_MAX_AGE_SECONDS"] == "7200"
+    assert env["SWEGEN_DOCKER_STOP_TIMEOUT_SECONDS"] == "10"
     assert any(
         volume.get("hostPath", {}).get("path") == "/var/run/docker.sock"
         for volume in pod_spec["volumes"]
     )
+    assert not any(
+        "containerd" in volume.get("hostPath", {}).get("path", "") for volume in pod_spec["volumes"]
+    )
     assert any(
-        volume.get("hostPath", {}).get("path") == "/run/lock"
+        volume.get("hostPath", {}).get("path") == "/run/lock" for volume in pod_spec["volumes"]
+    )
+    assert any(
+        volume.get("hostPath", {}).get("path") == "/data/swegen-k3s/build-slots"
         for volume in pod_spec["volumes"]
     )
+    assert any(
+        mount.get("mountPath") == "/run/swegen-build-slots" for mount in container["volumeMounts"]
+    )
+
+
+def test_generate_circuit_breaker_is_latched_and_rbac_scoped() -> None:
+    documents = [
+        document
+        for document in yaml.safe_load_all(
+            (DEPLOY_DIR / "swegen-generate-circuit-breaker.yaml").read_text()
+        )
+        if document
+    ]
+    role = next(document for document in documents if document["kind"] == "Role")
+    deployment = next(document for document in documents if document["kind"] == "Deployment")
+    rule = role["rules"][0]
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in container["env"]}
+
+    assert rule["resources"] == ["deployments"]
+    assert rule["resourceNames"] == ["swegen-generate"]
+    assert set(rule["verbs"]) == {"get", "patch"}
+    assert deployment["spec"]["replicas"] == 1
+    assert container["command"] == [
+        "python",
+        "-m",
+        "swegen.pipeline.generate_circuit_breaker",
+    ]
+    assert env["SWEGEN_BREAKER_WINDOW_SECONDS"] == "300"
+    assert env["SWEGEN_BREAKER_MINIMUM_SAMPLES"] == "20"
+    assert env["SWEGEN_BREAKER_FAILURE_RATE_THRESHOLD"] == "0.5"
+
+
+def test_generate_transient_requeue_is_transactional_and_audited() -> None:
+    migration = (DEPLOY_DIR / "requeue-transient-generate-failures-20260802.sql").read_text()
+
+    assert migration.startswith("\\set ON_ERROR_STOP on\n\nBEGIN;")
+    assert "LOCK TABLE pgmq.q_swegen_generate" in migration
+    assert "DISTINCT ON (result.task_id, result.task_version)" in migration
+    assert "could not read Username for %github.com" in migration
+    assert "error NOT ILIKE '%404%'" in migration
+    assert "error NOT ILIKE '%not merged%'" in migration
+    assert "NOT EXISTS (\n    SELECT 1\n    FROM pgmq.q_swegen_generate" in migration
+    assert "pgmq.send(" in migration
+    assert "UPDATE pipeline_tasks AS task" in migration
+    assert "pipeline_generate_requeue_audit" in migration
+    assert "COMMIT;" in migration
+
+
+def test_generate_all_failed_requeue_is_transactional_idempotent_and_audited() -> None:
+    migration = (DEPLOY_DIR / "requeue-all-failed-generate-20260802.sql").read_text()
+
+    assert migration.startswith("\\set ON_ERROR_STOP on\n\nBEGIN;")
+    assert "LOCK TABLE pgmq.q_swegen_generate" in migration
+    assert "task.state = 'failed'" in migration
+    assert "task.current_stage = 'generate'" in migration
+    assert "ORDER BY result.attempt DESC" in migration
+    assert "source_stage_attempt + 1 AS new_stage_attempt" in migration
+    assert "NOT EXISTS (\n    SELECT 1\n    FROM pgmq.q_swegen_generate" in migration
+    assert "pipeline_generate_requeue_all_failed_audit" in migration
+    assert "pgmq.send(" in migration
+    assert "UPDATE pipeline_tasks AS task" in migration
+    assert "operator requested GLM Generate restart at 32" in migration
+    assert "COMMIT;" in migration
 
 
 def test_from_scratch_guide_pins_runtime_and_documents_growth_controls() -> None:

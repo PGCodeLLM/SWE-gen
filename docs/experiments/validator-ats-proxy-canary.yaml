@@ -1,0 +1,156 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swegen-validate-ats-canary
+  namespace: swegen-pipeline
+  labels:
+    swegen.pgcode/experiment: ats-build-proxy-20260802
+spec:
+  # Completed experiment: leave disabled. See docs/verifier_yield_improvement.md.
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-worker-ats-canary
+      swegen.pgcode/stage: validate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-worker-ats-canary
+        swegen.pgcode/stage: validate
+        swegen.pgcode/experiment: ats-build-proxy-20260802
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: swegen.pgcode/node-ip
+                    operator: In
+                    values:
+                      - 7.244.3.200
+                      - 7.244.2.110
+                      - 7.244.1.209
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker-ats-canary
+              swegen.pgcode/stage: validate
+      containers:
+        - name: worker
+          image: swegen-worker:repo-affinity-runbox-20260802-0049
+          imagePullPolicy: Never
+          args: ["--stage", "validate"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Explicit env entries override the direct-SG values imported from
+            # swegen-runtime-proxy. The worker and uploaded BuildKit build args
+            # therefore use ATS, while the normal validator deployment remains
+            # an unchanged same-window control.
+            - name: HTTP_PROXY
+              value: http://7.244.3.78:3128
+            - name: HTTPS_PROXY
+              value: http://7.244.3.78:3128
+            - name: http_proxy
+              value: http://7.244.3.78:3128
+            - name: https_proxy
+              value: http://7.244.3.78:3128
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: default
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1200Mi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/swegen-k3s/workspaces
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/swegen-k3s/workspaces
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400

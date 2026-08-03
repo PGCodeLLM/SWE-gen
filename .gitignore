@@ -105,3 +105,7 @@ slurm-candidate-runtime/
 .claude-tmp/
 .env.ats
 /.kube/
+
+# Generated monitoring/profiling output. Regenerable from the scripts in
+# docs/metrics, and large enough (4.6 MB and growing per run) to bloat history.
+docs/metrics/

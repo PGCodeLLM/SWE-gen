@@ -146,6 +146,10 @@ def test_repair_session_uses_repair_prompt_and_continuation(tmp_path, monkeypatc
     assert result.success is True
     assert "Repair an Existing Harbor Task" in prompts[0]
     assert "tests/case.py" in prompts[0]
+    assert "buildkit-intermediate list --repo owner/repo" in prompts[0]
+    assert "buildkit-intermediate claim --repo owner/repo" in prompts[0]
+    assert "buildkit-intermediate complete" in prompts[0]
+    assert "authoritative NOP=0 and Oracle=1" in prompts[0]
     assert prompts[1] == runner.CC_REPAIR_CONTINUATION_PROMPT
 
 

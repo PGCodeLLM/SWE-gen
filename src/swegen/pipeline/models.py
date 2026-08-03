@@ -161,6 +161,8 @@ class PipelineTask:
     trace_id: UUID
     state: PipelineTaskState = PipelineTaskState.QUEUED
     current_stage: PipelineStage = PipelineStage.GENERATE
+    last_error: str | None = None
+    last_reason: str | None = None
 
     def __post_init__(self) -> None:
         _validate_task_id(self.task_id)
@@ -177,6 +179,10 @@ class PipelineTask:
             object.__setattr__(self, "current_stage", PipelineStage(self.current_stage))
         except (TypeError, ValueError) as error:
             raise ValueError("current_stage must be a fixed pipeline stage") from error
+        for name in ("last_error", "last_reason"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{name} must be a string or None")
 
 
 @dataclass(frozen=True, slots=True)

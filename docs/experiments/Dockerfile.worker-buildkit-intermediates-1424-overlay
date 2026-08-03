@@ -1,0 +1,8 @@
+# Source-only hotfix over the fully locked 2026-08-02 13:42 worker image.
+# pyproject.toml and uv.lock are unchanged; the package is installed editable
+# from /app/src, so replacing that directory preserves the verified dependency
+# set while avoiding another large registry download during the CLI SQL fix.
+FROM swegen-worker:buildkit-intermediates-20260802-1342
+
+WORKDIR /app
+COPY src ./src

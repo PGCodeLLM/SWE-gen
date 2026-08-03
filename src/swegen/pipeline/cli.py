@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,6 +18,20 @@ from swegen import db
 from swegen.pipeline.models import PipelineTask
 from swegen.queueing.models import PipelineStage, QueueMessage, QueueMetrics, QueueName
 from swegen.queueing.pgmq import ConnectionLike, PgmqQueue
+from swegen.tools.buildkit_intermediates import (
+    BuildkitIntermediateError,
+    claim_intermediate,
+    complete_intermediate,
+    fail_intermediate,
+    inspect_manifest_digest,
+    list_intermediates,
+    touch_intermediate,
+)
+from swegen.tools.remote_buildkit import DEFAULT_ORPHAN_MIN_AGE_SECONDS, sweep_orphaned_builds
+
+_DEFAULT_NAMESPACE = "swegen-pipeline"
+_SWEEP_PREVIEW_LIMIT = 20
+_KUBECTL_TIMEOUT_SECONDS = 60
 
 _INSERT_TASK_SQL = """
     INSERT INTO pipeline_tasks (
@@ -44,7 +62,8 @@ _STAGE_RESULTS_SQL = """
             WHEN 'validate' THEN 2
             WHEN 'repair' THEN 3
             WHEN 'reward' THEN 4
-            WHEN 'push' THEN 5
+            WHEN 'reward_repair' THEN 5
+            WHEN 'push' THEN 6
         END,
         attempt
 """
@@ -59,7 +78,8 @@ _STAGE_RESULTS_FILTERED_SQL = """
             WHEN 'validate' THEN 2
             WHEN 'repair' THEN 3
             WHEN 'reward' THEN 4
-            WHEN 'push' THEN 5
+            WHEN 'reward_repair' THEN 5
+            WHEN 'push' THEN 6
         END,
         attempt
 """
@@ -303,11 +323,209 @@ def render_pipeline_status(
     return "\n".join(lines)
 
 
+def _live_worker_pod_names(namespace: str) -> list[str]:
+    """Return every Pod name currently present in ``namespace``.
+
+    The sweep treats absence from this list as proof a worker is gone, so this
+    must fail loudly rather than return a partial list. Every Pod is returned
+    regardless of phase: a Pending or Terminating worker still owns its rows.
+    """
+
+    executable = shutil.which("kubectl") or shutil.which("k3s")
+    if executable is None:
+        raise ValueError("neither kubectl nor k3s is on PATH")
+    command = [executable, "get", "pods", "-n", namespace, "-o", "json"]
+    if executable.endswith("k3s"):
+        command.insert(1, "kubectl")
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_KUBECTL_TIMEOUT_SECONDS,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"kubectl returned unparsable JSON: {error}") from error
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise ValueError("kubectl response has no 'items' list")
+    names = [
+        item["metadata"]["name"]
+        for item in items
+        if isinstance(item, dict)
+        and isinstance(item.get("metadata"), dict)
+        and isinstance(item["metadata"].get("name"), str)
+    ]
+    if len(names) != len(items):
+        raise ValueError("kubectl returned Pod entries without a usable name")
+    return names
+
+
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help="Operate the PostgreSQL/PGMQ SWE-gen pipeline.",
 )
+buildkit_intermediate_app = typer.Typer(
+    no_args_is_help=True,
+    help="List, claim, and register repository dependency intermediates.",
+)
+app.add_typer(buildkit_intermediate_app, name="buildkit-intermediate")
+
+
+def _json_object(raw_value: str | None) -> dict[str, object]:
+    if raw_value is None or not raw_value.strip():
+        return {}
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"metadata must be valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("metadata must be a JSON object")
+    return value
+
+
+def _json_echo(value: object) -> None:
+    typer.echo(json.dumps(value, default=str, sort_keys=True, separators=(",", ":")))
+
+
+@buildkit_intermediate_app.command("list")
+def buildkit_intermediate_list(
+    repo: str = typer.Option(..., "--repo", help="GitHub repository in OWNER/REPO form"),
+    dependency_key: str | None = typer.Option(
+        None, "--dependency-key", help="Optional lock/dependency SHA-256"
+    ),
+    include_all: bool = typer.Option(
+        False, "--all", help="Include building, failed, and retired records"
+    ),
+) -> None:
+    """List reusable dependency images before attempting another cold build."""
+
+    try:
+        with db.connection() as connection:
+            rows = list_intermediates(
+                connection,
+                repo=repo,
+                dependency_key=dependency_key,
+                ready_only=not include_all,
+            )
+    except ValueError as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(2) from error
+    _json_echo(rows)
+
+
+@buildkit_intermediate_app.command("claim")
+def buildkit_intermediate_claim(
+    repo: str = typer.Option(..., "--repo"),
+    dependency_key: str = typer.Option(..., "--dependency-key"),
+    build_key: str = typer.Option(..., "--build-key"),
+    cold_build_seconds: float = typer.Option(..., "--cold-build-seconds"),
+    claim_owner: str | None = typer.Option(None, "--claim-owner"),
+    commit_sha: str | None = typer.Option(None, "--commit-sha"),
+    lockfile_path: str | None = typer.Option(None, "--lockfile-path"),
+    lockfile_sha256: str | None = typer.Option(None, "--lockfile-sha256"),
+    dockerfile_sha256: str | None = typer.Option(None, "--dockerfile-sha256"),
+    source_task_id: str | None = typer.Option(None, "--source-task-id"),
+    source_task_version: int | None = typer.Option(None, "--source-task-version"),
+    metadata_json: str | None = typer.Option(None, "--metadata-json"),
+) -> None:
+    """Atomically reserve one dependency/build key, suppressing duplicate builds."""
+
+    owner = claim_owner or os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "operator"
+    try:
+        metadata = _json_object(metadata_json)
+        with db.connection() as connection:
+            row = claim_intermediate(
+                connection,
+                repo=repo,
+                dependency_key=dependency_key,
+                build_key=build_key,
+                claim_owner=owner,
+                cold_build_seconds=cold_build_seconds,
+                commit_sha=commit_sha,
+                lockfile_path=lockfile_path,
+                lockfile_sha256=lockfile_sha256,
+                dockerfile_sha256=dockerfile_sha256,
+                source_task_id=source_task_id,
+                source_task_version=source_task_version,
+                metadata=metadata,
+            )
+    except (BuildkitIntermediateError, ValueError) as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(2) from error
+    _json_echo(row)
+
+
+@buildkit_intermediate_app.command("complete")
+def buildkit_intermediate_complete(
+    claim_token: str = typer.Option(..., "--claim-token"),
+    image_ref: str = typer.Option(..., "--image-ref"),
+    build_seconds: float = typer.Option(..., "--build-seconds"),
+    cold_build_seconds: float = typer.Option(..., "--cold-build-seconds"),
+    image_digest: str | None = typer.Option(
+        None,
+        "--image-digest",
+        help="Expected digest; omit to use the verified registry manifest digest",
+    ),
+    metadata_json: str | None = typer.Option(None, "--metadata-json"),
+) -> None:
+    """Verify the pushed manifest and make the claimed intermediate reusable."""
+
+    try:
+        metadata = _json_object(metadata_json)
+        verified_digest = inspect_manifest_digest(image_ref)
+        if image_digest is not None and image_digest.strip().lower() != verified_digest:
+            raise BuildkitIntermediateError(
+                f"registry manifest digest {verified_digest} does not match {image_digest}"
+            )
+        with db.connection() as connection:
+            row = complete_intermediate(
+                connection,
+                claim_token=claim_token,
+                image_ref=image_ref,
+                image_digest=verified_digest,
+                build_seconds=build_seconds,
+                cold_build_seconds=cold_build_seconds,
+                metadata=metadata,
+            )
+    except (BuildkitIntermediateError, ValueError, OSError, subprocess.SubprocessError) as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(2) from error
+    _json_echo(row)
+
+
+@buildkit_intermediate_app.command("fail")
+def buildkit_intermediate_fail(
+    claim_token: str = typer.Option(..., "--claim-token"),
+    error: str = typer.Option(..., "--error"),
+) -> None:
+    """Release a failed claim so another Repair worker may retry it later."""
+
+    try:
+        with db.connection() as connection:
+            row = fail_intermediate(connection, claim_token=claim_token, error=error)
+    except (BuildkitIntermediateError, ValueError) as caught:
+        typer.echo(f"error: {caught}", err=True)
+        raise typer.Exit(2) from caught
+    _json_echo(row)
+
+
+@buildkit_intermediate_app.command("use")
+def buildkit_intermediate_use(
+    intermediate_id: int = typer.Option(..., "--id"),
+) -> None:
+    """Record that a Repair worker selected a ready intermediate."""
+
+    try:
+        with db.connection() as connection:
+            row = touch_intermediate(connection, intermediate_id=intermediate_id)
+    except (BuildkitIntermediateError, ValueError) as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(2) from error
+    _json_echo(row)
 
 
 @app.command()
@@ -349,6 +567,49 @@ def status(
     with db.connection() as connection:
         report = render_pipeline_status(connection, task_id=task_id)
     typer.echo(report)
+
+
+@app.command("sweep-remote-builds")
+def sweep_remote_builds(
+    namespace: str = typer.Option(
+        _DEFAULT_NAMESPACE, "--namespace", help="Namespace holding the worker Pods"
+    ),
+    min_age_seconds: float = typer.Option(
+        DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+        "--min-age-seconds",
+        help="Only sweep rows untouched for at least this long",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be swept without writing"
+    ),
+) -> None:
+    """Mark remote builds whose submitting worker Pod no longer exists as orphaned."""
+
+    try:
+        live_worker_ids = _live_worker_pod_names(namespace)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        typer.echo(f"error: could not list Pods in {namespace}: {error}", err=True)
+        raise typer.Exit(1) from error
+
+    try:
+        with db.connection() as connection:
+            swept = sweep_orphaned_builds(
+                connection,
+                live_worker_ids,
+                min_age_seconds=min_age_seconds,
+            )
+            if dry_run:
+                connection.rollback()
+    except ValueError as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(2) from error
+
+    verb = "would sweep" if dry_run else "swept"
+    typer.echo(f"{verb} {len(swept)} orphaned remote build(s); {len(live_worker_ids)} live Pods")
+    for row in swept[:_SWEEP_PREVIEW_LIMIT]:
+        typer.echo(f"  {row['request_id']} was={row['status']} worker={row['worker_id']}")
+    if len(swept) > _SWEEP_PREVIEW_LIMIT:
+        typer.echo(f"  ... and {len(swept) - _SWEEP_PREVIEW_LIMIT} more")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -21,6 +21,7 @@ _ACTION_ENVIRONMENT_NAMES = (
     "SWEGEN_GENERATE_TIMEOUT_SECONDS",
     "SWEGEN_HARBOR_TIMEOUT_SECONDS",
     "SWEGEN_REPAIR_TIMEOUT_SECONDS",
+    "SWEGEN_REWARD_REPAIR_TIMEOUT_SECONDS",
     "SWEGEN_REWARD_ENDPOINT",
     "SWEGEN_REWARD_PRIMARY_MODEL",
     "SWEGEN_REWARD_FALLBACK_MODEL",
@@ -184,8 +185,12 @@ def test_proxy_ca_environment_is_injected_into_legacy_task_dockerfile(
 
     rendered = dockerfile.read_text()
     trusted_ca = "/usr/local/share/ca-certificates/swegen-proxy-ca.crt"
+    assert f"GIT_SSL_CAINFO={trusted_ca}" in rendered
+    assert "UV_NATIVE_TLS=true" in rendered
     assert f"NODE_EXTRA_CA_CERTS={trusted_ca}" in rendered
     assert f"NPM_CONFIG_CAFILE={trusted_ca}" in rendered
+    assert "NPM_CONFIG_LEGACY_PEER_DEPS=true" in rendered
+    assert "cat /tmp/swegen-proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt" in rendered
     assert "NPM_CONFIG_FETCH_RETRIES=5" in rendered
     assert "NPM_CONFIG_MAXSOCKETS=4" in rendered
     assert "YARN_NETWORK_TIMEOUT=600000" in rendered
@@ -216,6 +221,8 @@ def test_proxy_ca_environment_precedes_npm_in_ca_install_instruction(
     assert actions._ensure_proxy_ca_runtime_environment(task_dir) is True
 
     rendered = dockerfile.read_text()
+    assert rendered.index("GIT_SSL_CAINFO=") < rendered.index("RUN update-ca-certificates")
+    assert rendered.index("UV_NATIVE_TLS=true") < rendered.index("RUN update-ca-certificates")
     assert rendered.index("NODE_EXTRA_CA_CERTS=") < rendered.index("RUN update-ca-certificates")
     assert rendered.index("NPM_CONFIG_CAFILE=") < rendered.index("npm install --global npm")
 
@@ -241,6 +248,8 @@ def test_proxy_ca_environment_duplicates_late_assignments_before_ca_install(
     assert actions._ensure_proxy_ca_runtime_environment(task_dir) is False
 
     rendered = dockerfile.read_text()
+    assert rendered.index("GIT_SSL_CAINFO=") < rendered.index("RUN update-ca-certificates")
+    assert rendered.index("UV_NATIVE_TLS=true") < rendered.index("RUN update-ca-certificates")
     assert rendered.index("NODE_EXTRA_CA_CERTS=") < rendered.index("RUN update-ca-certificates")
     assert rendered.index("NPM_CONFIG_CAFILE=") < rendered.index("npm install --global npm")
 
@@ -974,12 +983,31 @@ def test_push_action_skips_when_exact_remote_buildkit_image_is_already_pushed(
     task_dir = tmp_path / "tasks" / task.task_id
     (task_dir / "environment").mkdir(parents=True)
     remote_tag = "registry.example/team/generated:sha256-abc"
+    normalization_calls: list[tuple[str, Path]] = []
     monkeypatch.setenv("SWEGEN_SWR_HOST", "registry.example")
     monkeypatch.setenv("SWEGEN_SWR_REPOSITORY", "team/generated")
     monkeypatch.setattr(
         actions,
+        "rewrite_ubuntu_mirrors",
+        lambda path: normalization_calls.append(("mirrors", path)),
+    )
+    monkeypatch.setattr(
+        actions,
+        "_ensure_proxy_ca_runtime_environment",
+        lambda path: normalization_calls.append(("proxy_ca", path)),
+    )
+
+    def remote_image(task_id, directory, expected_repository):
+        assert normalization_calls == [
+            ("mirrors", task_dir / "environment" / "Dockerfile"),
+            ("proxy_ca", task_dir),
+        ]
+        return remote_tag
+
+    monkeypatch.setattr(
+        actions,
         "_remote_buildkit_image_for_push",
-        lambda task_id, directory, expected_repository: remote_tag,
+        remote_image,
     )
     monkeypatch.setattr(
         actions,
@@ -1005,7 +1033,46 @@ def test_push_action_skips_when_exact_remote_buildkit_image_is_already_pushed(
         "already_present": True,
         "remote_buildkit": True,
     }
-    assert removed == [actions.local_image_tag(task.task_id), remote_tag, "registry.example/team/generated:owner__repo-42"]
+    assert removed == [
+        actions.local_image_tag(task.task_id),
+        remote_tag,
+        "registry.example/team/generated:owner__repo-42",
+    ]
+    assert normalization_calls == [
+        ("mirrors", task_dir / "environment" / "Dockerfile"),
+        ("proxy_ca", task_dir),
+    ]
+
+
+def test_remote_buildkit_push_lookup_accepts_local_overflow_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    task_dir = tmp_path / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    config = SimpleNamespace(
+        mode="local_overflow",
+        dockerfile_registry_rewrites=(),
+    )
+    remote_ref = "registry.example/team/generated:sha256-exact"
+    monkeypatch.setattr(actions.RemoteBuildkitConfig, "from_env", lambda: config)
+    monkeypatch.setattr(actions, "context_digest", lambda *args, **kwargs: "a" * 64)
+    monkeypatch.setattr(
+        actions,
+        "find_successful_remote_image",
+        lambda **kwargs: remote_ref,
+    )
+
+    result = actions._remote_buildkit_image_for_push(
+        task.task_id,
+        task_dir,
+        expected_repository="registry.example/team/generated",
+    )
+
+    assert result == remote_ref
 
 
 def test_push_action_removes_local_image_when_push_fails(
@@ -1081,6 +1148,7 @@ def test_repair_action_captures_agent_edits_and_returns_to_authoritative_validat
     (task_dir / "tests" / "case.py").write_text("assert False\n")
     (task_dir / "solution" / "solve.sh").write_text("#!/bin/sh\n")
     calls: list[dict[str, object]] = []
+    removed: list[str] = []
 
     def fake_session(**kwargs):
         calls.append(kwargs)
@@ -1093,17 +1161,132 @@ def test_repair_action_captures_agent_edits_and_returns_to_authoritative_validat
         )
 
     monkeypatch.setattr(actions, "run_claude_code_session", fake_session)
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
     execution = actions.repair_action(task, tmp_path)
 
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json()["agent_reported_success"] is False
+    assert execution.result_json()["agent_changed_files"] is True
     captured = {task_file.path: task_file.content for task_file in execution.files}
     assert captured["tests/test.sh"] == b"#!/bin/sh\npytest -q case.py\n"
     assert calls[0]["repair"] is True
     assert calls[0]["validate"] is True
     assert calls[0]["test_files"] == ["tests/case.py"]
     assert calls[0]["timeout"] == actions.DEFAULT_REPAIR_TIMEOUT_SECONDS
+    assert removed == [actions.local_image_tag(task.task_id)]
+
+
+def test_repair_action_does_not_handoff_failed_unchanged_bundle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    task_dir = tmp_path / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "tests").mkdir()
+    (task_dir / "solution").mkdir()
+    (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\nexit 1\n")
+    (task_dir / "solution" / "solve.sh").write_text("#!/bin/sh\n")
+    removed: list[str] = []
+    monkeypatch.setattr(
+        actions,
+        "run_claude_code_session",
+        lambda **kwargs: SimpleNamespace(
+            success=False,
+            nop_passed=False,
+            oracle_passed=False,
+            error_message="model endpoint unavailable",
+        ),
+    )
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
+
+    execution = actions.repair_action(task, tmp_path)
+
+    assert execution.status is StageResultStatus.FAILED
+    assert execution.should_handoff is False
+    assert execution.files == ()
+    assert execution.result_json()["agent_changed_files"] is False
+    assert execution.result_json()["error"] == "model endpoint unavailable"
+    assert removed == [actions.local_image_tag(task.task_id)]
+
+
+def test_repair_action_removes_local_image_when_session_raises(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = make_task()
+    task_dir = tmp_path / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "tests").mkdir()
+    (task_dir / "solution").mkdir()
+    (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\nexit 1\n")
+    (task_dir / "solution" / "solve.sh").write_text("#!/bin/sh\n")
+    removed: list[str] = []
+    monkeypatch.setattr(
+        actions,
+        "run_claude_code_session",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("repair session crashed")),
+    )
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
+
+    with pytest.raises(RuntimeError, match="repair session crashed"):
+        actions.repair_action(task, tmp_path)
+
+    assert removed == [actions.local_image_tag(task.task_id)]
+
+
+def test_reward_repair_action_passes_rejection_reason_and_uses_dedicated_jobs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from swegen.pipeline import actions
+
+    task = PipelineTask(
+        task_id="owner__repo-42",
+        task_version=1,
+        repo="owner/repo",
+        pr=42,
+        trace_id=UUID("12345678-1234-5678-1234-567812345678"),
+        current_stage=PipelineStage.REWARD_REPAIR,
+        last_reason="Verifier only checks that the command exits zero.",
+    )
+    task_dir = tmp_path / "tasks" / task.task_id
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "tests").mkdir()
+    (task_dir / "solution").mkdir()
+    (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\nexit 1\n")
+    (task_dir / "solution" / "solve.sh").write_text("#!/bin/sh\n")
+    calls: list[dict[str, object]] = []
+    removed: list[str] = []
+
+    def fake_session(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            success=True,
+            nop_passed=True,
+            oracle_passed=True,
+            error_message=None,
+        )
+
+    monkeypatch.setattr(actions, "run_claude_code_session", fake_session)
+    monkeypatch.setattr(actions, "remove_local_image", removed.append)
+
+    execution = actions.reward_repair_action(task, tmp_path)
+
+    assert execution.status is StageResultStatus.SUCCEEDED
+    assert calls[0]["repair"] is True
+    assert calls[0]["repair_reason"] == task.last_reason
+    assert calls[0]["timeout"] == actions.DEFAULT_REWARD_REPAIR_TIMEOUT_SECONDS
+    assert "reward-repair-harbor-jobs" in str(calls[0]["jobs_dir"])
+    assert removed == [actions.local_image_tag(task.task_id)]
 
 
 def test_action_for_stage_maps_all_pipeline_stages_and_rejects_unknown() -> None:
@@ -1113,6 +1296,7 @@ def test_action_for_stage_maps_all_pipeline_stages_and_rejects_unknown() -> None
     assert actions.action_for_stage(PipelineStage.VALIDATE) is actions.validate_action
     assert actions.action_for_stage(PipelineStage.REPAIR) is actions.repair_action
     assert actions.action_for_stage(PipelineStage.REWARD) is actions.reward_action
+    assert actions.action_for_stage(PipelineStage.REWARD_REPAIR) is actions.reward_repair_action
     assert actions.action_for_stage(PipelineStage.PUSH) is actions.push_action
 
     with pytest.raises(ValueError, match="unsupported pipeline stage"):

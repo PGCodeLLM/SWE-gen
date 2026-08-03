@@ -274,10 +274,7 @@ def test_pipeline_schema_has_named_tables_and_idempotent_stage_key() -> None:
     assert (
         "CONSTRAINT pk_pipeline_stage_results PRIMARY KEY (task_id, task_version, stage, attempt)"
     ) in sql
-    assert (
-        "CONSTRAINT pk_pipeline_stage_activity PRIMARY KEY (task_id, task_version, stage)"
-        in sql
-    )
+    assert "CONSTRAINT pk_pipeline_stage_activity PRIMARY KEY (task_id, task_version, stage)" in sql
 
 
 def test_pipeline_schema_has_named_identity_and_file_constraints() -> None:
@@ -346,10 +343,19 @@ def test_pipeline_schema_uses_the_fixed_state_stage_and_result_values() -> None:
     sql = schema_sql()
 
     assert "state IN ('queued', 'running', 'rejected', 'failed', 'completed')" in sql
-    assert "current_stage IN ('generate', 'validate', 'repair', 'reward', 'push')" in sql
-    assert "stage IN ('generate', 'validate', 'repair', 'reward', 'push')" in sql
+    for stage in ("generate", "validate", "repair", "reward", "reward_repair", "push"):
+        assert f"'{stage}'" in sql
     assert "status IN ('succeeded', 'rejected', 'failed')" in sql
     assert "content BYTEA NOT NULL" in sql
     assert "result JSONB NOT NULL DEFAULT '{}'::jsonb" in sql
     assert "started_at TIMESTAMPTZ NOT NULL" in sql
     assert "finished_at TIMESTAMPTZ NOT NULL" in sql
+
+
+def test_schema_has_dependency_keyed_buildkit_intermediate_registry() -> None:
+    sql = schema_sql()
+
+    assert "CREATE TABLE IF NOT EXISTS buildkit_intermediates" in sql
+    assert "UNIQUE (repo, dependency_key, build_key)" in sql
+    assert "cold_build_seconds > 600" in sql
+    assert "status IN ('building', 'ready', 'failed', 'retired')" in sql

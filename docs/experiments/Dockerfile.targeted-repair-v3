@@ -1,0 +1,6 @@
+FROM swegen-worker:targeted-repair-canary-20260802-0625
+
+# The v2 canary image already contains the isolated queue and autoseed switch.
+# Replace only the two queue-boundary modules fixed after the first dry claim.
+COPY src/swegen/queueing/pgmq.py /app/src/swegen/queueing/pgmq.py
+COPY src/swegen/pipeline/task_store.py /app/src/swegen/pipeline/task_store.py

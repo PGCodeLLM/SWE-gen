@@ -13,7 +13,9 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
+      # Keep updating healthy nodes when one node is already unavailable under
+      # DiskPressure. This DaemonSet is a maintenance helper, not request-serving.
+      maxUnavailable: 2
   template:
     metadata:
       labels:
@@ -33,7 +35,10 @@ spec:
             - |
               lock_file=/host-run-lock/swegen-buildkit-pruner.lock
               output_file=/tmp/swegen-buildkit-prune.log
+              build_slot_dir="${SWEGEN_BUILD_SLOT_DIR}"
+              build_gc_lock="${build_slot_dir}/gc.lock"
 
+              sleep "${SWEGEN_BUILDKIT_PRUNE_START_DELAY_SECONDS}"
               while true; do
                 printf '%s node=%s buildkit-prune cycle starting\n' "$(date -Iseconds)" "${NODE_NAME}"
                 (
@@ -42,12 +47,82 @@ spec:
                     exit 0
                   fi
 
+                  slot_count="$(cat "${build_slot_dir}/count" 2>/dev/null || true)"
+                  case "${slot_count}" in
+                    ''|*[!0-9]*|0)
+                      printf '%s node=%s buildkit-prune skipped: invalid slot count=%s\n' \
+                        "$(date -Iseconds)" "${NODE_NAME}" "${slot_count:-missing}"
+                      exit 0
+                      ;;
+                  esac
+                  active_slots=0
+                  slot_index=0
+                  while [ "${slot_index}" -lt "${slot_count}" ]; do
+                    slot_file="${build_slot_dir}/${slot_index}"
+                    if ! flock -n "${slot_file}" true; then
+                      active_slots="$((active_slots + 1))"
+                    fi
+                    slot_index="$((slot_index + 1))"
+                  done
+                  if [ "${active_slots}" -gt 0 ]; then
+                    printf '%s node=%s buildkit-prune skipped: active build slots=%s/%s\n' \
+                      "$(date -Iseconds)" "${NODE_NAME}" "${active_slots}" "${slot_count}"
+                    exit 0
+                  fi
+                  if ! flock -n 8; then
+                    printf '%s node=%s buildkit-prune skipped: build admission guard is held\n' \
+                      "$(date -Iseconds)" "${NODE_NAME}"
+                    exit 0
+                  fi
+
                   printf '%s node=%s cache before prune\n' "$(date -Iseconds)" "${NODE_NAME}"
                   timeout 30 docker system df || true
 
+                  printf '%s node=%s dangling-image cleanup starting\n' \
+                    "$(date -Iseconds)" "${NODE_NAME}"
+                  # This reaches only the host Docker daemon used by Harbor
+                  # builds. K3s worker images live in containerd, whose socket
+                  # is intentionally not mounted into this DaemonSet.
+                  timeout 120 docker image prune --force || true
+
+                  cutoff_epoch="$((
+                    $(date -u +%s) - SWEGEN_DOCKER_CONTAINER_MAX_AGE_SECONDS
+                  ))"
+                  removed_containers=0
+                  for container_id in $(docker ps --all --quiet); do
+                    created_at="$(
+                      timeout 15 docker inspect --format '{{.Created}}' "${container_id}" \
+                        2>/dev/null || true
+                    )"
+                    [ -n "${created_at}" ] || continue
+                    created_epoch="$(date -u -d "${created_at}" +%s 2>/dev/null || true)"
+                    [ -n "${created_epoch}" ] || continue
+                    [ "${created_epoch}" -le "${cutoff_epoch}" ] || continue
+
+                    is_running="$(
+                      timeout 15 docker inspect --format '{{.State.Running}}' \
+                        "${container_id}" 2>/dev/null || true
+                    )"
+                    if [ "${is_running}" = "true" ]; then
+                      timeout 30 docker stop \
+                        --time "${SWEGEN_DOCKER_STOP_TIMEOUT_SECONDS}" \
+                        "${container_id}" || true
+                    fi
+                    if timeout 30 docker rm --force "${container_id}" >/dev/null; then
+                      removed_containers="$((removed_containers + 1))"
+                    fi
+                  done
+                  printf '%s node=%s old-container cleanup removed=%s max_age_seconds=%s\n' \
+                    "$(date -Iseconds)" "${NODE_NAME}" "${removed_containers}" \
+                    "${SWEGEN_DOCKER_CONTAINER_MAX_AGE_SECONDS}"
+
+                  # Removing old containers can expose more unreferenced image layers.
+                  timeout 120 docker image prune --force || true
+
                   prune_status=0
                   timeout "${SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS}" \
-                    docker builder prune \
+                    docker buildx prune \
+                      --builder default \
                       --all \
                       --force \
                       --max-used-space "${SWEGEN_BUILDKIT_MAX_USED_SPACE}" \
@@ -64,7 +139,7 @@ spec:
 
                   printf '%s node=%s cache after prune\n' "$(date -Iseconds)" "${NODE_NAME}"
                   timeout 30 docker system df || true
-                ) 9>"${lock_file}"
+                ) 8>"${build_gc_lock}" 9>"${lock_file}"
 
                 sleep "${SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS}"
               done
@@ -75,8 +150,16 @@ spec:
                   fieldPath: spec.nodeName
             - name: SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS
               value: "600"
+            - name: SWEGEN_BUILDKIT_PRUNE_START_DELAY_SECONDS
+              value: "600"
             - name: SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS
-              value: "540"
+              value: "3600"
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_DOCKER_CONTAINER_MAX_AGE_SECONDS
+              value: "7200"
+            - name: SWEGEN_DOCKER_STOP_TIMEOUT_SECONDS
+              value: "10"
             - name: SWEGEN_BUILDKIT_MAX_USED_SPACE
               value: 100GB
             - name: SWEGEN_BUILDKIT_RESERVED_SPACE
@@ -93,6 +176,8 @@ spec:
               mountPath: /var/run/docker.sock
             - name: host-run-lock
               mountPath: /host-run-lock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
       volumes:
         - name: docker-sock
           hostPath:
@@ -101,4 +186,8 @@ spec:
         - name: host-run-lock
           hostPath:
             path: /run/lock
+            type: DirectoryOrCreate
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
             type: DirectoryOrCreate

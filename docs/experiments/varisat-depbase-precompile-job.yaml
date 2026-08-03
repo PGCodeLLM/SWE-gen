@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swegen-varisat-depbase-precompile-20260802
+  namespace: swegen-pipeline
+data:
+  Dockerfile: |
+    FROM ubuntu:24.04
+
+    # Match the standard production apt rewrite used by validator workers.
+    ENV no_proxy=mirrors.tools.huawei.com NO_PROXY=mirrors.tools.huawei.com
+    RUN set -eux; \
+        for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+            if [ -f "$sources_file" ]; then \
+                sed -i \
+                    -e 's#http://archive.ubuntu.com/ubuntu#http://mirrors.tools.huawei.com/ubuntu#g' \
+                    -e 's#https://archive.ubuntu.com/ubuntu#http://mirrors.tools.huawei.com/ubuntu#g' \
+                    -e 's#http://security.ubuntu.com/ubuntu#http://mirrors.tools.huawei.com/ubuntu#g' \
+                    -e 's#https://security.ubuntu.com/ubuntu#http://mirrors.tools.huawei.com/ubuntu#g' \
+                    "$sources_file"; \
+            fi; \
+        done
+
+    COPY swegen-proxy-ca.crt /tmp/swegen-proxy-ca.crt
+
+    ENV GIT_SSL_CAINFO=/usr/local/share/ca-certificates/swegen-proxy-ca.crt \
+        UV_NATIVE_TLS=true \
+        NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/swegen-proxy-ca.crt \
+        NPM_CONFIG_CAFILE=/usr/local/share/ca-certificates/swegen-proxy-ca.crt \
+        NPM_CONFIG_LEGACY_PEER_DEPS=true \
+        NPM_CONFIG_FETCH_RETRIES=5 \
+        NPM_CONFIG_FETCH_RETRY_FACTOR=2 \
+        NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=20000 \
+        NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=120000 \
+        NPM_CONFIG_MAXSOCKETS=4 \
+        YARN_NETWORK_TIMEOUT=600000 \
+        YARN_HTTP_TIMEOUT=600000 \
+        YARN_NETWORK_CONCURRENCY=4
+
+    RUN apt-get -o Acquire::Retries=5 update && apt-get install -y \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        patch \
+        && mkdir -p /usr/local/share/ca-certificates \
+        && cp /tmp/swegen-proxy-ca.crt /usr/local/share/ca-certificates/swegen-proxy-ca.crt \
+        && chmod 0644 /usr/local/share/ca-certificates/swegen-proxy-ca.crt \
+        && update-ca-certificates \
+        && cat /tmp/swegen-proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt \
+        && rm /tmp/swegen-proxy-ca.crt \
+        && rm -rf /var/lib/apt/lists/*
+
+    ENV GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+        SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+        CARGO_HOME=/root/.cargo \
+        RUSTUP_HOME=/root/.rustup \
+        PATH=/root/.cargo/bin:${PATH} \
+        CARGO_TERM_COLOR=never
+
+    RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.34.2
+
+    WORKDIR /app
+
+    RUN git clone https://github.com/jix/varisat.git src && \
+        cd src && \
+        (git fetch --depth 1 origin b92d6e87b775ba7d9df20e0f8dfbb8c116dd8d86 || git fetch --depth 1 origin "+refs/pull/55/head:refs/remotes/origin/pr/55") && \
+        git checkout --detach FETCH_HEAD && \
+        git submodule update --init --recursive
+
+    WORKDIR /app/src
+
+    RUN cargo fetch --locked && \
+        cargo test --locked -p varisat --test checker --no-run -j 1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: swegen-varisat-depbase-precompile-20260802
+  namespace: swegen-pipeline
+  labels:
+    swegen.pgcode/experiment: varisat-depbase-precompile-20260802
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        swegen.pgcode/experiment: varisat-depbase-precompile-20260802
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        swegen.pgcode/node-ip: 7.244.2.110
+      containers:
+        - name: builder
+          image: swegen-worker:targeted-repair-canary-20260802-0645
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              set -eu;
+              docker build --progress=plain
+              --tag
+              swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:dep-varisat-b92d6e87-6879d03a5a4b-testbuild-j1
+              /context;
+              docker push
+              swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:dep-varisat-b92d6e87-6879d03a5a4b-testbuild-j1
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-runtime-proxy
+          env:
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: default
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1200Mi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: source-environment
+              mountPath: /context
+              readOnly: true
+            - name: experiment
+              mountPath: /context/Dockerfile
+              subPath: Dockerfile
+              readOnly: true
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: source-environment
+          hostPath:
+            path: /data/swegen-k3s/workspaces/varisat-depbase-20260802/task/environment
+            type: Directory
+        - name: experiment
+          configMap:
+            name: swegen-varisat-depbase-precompile-20260802
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400
+

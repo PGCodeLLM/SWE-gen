@@ -13,7 +13,7 @@ from collections.abc import Sequence
 
 DEFAULT_NAMESPACE = "swegen-pipeline"
 DEFAULT_MIN_AGE_SECONDS = 300
-DEFAULT_STOP_TIMEOUT_SECONDS = 10
+DEFAULT_STOP_TIMEOUT_SECONDS = 0
 WORKER_POD_PATTERN = re.compile(r"^swegen-(?:generate|validate|repair|reward|push)(?:-|$)")
 
 
@@ -97,6 +97,8 @@ def reconcile(
         min_age_seconds=min_age_seconds,
         now_ns=time.time_ns(),
     )
+    reconciled = 0
+    failures = 0
     for container_id, pod_name, state in orphans:
         print(
             f"orphan pod={pod_name} container={container_id[:12]} state={state}",
@@ -105,25 +107,65 @@ def reconcile(
         if dry_run:
             continue
         if state == "CONTAINER_RUNNING":
-            subprocess.run(
-                [
-                    "k3s",
-                    "crictl",
-                    "stop",
-                    "--timeout",
-                    str(stop_timeout_seconds),
-                    container_id,
-                ],
-                check=True,
-                timeout=stop_timeout_seconds + 15,
-            )
-        subprocess.run(
-            ["k3s", "crictl", "rm", container_id],
-            check=True,
+            try:
+                stopped = subprocess.run(
+                    [
+                        "k3s",
+                        "crictl",
+                        "stop",
+                        "--timeout",
+                        str(stop_timeout_seconds),
+                        container_id,
+                    ],
+                    check=False,
+                    timeout=max(stop_timeout_seconds, 1) + 15,
+                )
+            except subprocess.TimeoutExpired:
+                stopped = None
+            if stopped is None or stopped.returncode != 0:
+                remaining = subprocess.run(
+                    ["k3s", "crictl", "inspect", container_id],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if remaining.returncode != 0:
+                    reconciled += 1
+                    continue
+                print(
+                    f"stop did not complete; forcing removal pod={pod_name} "
+                    f"container={container_id[:12]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        removed = subprocess.run(
+            ["k3s", "crictl", "rm", "--force", container_id],
+            check=False,
             timeout=30,
         )
-    print(f"reconciled={0 if dry_run else len(orphans)} candidates={len(orphans)}")
-    return 0
+        if removed.returncode != 0:
+            remaining = subprocess.run(
+                ["k3s", "crictl", "inspect", container_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if remaining.returncode == 0:
+                failures += 1
+                print(
+                    f"failed to remove orphan pod={pod_name} container={container_id[:12]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+        reconciled += 1
+    print(
+        f"reconciled={0 if dry_run else reconciled} "
+        f"candidates={len(orphans)} failures={0 if dry_run else failures}"
+    )
+    return 1 if failures else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -139,8 +181,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.min_age_seconds < 60:
         parser.error("--min-age-seconds must be at least 60")
-    if args.stop_timeout_seconds < 1:
-        parser.error("--stop-timeout-seconds must be positive")
+    if args.stop_timeout_seconds < 0:
+        parser.error("--stop-timeout-seconds must be nonnegative")
     try:
         return reconcile(
             namespace=args.namespace,

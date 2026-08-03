@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -73,9 +75,7 @@ class RepoCache:
             return output.decode(errors="replace").strip()
         return output.strip()
 
-    def _raise_git_command_error(
-        self, command: str, error: subprocess.CalledProcessError
-    ) -> None:
+    def _raise_git_command_error(self, command: str, error: subprocess.CalledProcessError) -> None:
         """Log and raise a Git failure while preserving its diagnostic stderr."""
         stderr = self._decode_subprocess_output(error.stderr)
         message = f"{command} failed with exit code {error.returncode}"
@@ -85,6 +85,34 @@ class RepoCache:
             message += "\nGit produced no stderr."
         self.logger.error("%s", message)
         raise RuntimeError(message) from error
+
+    @staticmethod
+    def _git_environment() -> dict[str, str]:
+        """Return a non-interactive Git environment with GitHub token auth.
+
+        Git does not consume ``GITHUB_TOKEN`` by itself.  Supply the token as
+        an in-memory Git config header so clone/fetch/submodule commands can
+        authenticate without putting the credential in a URL, command line,
+        repository config, or credential store.
+        """
+
+        environment = dict(os.environ)
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        token = environment.get("GITHUB_TOKEN", "").strip()
+        if not token:
+            return environment
+
+        try:
+            config_count = int(environment.get("GIT_CONFIG_COUNT", "0"))
+        except ValueError:
+            config_count = 0
+        if config_count < 0:
+            config_count = 0
+        credential = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        environment[f"GIT_CONFIG_KEY_{config_count}"] = "http.https://github.com/.extraheader"
+        environment[f"GIT_CONFIG_VALUE_{config_count}"] = f"Authorization: Basic {credential}"
+        environment["GIT_CONFIG_COUNT"] = str(config_count + 1)
+        return environment
 
     def _clone(self, repo_url: str, repo_path: Path, head_sha: str) -> None:
         """Clone a repository and checkout the specified commit."""
@@ -97,6 +125,7 @@ class RepoCache:
                 ["git", "clone", repo_url, str(repo_path)],
                 check=True,
                 capture_output=True,
+                env=self._git_environment(),
             )
         except subprocess.CalledProcessError as error:
             self._raise_git_command_error("git clone", error)
@@ -115,6 +144,7 @@ class RepoCache:
                 cwd=str(repo_path),
                 check=True,
                 capture_output=True,
+                env=self._git_environment(),
             )
         except subprocess.CalledProcessError as error:
             self._raise_git_command_error("git fetch --all", error)
@@ -129,6 +159,7 @@ class RepoCache:
             ["git", "submodule", "deinit", "--all", "-f"],
             cwd=str(repo_path),
             capture_output=True,  # Don't check - might fail if no submodules
+            env=self._git_environment(),
         )
         # Reset any tracked changes
         subprocess.run(
@@ -136,6 +167,7 @@ class RepoCache:
             cwd=str(repo_path),
             check=True,
             capture_output=True,
+            env=self._git_environment(),
         )
         # Clean untracked files, including nested git repos (-ff) and ignored files (-x)
         subprocess.run(
@@ -143,6 +175,7 @@ class RepoCache:
             cwd=str(repo_path),
             check=True,
             capture_output=True,
+            env=self._git_environment(),
         )
 
     def _checkout(self, repo_path: Path, sha: str) -> None:
@@ -157,6 +190,7 @@ class RepoCache:
                 cwd=str(repo_path),
                 check=True,
                 capture_output=True,
+                env=self._git_environment(),
             )
             self.logger.debug("Checked out %s", sha[:8])
         except subprocess.CalledProcessError as e:
@@ -172,6 +206,7 @@ class RepoCache:
                     cwd=str(repo_path),
                     check=True,
                     capture_output=True,
+                    env=self._git_environment(),
                 )
                 # Clean again before checkout to ensure no untracked files
                 self._clean_repo(repo_path)
@@ -180,6 +215,7 @@ class RepoCache:
                     cwd=str(repo_path),
                     check=True,
                     capture_output=True,
+                    env=self._git_environment(),
                 )
                 self.logger.debug("Fetched and checked out %s", sha[:8])
             except subprocess.CalledProcessError as fetch_err:
@@ -198,6 +234,7 @@ class RepoCache:
                 check=True,
                 capture_output=True,
                 timeout=120,
+                env=self._git_environment(),
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             self.logger.debug("Submodule update skipped or failed (non-fatal)")

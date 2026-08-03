@@ -3,6 +3,7 @@ from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -306,15 +307,23 @@ def test_status_filters_all_ledger_queries_and_reports_fixed_queues() -> None:
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
             (
-                "swegen_reward length=4 visible=4 total=14 "
+                "swegen_repair_canary length=4 visible=4 total=14 "
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
             (
-                "swegen_push length=5 visible=5 total=15 "
+                "swegen_reward length=5 visible=5 total=15 "
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
             (
-                "swegen_dead length=6 visible=6 total=16 "
+                "swegen_reward_repair length=6 visible=6 total=16 "
+                "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
+            ),
+            (
+                "swegen_push length=7 visible=7 total=17 "
+                "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
+            ),
+            (
+                "swegen_dead length=8 visible=8 total=18 "
                 "newest_age_s=2 oldest_age_s=5 scraped=2026-07-29T12:05:00+00:00"
             ),
         ]
@@ -497,3 +506,89 @@ def test_enqueue_accepts_database_mapping_or_sequence_rows(
     )
 
     assert (result.task.task_id, result.task.task_version) == expected
+
+
+class SweepConnection(RecordingConnection):
+    def __init__(self, rows: Sequence[Mapping[str, object]]) -> None:
+        super().__init__(tuple(rows))
+        self.rolled_back = False
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+
+def _fake_pods(*names: str) -> Mapping[str, object]:
+    return {"items": [{"metadata": {"name": name}} for name in names]}
+
+
+def test_sweep_command_reports_orphans_and_commits(monkeypatch) -> None:
+    connection = SweepConnection(
+        [{"request_id": "farm-1:swegen-a", "worker_id": "swegen-validate-old", "status": "running"}]
+    )
+
+    @contextmanager
+    def fake_connection() -> Iterator[SweepConnection]:
+        yield connection
+
+    monkeypatch.setattr(cli.db, "connection", fake_connection)
+    monkeypatch.setattr(cli, "_live_worker_pod_names", lambda namespace: ["swegen-validate-new"])
+
+    result = CliRunner().invoke(cli.app, ["sweep-remote-builds"])
+
+    assert result.exit_code == 0
+    assert "swept 1 orphaned remote build(s); 1 live Pods" in result.stdout
+    assert "farm-1:swegen-a was=running worker=swegen-validate-old" in result.stdout
+    assert connection.rolled_back is False
+
+
+def test_sweep_command_dry_run_rolls_back(monkeypatch) -> None:
+    connection = SweepConnection(
+        [{"request_id": "farm-1:swegen-a", "worker_id": "swegen-validate-old", "status": "running"}]
+    )
+
+    @contextmanager
+    def fake_connection() -> Iterator[SweepConnection]:
+        yield connection
+
+    monkeypatch.setattr(cli.db, "connection", fake_connection)
+    monkeypatch.setattr(cli, "_live_worker_pod_names", lambda namespace: ["swegen-validate-new"])
+
+    result = CliRunner().invoke(cli.app, ["sweep-remote-builds", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "would sweep 1 orphaned remote build(s)" in result.stdout
+    assert connection.rolled_back is True
+
+
+def test_sweep_command_exits_when_pods_cannot_be_listed(monkeypatch) -> None:
+    def explode(namespace: str) -> list[str]:
+        raise ValueError("neither kubectl nor k3s is on PATH")
+
+    monkeypatch.setattr(cli, "_live_worker_pod_names", explode)
+
+    result = CliRunner().invoke(cli.app, ["sweep-remote-builds"])
+
+    assert result.exit_code == 1
+    assert "could not list Pods in swegen-pipeline" in result.stderr
+
+
+def test_live_worker_pod_names_parses_kubectl_json(monkeypatch) -> None:
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/kubectl")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout=json.dumps(_fake_pods("pod-a", "pod-b"))),
+    )
+
+    assert cli._live_worker_pod_names("swegen-pipeline") == ["pod-a", "pod-b"]
+
+
+def test_live_worker_pod_names_rejects_entries_without_a_name(monkeypatch) -> None:
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/kubectl")
+    payload = {"items": [{"metadata": {"name": "pod-a"}}, {"metadata": {}}]}
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=json.dumps(payload))
+    )
+
+    with pytest.raises(ValueError, match="without a usable name"):
+        cli._live_worker_pod_names("swegen-pipeline")

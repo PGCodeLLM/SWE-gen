@@ -223,7 +223,9 @@ CREATE TABLE IF NOT EXISTS pipeline_tasks (
         state IN ('queued', 'running', 'rejected', 'failed', 'completed')
     ),
     CONSTRAINT ck_pipeline_tasks_current_stage CHECK (
-        current_stage IN ('generate', 'validate', 'repair', 'reward', 'push')
+        current_stage IN (
+            'generate', 'validate', 'repair', 'reward', 'reward_repair', 'push'
+        )
     )
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_tasks_state_stage
@@ -274,7 +276,7 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_results (
     CONSTRAINT fk_pipeline_stage_results_task FOREIGN KEY (task_id, task_version)
         REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
     CONSTRAINT ck_pipeline_stage_results_stage CHECK (
-        stage IN ('generate', 'validate', 'repair', 'reward', 'push')
+        stage IN ('generate', 'validate', 'repair', 'reward', 'reward_repair', 'push')
     ),
     CONSTRAINT ck_pipeline_stage_results_attempt_positive CHECK (attempt > 0),
     CONSTRAINT ck_pipeline_stage_results_status CHECK (
@@ -303,7 +305,7 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_activity (
     CONSTRAINT fk_pipeline_stage_activity_task FOREIGN KEY (task_id, task_version)
         REFERENCES pipeline_tasks (task_id, task_version) ON DELETE CASCADE,
     CONSTRAINT ck_pipeline_stage_activity_stage CHECK (
-        stage IN ('generate', 'validate', 'repair', 'reward', 'push')
+        stage IN ('generate', 'validate', 'repair', 'reward', 'reward_repair', 'push')
     ),
     CONSTRAINT ck_pipeline_stage_activity_attempt_positive CHECK (attempt > 0),
     CONSTRAINT ck_pipeline_stage_activity_pgmq_msg_id_positive CHECK (pgmq_msg_id > 0),
@@ -316,6 +318,75 @@ CREATE TABLE IF NOT EXISTS pipeline_stage_activity (
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_stage_activity_heartbeat
     ON pipeline_stage_activity (heartbeat_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Stage circuit breakers
+-- ---------------------------------------------------------------------------
+-- The controller keeps the breaker latched until an operator explicitly
+-- resets it.  This is intentionally durable: restarting the controller must
+-- not allow a broken upstream to restart a Deployment and consume another
+-- large slice of the queue.
+CREATE TABLE IF NOT EXISTS pipeline_stage_circuit_breakers (
+    stage                  TEXT             PRIMARY KEY,
+    deployment_name        TEXT             NOT NULL,
+    is_open                BOOLEAN          NOT NULL DEFAULT FALSE,
+    window_seconds         INTEGER          NOT NULL,
+    minimum_samples        INTEGER          NOT NULL,
+    failure_rate_threshold DOUBLE PRECISION NOT NULL,
+    sample_count           INTEGER          NOT NULL DEFAULT 0,
+    failure_count          INTEGER          NOT NULL DEFAULT 0,
+    failure_rate           DOUBLE PRECISION,
+    trip_count             INTEGER          NOT NULL DEFAULT 0,
+    tripped_at             TIMESTAMPTZ,
+    reset_at               TIMESTAMPTZ,
+    reason                 TEXT,
+    updated_at             TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_stage CHECK (
+        stage IN ('generate', 'validate', 'repair', 'reward', 'reward_repair', 'push')
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_deployment_nonblank CHECK (
+        btrim(deployment_name) <> ''
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_window_positive CHECK (
+        window_seconds > 0
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_samples_positive CHECK (
+        minimum_samples > 0 AND sample_count >= 0 AND failure_count >= 0
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_failure_count CHECK (
+        failure_count <= sample_count
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_threshold CHECK (
+        failure_rate_threshold > 0 AND failure_rate_threshold < 1
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_rate CHECK (
+        failure_rate IS NULL OR (failure_rate >= 0 AND failure_rate <= 1)
+    ),
+    CONSTRAINT ck_pipeline_stage_circuit_breakers_trip_count CHECK (trip_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_circuit_breaker_events (
+    id                     BIGSERIAL        PRIMARY KEY,
+    stage                  TEXT             NOT NULL,
+    deployment_name        TEXT             NOT NULL,
+    event                  TEXT             NOT NULL,
+    occurred_at            TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    reason                 TEXT             NOT NULL,
+    window_seconds         INTEGER          NOT NULL,
+    minimum_samples        INTEGER          NOT NULL,
+    failure_rate_threshold DOUBLE PRECISION NOT NULL,
+    sample_count           INTEGER          NOT NULL,
+    failure_count          INTEGER          NOT NULL,
+    failure_rate           DOUBLE PRECISION,
+    CONSTRAINT ck_pipeline_circuit_breaker_events_stage CHECK (
+        stage IN ('generate', 'validate', 'repair', 'reward', 'reward_repair', 'push')
+    ),
+    CONSTRAINT ck_pipeline_circuit_breaker_events_event CHECK (
+        event IN ('tripped', 'reset')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_circuit_breaker_events_recent
+    ON pipeline_circuit_breaker_events (stage, occurred_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- Remote BuildKit router state (current state per submitted request)
@@ -346,3 +417,85 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_remote_builds_pending
     WHERE route = 'remote' AND status IN ('submitting', 'queued', 'running');
 CREATE INDEX IF NOT EXISTS idx_pipeline_remote_builds_recent
     ON pipeline_remote_builds (updated_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Repository-scoped dependency intermediates
+-- ---------------------------------------------------------------------------
+-- These are immutable SWR images containing dependency work that cannot fit
+-- inside the remote build farm's 600-second request boundary.  Reuse is
+-- deliberately keyed by both dependency input and build definition: a simple
+-- repo -> latest-image mapping can silently mix incompatible lockfiles or
+-- compiler/package-manager setup across PRs.
+CREATE TABLE IF NOT EXISTS buildkit_intermediates (
+    id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    repo               TEXT        NOT NULL,
+    dependency_key     TEXT        NOT NULL,
+    build_key          TEXT        NOT NULL,
+    commit_sha         TEXT,
+    lockfile_path      TEXT,
+    lockfile_sha256    TEXT,
+    status             TEXT        NOT NULL,
+    claim_token        UUID,
+    claim_owner        TEXT,
+    image_ref          TEXT,
+    image_digest       TEXT,
+    source_task_id     TEXT,
+    source_task_version INTEGER,
+    build_seconds      DOUBLE PRECISION,
+    cold_build_seconds DOUBLE PRECISION NOT NULL,
+    dockerfile_sha256  TEXT,
+    metadata           JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    error              TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ready_at           TIMESTAMPTZ,
+    last_used_at       TIMESTAMPTZ,
+    CONSTRAINT uq_buildkit_intermediates_identity
+        UNIQUE (repo, dependency_key, build_key),
+    CONSTRAINT ck_buildkit_intermediates_repo CHECK (
+        repo = lower(repo)
+        AND repo ~ '^[^/[:space:]]+/[^/[:space:]]+$'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_dependency_key CHECK (
+        dependency_key ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_build_key CHECK (
+        build_key ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_lockfile_digest CHECK (
+        lockfile_sha256 IS NULL OR lockfile_sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_dockerfile_digest CHECK (
+        dockerfile_sha256 IS NULL OR dockerfile_sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_image_digest CHECK (
+        image_digest IS NULL OR image_digest ~ '^sha256:[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_status CHECK (
+        status IN ('building', 'ready', 'failed', 'retired')
+    ),
+    CONSTRAINT ck_buildkit_intermediates_cold_threshold CHECK (
+        cold_build_seconds > 600
+    ),
+    CONSTRAINT ck_buildkit_intermediates_build_seconds CHECK (
+        build_seconds IS NULL OR build_seconds > 0
+    ),
+    CONSTRAINT ck_buildkit_intermediates_source_version CHECK (
+        source_task_version IS NULL OR source_task_version > 0
+    ),
+    CONSTRAINT ck_buildkit_intermediates_claim CHECK (
+        (status = 'building' AND claim_token IS NOT NULL AND claim_owner IS NOT NULL)
+        OR status <> 'building'
+    ),
+    CONSTRAINT ck_buildkit_intermediates_ready CHECK (
+        (status = 'ready' AND image_ref IS NOT NULL AND image_digest IS NOT NULL
+         AND ready_at IS NOT NULL)
+        OR status <> 'ready'
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_buildkit_intermediates_repo_ready
+    ON buildkit_intermediates (repo, dependency_key, updated_at DESC)
+    WHERE status = 'ready';
+CREATE INDEX IF NOT EXISTS idx_buildkit_intermediates_building
+    ON buildkit_intermediates (updated_at)
+    WHERE status = 'building';

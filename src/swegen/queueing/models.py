@@ -15,6 +15,7 @@ class PipelineStage(StrEnum):
     VALIDATE = "validate"
     REPAIR = "repair"
     REWARD = "reward"
+    REWARD_REPAIR = "reward_repair"
     PUSH = "push"
 
     @property
@@ -31,7 +32,9 @@ class QueueName(StrEnum):
     VALIDATE = "swegen_validate"
     VALIDATE_REPAIRED = "swegen_validate_repaired"
     REPAIR = "swegen_repair"
+    REPAIR_CANARY = "swegen_repair_canary"
     REWARD = "swegen_reward"
+    REWARD_REPAIR = "swegen_reward_repair"
     PUSH = "swegen_push"
     DEAD = "swegen_dead"
 
@@ -48,6 +51,7 @@ _NEXT_STAGE: dict[PipelineStage, PipelineStage | None] = {
     PipelineStage.VALIDATE: PipelineStage.REWARD,
     PipelineStage.REPAIR: PipelineStage.VALIDATE,
     PipelineStage.REWARD: PipelineStage.PUSH,
+    PipelineStage.REWARD_REPAIR: PipelineStage.VALIDATE,
     PipelineStage.PUSH: None,
 }
 
@@ -56,6 +60,7 @@ _QUEUE_BY_STAGE: dict[PipelineStage, QueueName] = {
     PipelineStage.VALIDATE: QueueName.VALIDATE,
     PipelineStage.REPAIR: QueueName.REPAIR,
     PipelineStage.REWARD: QueueName.REWARD,
+    PipelineStage.REWARD_REPAIR: QueueName.REWARD_REPAIR,
     PipelineStage.PUSH: QueueName.PUSH,
 }
 
@@ -80,7 +85,10 @@ def queues_for_stage(stage: PipelineStage) -> tuple[QueueName, ...]:
 def queue_for_handoff(current: PipelineStage, successor: PipelineStage) -> QueueName:
     """Route Repair validation handoffs ahead of the normal Validate FIFO."""
 
-    if current is PipelineStage.REPAIR and successor is PipelineStage.VALIDATE:
+    if (
+        current in {PipelineStage.REPAIR, PipelineStage.REWARD_REPAIR}
+        and successor is PipelineStage.VALIDATE
+    ):
         return QueueName.VALIDATE_REPAIRED
     return queue_for_stage(successor)
 

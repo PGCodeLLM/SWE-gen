@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swegen-varisat-depbase-derived-build-20260802
+  namespace: swegen-pipeline
+data:
+  Dockerfile: |
+    FROM swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:dep-varisat-b92d6e87-6879d03a5a4b-testbuild-j1
+
+    WORKDIR /app/src
+    RUN git reset --hard
+
+    COPY bug.patch /tmp/bug.patch
+    RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
+
+    RUN cargo test --locked -p varisat --test checker --no-run -j 1
+
+    RUN rm -rf /app/src/.git
+
+    WORKDIR /app/src
+  submit.py: |
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from swegen.tools.remote_buildkit import (
+        DatabaseBuildTracker,
+        RemoteBuildkitClient,
+        RemoteBuildkitConfig,
+        context_digest,
+        create_context_archive,
+    )
+
+    environment_dir = Path("/source-environment")
+    config = RemoteBuildkitConfig.from_env()
+    if config is None:
+        raise RuntimeError("remote BuildKit configuration is disabled")
+
+    digest = context_digest(
+        environment_dir,
+        dockerfile_registry_rewrites=config.dockerfile_registry_rewrites,
+    )
+    with tempfile.TemporaryDirectory(prefix="varisat-depbase-derived-") as temporary_dir:
+        archive_path = Path(temporary_dir) / "context.tar"
+        create_context_archive(
+            environment_dir,
+            archive_path,
+            dockerfile_registry_rewrites=config.dockerfile_registry_rewrites,
+        )
+        result = RemoteBuildkitClient(config).build(
+            archive_path=archive_path,
+            context_digest=digest,
+            environment_name="jix__varisat-55-depbase-testbuild-j1",
+            tracker=DatabaseBuildTracker(),
+            worker_id=os.environ.get("POD_NAME"),
+            node_name=os.environ.get("NODE_NAME"),
+        )
+
+    print(
+        json.dumps(
+            {
+                "context_digest": digest,
+                "request_id": result.request_id,
+                "owner_api_pod": result.owner_api_pod,
+                "image_ref": result.image_ref,
+                "status": result.status_payload.get("status"),
+            },
+            sort_keys=True,
+        )
+    )
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: swegen-varisat-depbase-derived-build-20260802
+  namespace: swegen-pipeline
+  labels:
+    swegen.pgcode/experiment: varisat-depbase-derived-build-20260802
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1200
+  template:
+    metadata:
+      labels:
+        swegen.pgcode/experiment: varisat-depbase-derived-build-20260802
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        swegen.pgcode/node-ip: 7.244.2.110
+      containers:
+        - name: submitter
+          image: swegen-worker:targeted-repair-canary-20260802-0645
+          imagePullPolicy: Never
+          command: ["/app/.venv/bin/python", "/experiment/submit.py"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: source-environment
+              mountPath: /source-environment
+              readOnly: true
+            - name: experiment
+              mountPath: /source-environment/Dockerfile
+              subPath: Dockerfile
+              readOnly: true
+            - name: experiment
+              mountPath: /experiment
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
+      volumes:
+        - name: source-environment
+          hostPath:
+            path: /data/swegen-k3s/workspaces/varisat-depbase-20260802/task/environment
+            type: Directory
+        - name: experiment
+          configMap:
+            name: swegen-varisat-depbase-derived-build-20260802
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+

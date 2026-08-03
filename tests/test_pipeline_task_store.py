@@ -39,7 +39,8 @@ def normalize_sql(sql: str) -> str:
 
 GET_TASK_SQL = normalize_sql(
     """
-    SELECT task_id, task_version, repo, pr, trace_id, state, current_stage
+    SELECT task_id, task_version, repo, pr, trace_id, state, current_stage,
+           last_error, last_reason
     FROM pipeline_tasks
     WHERE task_id = %s AND task_version = %s
     """
@@ -309,6 +310,23 @@ def test_record_stage_activity_upserts_the_exact_claim_identity() -> None:
             ),
         )
     ]
+
+
+def test_record_stage_activity_accepts_isolated_repair_canary_queue() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = make_claim(PipelineStage.REPAIR, queue=QueueName.REPAIR_CANARY)
+    connection = RecordingConnection(CursorResult(rowcount=1))
+
+    TaskStore().record_stage_activity(
+        connection,
+        claim,
+        started_at=STARTED_AT,
+        worker_id="worker-1",
+        node_name="node-a",
+    )
+
+    assert connection.calls[0][1][2] == "repair"
 
 
 def test_heartbeat_stage_activity_updates_only_the_current_worker_claim() -> None:
@@ -799,6 +817,8 @@ def test_materialize_task_files_cleans_staging_after_write_failure(
             "trace_id": TRACE_ID,
             "state": "queued",
             "current_stage": "generate",
+            "last_error": None,
+            "last_reason": None,
         },
         (
             "owner__repo-123",
@@ -808,6 +828,8 @@ def test_materialize_task_files_cleans_staging_after_write_failure(
             TRACE_ID,
             "queued",
             "generate",
+            None,
+            None,
         ),
     ],
 )
@@ -877,12 +899,15 @@ def test_next_stage_attempt_uses_durable_stage_history() -> None:
 
     connection = RecordingConnection([{"next_attempt": 4}])
 
-    assert TaskStore().next_stage_attempt(
-        connection,
-        "owner__repo-123",
-        1,
-        PipelineStage.VALIDATE,
-    ) == 4
+    assert (
+        TaskStore().next_stage_attempt(
+            connection,
+            "owner__repo-123",
+            1,
+            PipelineStage.VALIDATE,
+        )
+        == 4
+    )
     assert connection.calls == [
         (
             NEXT_STAGE_ATTEMPT_SQL,
@@ -894,9 +919,7 @@ def test_next_stage_attempt_uses_durable_stage_history() -> None:
 def test_reserve_repair_candidate_returns_bounded_attempt_message() -> None:
     from swegen.pipeline.task_store import TaskStore
 
-    connection = RecordingConnection(
-        [("owner__repo-123", 1, TRACE_ID, 2)]
-    )
+    connection = RecordingConnection([("owner__repo-123", 1, TRACE_ID, 2)])
 
     message = TaskStore().reserve_repair_candidate(
         connection,
@@ -925,12 +948,43 @@ def test_reserve_repair_candidate_returns_none_after_attempt_cap() -> None:
 
     connection = RecordingConnection([])
 
-    assert TaskStore().reserve_repair_candidate(
+    assert (
+        TaskStore().reserve_repair_candidate(
+            connection,
+            max_repair_attempts=3,
+            event_id=EVENT_ID,
+            enqueued_at=ENQUEUED_AT,
+        )
+        is None
+    )
+
+
+def test_reserve_reward_repair_candidate_returns_bounded_attempt_message() -> None:
+    from swegen.pipeline.task_store import TaskStore
+
+    connection = RecordingConnection([("owner__repo-123", 1, TRACE_ID, 2)])
+
+    message = TaskStore().reserve_reward_repair_candidate(
         connection,
-        max_repair_attempts=3,
+        max_reward_repair_attempts=3,
         event_id=EVENT_ID,
         enqueued_at=ENQUEUED_AT,
-    ) is None
+    )
+
+    assert message == QueueMessage(
+        event_id=EVENT_ID,
+        task_id="owner__repo-123",
+        task_version=1,
+        stage=PipelineStage.REWARD_REPAIR,
+        attempt=2,
+        trace_id=TRACE_ID,
+        enqueued_at=ENQUEUED_AT,
+    )
+    query, params = connection.calls[0]
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert "task.state = 'rejected' AND task.current_stage = 'reward'" in query
+    assert "task.state = 'failed' AND task.current_stage = 'reward_repair'" in query
+    assert params == (3, ENQUEUED_AT)
 
 
 def test_replace_files_deletes_then_inserts_every_file_without_committing() -> None:
@@ -1440,7 +1494,7 @@ def test_stage_results_reject_files_outside_successful_generation(
         execution = StageExecution(execution.status, execution.result, (make_task_file(),))
     connection = RecordingConnection()
 
-    with pytest.raises(TaskFileError, match="only successful generate"):
+    with pytest.raises(TaskFileError, match="only successful file-producing"):
         TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
             connection,
             make_claim(stage),
@@ -1496,14 +1550,17 @@ def test_record_stage_result_accepts_validate_claim_from_repaired_queue() -> Non
     claim = make_claim(PipelineStage.VALIDATE, queue=QueueName.VALIDATE_REPAIRED)
     connection = RecordingConnection(inserted_stage_result(claim), CursorResult(rowcount=1))
 
-    assert TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
-        connection,
-        claim,
-        StageExecution.succeeded({"nop_reward": 0, "oracle_reward": 1}),
-        started_at=STARTED_AT,
-        worker_id="worker-1",
-        node_name="node-a",
-    ) is True
+    assert (
+        TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+            connection,
+            claim,
+            StageExecution.succeeded({"nop_reward": 0, "oracle_reward": 1}),
+            started_at=STARTED_AT,
+            worker_id="worker-1",
+            node_name="node-a",
+        )
+        is True
+    )
 
 
 def test_record_stage_result_requires_exactly_one_matching_task_update() -> None:

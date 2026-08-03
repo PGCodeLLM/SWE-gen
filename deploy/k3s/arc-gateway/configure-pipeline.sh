@@ -2,7 +2,7 @@
 set -euo pipefail
 
 namespace="${SWEGEN_NAMESPACE:-swegen-pipeline}"
-model_secret="${SWEGEN_ARC_MODEL_SECRET:-swegen-model-credentials-pooled-20260801}"
+model_secret="${SWEGEN_ARC_MODEL_SECRET:-swegen-model-credentials-gpt53-spark-20260802}"
 reward_secret="${SWEGEN_ARC_REWARD_SECRET:-swegen-reward-credentials-arcyleung-20260801}"
 gateway_url="${SWEGEN_ARC_GATEWAY_URL:-http://swegen-arc-gateway.swegen-pipeline.svc.cluster.local:3130}"
 

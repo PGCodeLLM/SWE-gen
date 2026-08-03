@@ -2,6 +2,8 @@
 set -euo pipefail
 
 namespace="${SWEGEN_K3S_NAMESPACE:-swegen-pipeline}"
+model_secret_name="${SWEGEN_MODEL_SECRET_NAME:-swegen-model-credentials-v2}"
+generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-moedsa-20260802-v2}"
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_directory}/../.." && pwd)"
 runtime_root="${SWEGEN_RUNTIME_ROOT:-/data/work/slurm-swegen/slurm-runtime/20260716-sol-max-full-16w/workspace}"
@@ -53,6 +55,30 @@ merged_docker_config="${temporary_directory}/docker-config.json"
 normalize_env_file "${credentials_env}" "${normalized_credentials}"
 normalize_env_file "${proxy_env}" "${normalized_proxy}"
 normalize_env_file "${reward_env}" "${normalized_reward}"
+
+# Model credentials have their own immutable Secret. Keep them out of the
+# generic proxy Secret so envFrom ordering cannot silently replace the model
+# endpoint or API key in newly deployed workers.
+python3 - "${normalized_proxy}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+blocked_prefixes = ("ANTHROPIC_", "CLAUDE_", "OPENAI_", "SWEGEN_CLAUDE_")
+kept: list[str] = []
+for raw_line in path.read_text(encoding="utf-8").splitlines():
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        kept.append(raw_line)
+        continue
+    key = stripped.split("=", 1)[0].strip()
+    if key.startswith(blocked_prefixes):
+        continue
+    kept.append(raw_line)
+path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+os.chmod(path, 0o600)
+PY
 
 python3 - "${docker_config}" "${normalized_proxy}" "${remote_buildkit_registry}" <<'PY'
 import base64
@@ -119,6 +145,9 @@ if parsed.scheme not in {"http", "https"} or not parsed.netloc or not api_key:
     raise SystemExit(f"{model} requires a valid api_base and non-empty api_key")
 anthropic_base = api_base.removesuffix("/v1")
 values = {
+    "OPENAI_API_KEY": api_key,
+    "OPENAI_BASE_URL": api_base,
+    "OPENAI_MODEL": model,
     "ANTHROPIC_API_KEY": api_key,
     "ANTHROPIC_AUTH_TOKEN": api_key,
     "ANTHROPIC_BASE_URL": anthropic_base,
@@ -194,12 +223,72 @@ else
     kubectl=(sudo k3s kubectl)
 fi
 
+ensure_immutable_env_secret() {
+    local secret_name="$1"
+    local env_file="$2"
+    local desired_json="${temporary_directory}/${secret_name}.desired.json"
+    local existing_json="${temporary_directory}/${secret_name}.existing.json"
+
+    "${kubectl[@]}" -n "${namespace}" create secret generic "${secret_name}" \
+        --from-env-file="${env_file}" \
+        --dry-run=client -o json > "${desired_json}"
+    python3 - "${desired_json}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+document = json.loads(path.read_text(encoding="utf-8"))
+document["immutable"] = True
+metadata = document.setdefault("metadata", {})
+metadata["labels"] = {
+    **metadata.get("labels", {}),
+    "app.kubernetes.io/managed-by": "swegen-platform",
+    "swegen.pgcode/credential-scope": "model",
+}
+path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
+os.chmod(path, 0o600)
+PY
+
+    if "${kubectl[@]}" -n "${namespace}" get secret "${secret_name}" \
+        -o json > "${existing_json}" 2>/dev/null
+    then
+        python3 - "${existing_json}" "${desired_json}" "${secret_name}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+existing_path, desired_path = map(Path, sys.argv[1:3])
+secret_name = sys.argv[3]
+existing = json.loads(existing_path.read_text(encoding="utf-8"))
+desired = json.loads(desired_path.read_text(encoding="utf-8"))
+existing_data = existing.get("data", {})
+desired_data = desired.get("data", {})
+if existing_data != desired_data:
+    differing = sorted(
+        key
+        for key in set(existing_data) | set(desired_data)
+        if existing_data.get(key) != desired_data.get(key)
+    )
+    raise SystemExit(
+        f"Immutable Secret {secret_name} differs for keys: {', '.join(differing)}. "
+        "Use the documented credential-rotation procedure instead of overwriting it."
+    )
+PY
+        "${kubectl[@]}" -n "${namespace}" patch secret "${secret_name}" \
+            --type=merge \
+            -p '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"swegen-platform","swegen.pgcode/credential-scope":"model"},"annotations":{"kubectl.kubernetes.io/last-applied-configuration":null}},"immutable":true}'
+    else
+        "${kubectl[@]}" -n "${namespace}" create -f "${desired_json}"
+    fi
+}
+
 "${kubectl[@]}" create namespace "${namespace}" \
     --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
 
-"${kubectl[@]}" -n "${namespace}" create secret generic swegen-model-credentials \
-    --from-env-file="${normalized_credentials}" \
-    --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
+ensure_immutable_env_secret "${model_secret_name}" "${normalized_credentials}"
+ensure_immutable_env_secret "${generate_glm_secret_name}" "${repair_model_env}"
 
 "${kubectl[@]}" -n "${namespace}" create secret generic swegen-repair-model-credentials \
     --from-env-file="${repair_model_env}" \
@@ -241,7 +330,8 @@ unset postgres_password
     --dry-run=client -o yaml | "${kubectl[@]}" apply -f -
 
 "${kubectl[@]}" -n "${namespace}" get secret \
-    swegen-model-credentials \
+    "${model_secret_name}" \
+    "${generate_glm_secret_name}" \
     swegen-repair-model-credentials \
     swegen-runtime-proxy \
     swegen-reward-credentials \

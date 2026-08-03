@@ -7,6 +7,7 @@ read -r -a nodes <<< "${nodes_text}"
 ssh_user="${SWEGEN_K3S_SSH_USER:-root}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 build_ca="${SWEGEN_BUILD_CA:-/etc/ssl/certs/ca-certificates.crt}"
+worker_dockerfile="${SWEGEN_WORKER_DOCKERFILE:-${repo_root}/deploy/k3s/Dockerfile.worker}"
 temporary_directory="$(mktemp -d)"
 archive="${temporary_directory}/swegen-worker.tar"
 remote_staging_archive="/tmp/swegen-worker-current.tar"
@@ -45,6 +46,10 @@ if [[ ! -r "${build_ca}" ]]; then
     printf 'Build CA bundle is not readable: %s\n' "${build_ca}" >&2
     exit 1
 fi
+if [[ ! -r "${worker_dockerfile}" ]]; then
+    printf 'Worker Dockerfile is not readable: %s\n' "${worker_dockerfile}" >&2
+    exit 1
+fi
 
 docker build \
     --build-arg HTTP_PROXY \
@@ -54,7 +59,7 @@ docker build \
     --build-arg https_proxy \
     --build-arg no_proxy \
     --secret "id=combined_ca,src=${build_ca}" \
-    --file "${repo_root}/deploy/k3s/Dockerfile.worker" \
+    --file "${worker_dockerfile}" \
     --tag "${image}" \
     "${repo_root}"
 docker save --output "${archive}" "${image}"

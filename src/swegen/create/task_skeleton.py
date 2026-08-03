@@ -55,18 +55,23 @@ def generate_dockerfile(
         proxy_ca_copy = f"COPY {proxy_ca_filename} /tmp/{proxy_ca_filename}\n\n"
         proxy_ca_install = f"""    && mkdir -p /usr/local/share/ca-certificates \\
     && cp /tmp/{proxy_ca_filename} /usr/local/share/ca-certificates/{proxy_ca_filename} \\
+    && chmod 0644 /usr/local/share/ca-certificates/{proxy_ca_filename} \\
     && update-ca-certificates \\
+    && cat /tmp/{proxy_ca_filename} >> /etc/ssl/certs/ca-certificates.crt \\
     && rm /tmp/{proxy_ca_filename} \\
 """
-        proxy_ca_environment = f"""ENV NODE_EXTRA_CA_CERTS={trusted_ca_path} \\
-    NPM_CONFIG_CAFILE={trusted_ca_path}
+        proxy_ca_environment = f"""ENV GIT_SSL_CAINFO={trusted_ca_path} \\
+    UV_NATIVE_TLS=true \\
+    NODE_EXTRA_CA_CERTS={trusted_ca_path} \\
+    NPM_CONFIG_CAFILE={trusted_ca_path} \\
+    NPM_CONFIG_LEGACY_PEER_DEPS=true
 
 """
 
     return f"""FROM ubuntu:24.04
 
 # Base system packages (common to all languages)
-{proxy_ca_copy}RUN apt-get update && apt-get install -y \\
+{proxy_ca_copy}RUN apt-get -o Acquire::Retries=5 update && apt-get install -y \\
     git \\
     curl \\
     ca-certificates \\
@@ -131,9 +136,14 @@ WORKDIR /app/src
 # If install/build steps touched tracked files, reset them so bug.patch applies cleanly,
 RUN git reset --hard
 
-# Apply bug.patch to revert to buggy state (BASE)
+# Apply bug.patch to revert to buggy state (BASE).
+# bug.patch comes from `git diff` on the host, so it carries the repository's
+# stored line endings. A repo whose .gitattributes requests a CRLF checkout
+# produces a working tree those hunks no longer match, and `patch` rejects them
+# outright ("different line endings"). `git apply --ignore-whitespace` tolerates
+# that while still refusing a patch that genuinely does not apply.
 COPY bug.patch /tmp/bug.patch
-RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
+RUN git apply --ignore-whitespace /tmp/bug.patch && rm /tmp/bug.patch
 
 # TODO: Rebuild after applying bug.patch if needed
 # For compiled languages (TypeScript, Rust, Go, Java), you MUST rebuild after patching
@@ -248,12 +258,21 @@ exit "$test_status"
 
 def generate_solve_sh() -> str:
     """Generate solution/solve.sh script (same for all tasks)."""
+    # fix.patch has to survive the same CRLF checkout mismatch bug.patch does,
+    # but solve.sh runs after `rm -rf .git`, so prefer `git apply` (it works
+    # outside a repository) and keep `patch` as the fallback for images without
+    # git installed. The oracle failing here reads as an unsolvable task, so a
+    # whitespace mismatch must not be the reason.
     return """#!/bin/bash
 
 set -euo pipefail
 cd /app/src
 
-patch -p1 < /solution/fix.patch
+if command -v git >/dev/null 2>&1; then
+    git apply --ignore-whitespace /solution/fix.patch
+else
+    patch -p1 < /solution/fix.patch
+fi
 """
 
 

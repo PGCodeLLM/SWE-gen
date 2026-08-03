@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swegen-revault-depbase-precompile-20260802
+  namespace: swegen-pipeline
+data:
+  Dockerfile: |
+    FROM swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:dep-revault-gui-b3ff4588-2fc887c39ebe
+
+    WORKDIR /app/src
+
+    # Materialize the Rust test build once outside the farm's 600-second
+    # request boundary. One Cargo job keeps peak rustc memory bounded while
+    # preserving the task's source and test semantics.
+    RUN cargo test --locked --no-run -j 1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: swegen-revault-depbase-precompile-20260802
+  namespace: swegen-pipeline
+  labels:
+    swegen.pgcode/experiment: revault-depbase-precompile-20260802
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        swegen.pgcode/experiment: revault-depbase-precompile-20260802
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      nodeSelector:
+        swegen.pgcode/node-ip: 7.244.2.110
+      containers:
+        - name: builder
+          image: swegen-worker:targeted-repair-canary-20260802-0645
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              set -eu;
+              docker build --progress=plain
+              --tag
+              swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:dep-revault-gui-b3ff4588-2fc887c39ebe-testbuild-j1
+              /experiment;
+              docker push
+              swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox/public/swe-gen/feature-implementation/generated:dep-revault-gui-b3ff4588-2fc887c39ebe-testbuild-j1
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-runtime-proxy
+          env:
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: default
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1200Mi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+            - name: experiment
+              mountPath: /experiment
+              readOnly: true
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400
+        - name: experiment
+          configMap:
+            name: swegen-revault-depbase-precompile-20260802
+

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 from subprocess import CompletedProcess, run
 
 import pytest
 
 
-def evaluate_chart_scroll_target(saved: int | None, max_scroll: int) -> int:
+def evaluate_chart_scroll_target(saved: dict[str, object] | None, max_scroll: int) -> int:
     from swegen.dashboard.server import HTML
 
     match = re.search(
@@ -14,7 +15,7 @@ def evaluate_chart_scroll_target(saved: int | None, max_scroll: int) -> int:
         HTML,
     )
     assert match is not None
-    saved_javascript = "undefined" if saved is None else str(saved)
+    saved_javascript = "undefined" if saved is None else json.dumps(saved)
     completed = run(
         [
             "node",
@@ -27,6 +28,72 @@ def evaluate_chart_scroll_target(saved: int | None, max_scroll: int) -> int:
         text=True,
     )
     return int(completed.stdout)
+
+
+def evaluate_chart_scroll_snapshot(
+    scroll_left: int,
+    scroll_width: int,
+    client_width: int,
+) -> dict[str, object]:
+    from swegen.dashboard.server import HTML
+
+    definition = (
+        "const chartScrollSnapshot="
+        + HTML.split("const chartScrollSnapshot=", 1)[1].split("function setText", 1)[0]
+    )
+    completed = run(
+        [
+            "node",
+            "-e",
+            definition
+            + "process.stdout.write(JSON.stringify(chartScrollSnapshot("
+            + f"{{scrollLeft:{scroll_left},scrollWidth:{scroll_width},"
+            + f"clientWidth:{client_width}}})));",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def evaluate_chart_restore_sequence(saved: dict[str, object] | None) -> dict[str, object]:
+    from swegen.dashboard.server import HTML
+
+    target = re.search(
+        r"function chartScrollTarget\(saved,maxScroll\)\{[^}]+\}",
+        HTML,
+    )
+    assert target is not None
+    restore = (
+        "function restoreChartScroll"
+        + HTML.split("function restoreChartScroll", 1)[1].split("function positionChartTooltip", 1)[
+            0
+        ]
+    )
+    saved_javascript = "{}" if saved is None else json.dumps({"validate": saved})
+    script = f"""
+const uiState={{chartScroll:{saved_javascript}}};
+const callbacks=[];
+const requestAnimationFrame=callback=>callbacks.push(callback);
+const chart={{dataset:{{stage:'validate'}},scrollWidth:200,clientWidth:200,scrollLeft:0}};
+{target.group(0)}
+{restore}
+restoreChartScroll(chart,'validate');
+callbacks.shift()();
+chart.scrollWidth=617;
+callbacks.shift()();
+chart.scrollWidth=705;
+callbacks.shift()();
+process.stdout.write(JSON.stringify({{left:chart.scrollLeft,state:uiState.chartScroll.validate,restoring:chart.dataset.restoringScroll||null}}));
+"""
+    completed = run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
 
 
 def evaluate_cpu_triple(
@@ -55,12 +122,64 @@ def evaluate_cpu_triple(
     return completed.stdout
 
 
+def evaluate_pod_phases(phases: dict[str, int] | None, evicted: int) -> str:
+    from swegen.dashboard.server import HTML
+
+    match = re.search(r"const formatPodPhases=.*?\};", HTML)
+    assert match is not None
+    completed = run(
+        [
+            "node",
+            "-e",
+            match.group(0)
+            + f"process.stdout.write(formatPodPhases({json.dumps(phases)},{evicted}));",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+def evaluate_chart_axis_helpers(
+    point_count: int,
+    chart_width: int,
+    count: int,
+) -> tuple[int, str, str]:
+    from swegen.dashboard.server import HTML
+
+    definitions = []
+    for name in ("compactChartCount", "compactChartTimestamp", "chartTickEvery"):
+        match = re.search(rf"const {name}=.*?;", HTML)
+        assert match is not None
+        definitions.append(match.group(0))
+    completed = run(
+        [
+            "node",
+            "-e",
+            "".join(definitions)
+            + "process.stdout.write(JSON.stringify(["
+            + f"chartTickEvery({point_count},{chart_width}),"
+            + f"compactChartCount({count}),"
+            + "compactChartTimestamp('2026-07-31T12:30:00Z')]));",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    import json
+
+    tick_every, compact_count, timestamp = json.loads(completed.stdout)
+    return int(tick_every), str(compact_count), str(timestamp)
+
+
 def evaluate_chart_tooltip() -> dict[str, object]:
     from swegen.dashboard.server import HTML
 
-    functions = "function positionChartTooltip" + HTML.split(
-        "function positionChartTooltip", 1
-    )[1].split("function scaleControls", 1)[0]
+    functions = (
+        "function positionChartTooltip"
+        + HTML.split("function positionChartTooltip", 1)[1].split("function scaleControls", 1)[0]
+    )
     script = """
 const tooltip={hidden:true,textContent:'',style:{},offsetWidth:100,offsetHeight:30};
 const el=id=>tooltip;
@@ -94,10 +213,37 @@ def test_chart_first_render_defaults_to_the_rightmost_position() -> None:
 def test_chart_refresh_preserves_a_user_selected_scroll_position() -> None:
     from swegen.dashboard.server import HTML
 
-    assert evaluate_chart_scroll_target(137, 417) == 137
-    assert evaluate_chart_scroll_target(0, 417) == 0
+    saved = {"left": 137, "followLatest": False}
+    assert evaluate_chart_scroll_target(saved, 417) == 137
+    assert evaluate_chart_scroll_target({"left": 0, "followLatest": False}, 417) == 0
+    assert evaluate_chart_scroll_target(saved, 100) == 100
     assert "hasOwnProperty.call(uiState.chartScroll,stage)" in HTML
-    assert "uiState.chartScroll[stage]=chart.scrollLeft" in HTML
+    assert "uiState.chartScroll[stage]=chartScrollSnapshot(chart)" in HTML
+    assert "chart.dataset.restoringScroll!=='true'" in HTML
+
+
+def test_chart_refresh_keeps_follow_latest_pinned_to_new_right_edge() -> None:
+    from swegen.dashboard.server import HTML
+
+    at_right = evaluate_chart_scroll_snapshot(417, 617, 200)
+    historical = evaluate_chart_scroll_snapshot(137, 617, 200)
+
+    assert at_right == {"left": 417, "followLatest": True}
+    assert historical == {"left": 137, "followLatest": False}
+    assert evaluate_chart_scroll_target(at_right, 505) == 505
+    assert evaluate_chart_scroll_target(historical, 505) == 137
+    assert evaluate_chart_restore_sequence(at_right) == {
+        "left": 505,
+        "state": {"left": 505, "followLatest": True},
+        "restoring": None,
+    }
+    assert evaluate_chart_restore_sequence(historical) == {
+        "left": 137,
+        "state": {"left": 137, "followLatest": False},
+        "restoring": None,
+    }
+    assert "requestAnimationFrame(()=>requestAnimationFrame" in HTML
+    assert "apply();requestAnimationFrame(()=>{apply()" in HTML
 
 
 def test_chart_tooltip_appears_immediately_and_hides_on_leave() -> None:
@@ -118,6 +264,34 @@ def test_chart_tooltip_appears_immediately_and_hides_on_leave() -> None:
     assert "bucket.addEventListener('mouseenter'" in HTML
     assert "bucket.addEventListener('mousemove',positionChartTooltip)" in HTML
     assert 'id="chart-tooltip"' in HTML
+
+
+def test_chart_axes_show_counts_and_compact_timestamp_ticks() -> None:
+    from swegen.dashboard.server import HTML
+
+    tick_every, compact_count, timestamp = evaluate_chart_axis_helpers(24, 240, 12_500)
+
+    assert tick_every == 6
+    assert compact_count == "12.5k"
+    assert re.fullmatch(r"\d{2}:\d{2}", timestamp)
+    assert "chart.className='chart'" in HTML
+    assert "yAxis.className='chart-y-axis'" in HTML
+    assert "xTick.className='x-tick'" in HTML
+    assert "compactChartTimestamp(row.bucket)" in HTML
+    assert ".x-tick::before{" in HTML
+
+
+def test_chart_timestamp_density_responds_to_available_width() -> None:
+    from swegen.dashboard.server import HTML
+
+    narrow, _, _ = evaluate_chart_axis_helpers(24, 240, 950)
+    wide, compact_count, _ = evaluate_chart_axis_helpers(24, 960, 1_250_000)
+
+    assert narrow == 6
+    assert wide == 2
+    assert compact_count == "1.3m"
+    assert "new ResizeObserver(()=>updateChartTicks(chart))" in HTML
+    assert "index!==0&&index!==ticks.length-1" in HTML
 
 
 def test_cpu_triple_formats_used_allocated_and_allocatable_in_order() -> None:
@@ -191,11 +365,25 @@ def test_local_buildkit_slots_are_shown_per_node_with_unknown_waiters() -> None:
     from swegen.dashboard.server import HTML
 
     assert "Local BuildKit slots / waiters" in HTML
-    assert "formatBuildSlots(node.build_slots)" in HTML
+    assert "buildSlotControls(workload,node.build_slots)" in HTML
+    assert "setText(status,formatBuildSlots(slots))" in HTML
     assert "${slots.used}/${slots.total} used" in HTML
     assert "waiters ${slots.waiters??'unknown'}" in HTML
     assert "Wrapper does not persist waiter depth; unknown is explicit." in HTML
     assert "td.colSpan=5" in HTML
+
+
+def test_local_buildkit_slots_have_compact_per_node_apply_controls() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert 'id="build-slot-feedback"' in HTML
+    assert "function buildSlotControls(node,slots)" in HTML
+    assert "input.type='number';input.min='1'" in HTML
+    assert "setText(button,'Apply')" in HTML
+    assert ".slot-controls{display:grid;grid-template-columns:72px 52px" in HTML
+    assert "fetch('/api/pipeline/build-slots'" in HTML
+    assert "JSON.stringify({node,slots})" in HTML
+    assert "in-flight builds on retired slots finish normally" in HTML
 
 
 def test_top_stage_cards_use_display_names_and_omit_dead_letters() -> None:
@@ -213,6 +401,38 @@ def test_top_stage_cards_display_lifetime_processed_count() -> None:
 
     assert "pg.throughput?.lifetime_processed?.[stage]" in HTML
     assert "lifetime processed <b>${lifetime}</b>" in HTML
+
+
+def test_top_stage_cards_separate_fresh_activity_from_queue_leases() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert "pg.activity?.stages?.[stage]" in HTML
+    assert "active <b>${a.fresh||0}</b>" in HTML
+    assert "leased ${q.in_flight||0}" in HTML
+    assert "stale ${stale}" in HTML
+
+
+def test_top_stage_cards_show_pod_phases_instead_of_a_ready_fraction() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert '<div class="big">${w.pod_phases?.Running||0} Running</div>' in HTML
+    assert "formatPodPhases(w.pod_phases,w.evicted||0)" in HTML
+    assert "desired <b>${w.desired||0}</b>" in HTML
+    assert "${w.ready||0}/${w.desired||0} ready" not in HTML
+    assert "w.pods_ready" not in HTML
+
+
+def test_pod_phase_line_lists_non_running_states_and_buckets_evictions() -> None:
+    phases = {"Running": 122, "Pending": 6, "Terminating": 2, "Succeeded": 12}
+
+    assert evaluate_pod_phases(phases, 12_474) == (
+        "Pending 6 · Terminating 2 · Succeeded 12 · Evicted 12474"
+    )
+    assert evaluate_pod_phases({"Running": 160}, 0) == "no other pod states"
+    assert evaluate_pod_phases({}, 0) == "no other pod states"
+    assert evaluate_pod_phases(None, 0) == "no other pod states"
+    # A scaled-to-zero stage with orphaned activity rows must read as zero pods, not "0/0 ready".
+    assert evaluate_pod_phases({}, 54) == "Evicted 54"
 
 
 def test_validation_and_repair_share_a_visual_retry_group_without_arrows() -> None:
@@ -268,11 +488,13 @@ def test_stage_charts_are_embedded_with_the_requested_placements() -> None:
     assert "stageCard('validate',pg,k,maxReplicas,true)" in HTML
     assert "stageCard('repair',pg,k,maxReplicas,true)" in HTML
     assert ".stage-card-horizontal{display:grid;grid-template-columns:240px minmax(0,1fr)" in HTML
-    assert ".stage-card:not(.stage-card-horizontal) .stage-chart-wrap{flex:1;margin-top:10px" in HTML
+    assert (
+        ".stage-card:not(.stage-card-horizontal) .stage-chart-wrap{flex:1;margin-top:10px" in HTML
+    )
     assert ".stage-card-horizontal .stage-chart-wrap{border-left:1px solid var(--line)" in HTML
     assert ".stage-card{display:flex;flex-direction:column;padding:11px}" in HTML
     assert ".validation-loop{" in HTML and "align-content:stretch" in HTML
-    assert "15m outcomes · last 6h" in HTML
+    assert "15m outcomes · last 48h" in HTML
 
 
 def test_stage_charts_grow_without_centering_margins() -> None:
@@ -280,7 +502,8 @@ def test_stage_charts_grow_without_centering_margins() -> None:
 
     assert ".stage-chart-wrap{min-width:0;min-height:0;display:flex;flex-direction:column}" in HTML
     assert ".stage-card:not(.stage-card-horizontal) .stage-chart-wrap{flex:1" in HTML
-    assert ".chart{min-height:96px;flex:1" in HTML
+    assert ".chart-frame{min-width:0;min-height:112px;flex:1" in HTML
+    assert ".chart{min-height:112px;min-width:0" in HTML
     assert "bar.style.height=`${Math.max(2,total/max*100)}%`" in HTML
     assert "justify-content:center;padding:11px" not in HTML
 
@@ -372,6 +595,86 @@ def test_scaler_uses_allowlisted_kubectl_argument_arrays() -> None:
             "--replicas=4",
         ],
     ]
+
+
+def test_build_slot_controller_uses_snapshot_allowlist_and_atomic_exec() -> None:
+    from swegen.dashboard.server import K3sBuildSlotController
+
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        commands.append(command)
+        return CompletedProcess(command, 0, stdout='{"slots":48}\n', stderr="")
+
+    nodes = [
+        {
+            "name": "node-a",
+            "build_slot_max": 192,
+            "build_slot_probe_pod": "swegen-buildkit-pruner-a",
+        }
+    ]
+    applied = K3sBuildSlotController(runner=runner).update(
+        "node-a",
+        48,
+        nodes=nodes,
+    )
+
+    assert applied == {
+        "node": "node-a",
+        "slots": 48,
+        "max_slots": 192,
+        "controller_pod": "swegen-buildkit-pruner-a",
+    }
+    assert commands[0][:7] == [
+        "kubectl",
+        "--request-timeout=10s",
+        "-n",
+        "swegen-pipeline",
+        "exec",
+        "swegen-buildkit-pruner-a",
+        "--",
+    ]
+    assert commands[0][-1] == "48"
+    assert "os.replace(tmp,d/'count')" in commands[0][-2]
+    assert "touch(exist_ok=True)" in commands[0][-2]
+
+
+@pytest.mark.parametrize(
+    ("node", "slots", "message"),
+    [
+        ("unknown", 32, "unknown node"),
+        ("node-a", 0, "between 1 and 192"),
+        ("node-a", 193, "between 1 and 192"),
+        ("node-a", True, "slots must be an integer"),
+    ],
+)
+def test_build_slot_controller_rejects_unallowlisted_or_invalid_updates(
+    node: object,
+    slots: object,
+    message: str,
+) -> None:
+    from swegen.dashboard.server import K3sBuildSlotController
+
+    nodes = [
+        {
+            "name": "node-a",
+            "build_slot_max": 192,
+            "build_slot_probe_pod": "swegen-buildkit-pruner-a",
+        }
+    ]
+    with pytest.raises(ValueError, match=message):
+        K3sBuildSlotController.plan(node, slots, nodes=nodes)
+
+
+def test_build_slot_controller_rejects_node_without_controller_pod() -> None:
+    from swegen.dashboard.server import K3sBuildSlotController
+
+    with pytest.raises(ValueError, match="controller is unavailable"):
+        K3sBuildSlotController.plan(
+            "node-a",
+            32,
+            nodes=[{"name": "node-a", "build_slot_max": 192}],
+        )
 
 
 def test_cache_retains_last_good_capacity_without_dropping_below_configured() -> None:

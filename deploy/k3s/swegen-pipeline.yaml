@@ -31,16 +31,27 @@ data:
   SWEGEN_GITHUB_RETRY_BASE_SECONDS: "10"
   SWEGEN_GITHUB_MAX_WAIT_SECONDS: "300"
   SWEGEN_HARBOR_TIMEOUT_SECONDS: "3600"
+  # Total deliveries per stage message: one initial attempt plus one retry.
+  # Most stage failures are deterministic, so a third delivery mostly re-burns
+  # build capacity that newly enqueued tasks are waiting on.
+  SWEGEN_MAX_DELIVERIES: "2"
+  # Validator failures are terminal for this pass. Retry/repaired tasks are
+  # quarantined and explicitly resubmitted in a later second-pass campaign.
+  SWEGEN_VALIDATE_MAX_DELIVERIES: "1"
   SWEGEN_REPAIR_TIMEOUT_SECONDS: "14400"
   SWEGEN_MAX_REPAIR_ATTEMPTS: "3"
+  SWEGEN_REWARD_REPAIR_TIMEOUT_SECONDS: "14400"
+  SWEGEN_MAX_REWARD_REPAIR_ATTEMPTS: "3"
+  SWEGEN_REWARD_ENDPOINT: https://arcyleung-ubuntu.tailb940e6.ts.net
   SWEGEN_REWARD_PRIMARY_MODEL: gpt-5.6-sol
   SWEGEN_REWARD_FALLBACK_MODEL: gpt-5.6-sol
   SWEGEN_SWR_HOST: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
   SWEGEN_SWR_REPOSITORY: swesandbox/public/swe-gen/feature-implementation/generated
   SWEGEN_SWR_REGISTRY: platform
   SWEGEN_SWR_SUFFIX: _platform
-  # Enable hybrid after the remote farm's server-side SWR credentials pass a push smoke.
-  SWEGEN_BUILD_ROUTER_MODE: hybrid
+  # Fill node-local BuildKit slots first, then overflow immediately to the
+  # remote farm rather than waiting in the local slot wrapper.
+  SWEGEN_BUILD_ROUTER_MODE: local_overflow
   SWEGEN_REMOTE_BUILDKIT_URL: http://7.156.122.134:32083
   SWEGEN_REMOTE_BUILDKIT_REGISTRY: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
   SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox
@@ -50,13 +61,23 @@ data:
   SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
   SWEGEN_REMOTE_BUILDKIT_PERCENT: "75"
   SWEGEN_REMOTE_BUILDKIT_TIMEOUT_SECONDS: "3600"
-  SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL: "true"
+  # Pilot repository affinity. Values are backend pools; the client hashes the
+  # exact task context within the pool and allows the farm to fall back if the
+  # preferred backend is unavailable.
+  SWEGEN_REMOTE_BUILDKIT_REPO_BACKEND_MAP: '{"runbox/runbox7":["buildkit-worker-46"]}'
+  # A remote timeout/network failure is recorded for a later second pass. It
+  # must not re-enter the already saturated node-local BuildKit queue.
+  SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL: "false"
+  # Build containers inherit the daemon's proxy settings but not NO_PROXY, so
+  # apt must reach these hosts directly. mirrors.aliyun.com only answers
+  # through the corporate proxy, which returns 504 under build load; the
+  # internal mirror serves every suite directly in well under a second.
   SWEGEN_UBUNTU_ARCHIVE_MIRROR: http://mirrors.tools.huawei.com/ubuntu/
   SWEGEN_UBUNTU_CDIMAGE_MIRROR: http://mirrors.tools.huawei.com/ubuntu-cdimage/
   SWEGEN_UBUNTU_CLOUD_IMAGES_MIRROR: http://mirrors.tools.huawei.com/ubuntu-cloud-images/
   SWEGEN_UBUNTU_PORTS_MIRROR: http://mirrors.tools.huawei.com/ubuntu-ports/
   SWEGEN_UBUNTU_RELEASES_MIRROR: http://mirrors.tools.huawei.com/ubuntu-releases/
-  SWEGEN_NPM_REGISTRY: http://mirrors.tools.huawei.com/npm/
+  SWEGEN_NPM_REGISTRY: https://registry.npmmirror.com/
   SWEGEN_NO_PROXY: ".myhuaweicloud.com,.huaweicloud.com,.huawei.com,127.0.0.1,localhost,7.156.122.134,7.237.95.141,7.244.3.251,7.244.3.200,7.244.3.78,7.244.2.110,7.244.1.209,10.42.0.0/16,10.43.0.0/16,100.*,10.*"
 ---
 apiVersion: apps/v1
@@ -65,9 +86,12 @@ metadata:
   name: swegen-generate
   namespace: swegen-pipeline
 spec:
-  replicas: 48
+  replicas: 32
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 16
+      maxUnavailable: 16
   selector:
     matchLabels:
       app.kubernetes.io/name: swegen-worker
@@ -79,12 +103,15 @@ spec:
         swegen.pgcode/stage: generate
     spec:
       automountServiceAccountToken: false
+      # Generation is the one stage left on a long grace: it must exceed
+      # SWEGEN_GENERATE_TIMEOUT_SECONDS (14400) so an in-flight Claude Code run
+      # can finish rather than be killed mid-task.
       terminationGracePeriodSeconds: 18000
       nodeSelector:
-        swegen.pgcode/node-ip: 7.244.2.110
+        swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: worker
-          image: swegen-worker:e2e
+          image: swegen-worker:github-auth-fix-20260802-1744
           imagePullPolicy: Never
           args: ["--stage", "generate"]
           envFrom:
@@ -95,7 +122,7 @@ spec:
             - secretRef:
                 name: swegen-runtime-proxy
             - secretRef:
-                name: swegen-model-credentials
+                name: swegen-model-credentials-glm52-moedsa-20260802-v2
           env:
             - name: POD_NAME
               valueFrom:
@@ -118,7 +145,7 @@ spec:
           resources:
             requests:
               cpu: 500m
-              memory: 1536Mi
+              memory: 200Mi
             limits:
               cpu: "16"
               memory: 32Gi
@@ -155,7 +182,7 @@ metadata:
   name: swegen-validate
   namespace: swegen-pipeline
 spec:
-  replicas: 96
+  replicas: 180
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -172,7 +199,7 @@ spec:
         swegen.pgcode/stage: validate
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 300
+      terminationGracePeriodSeconds: 600
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
@@ -183,7 +210,7 @@ spec:
               swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:package-mirrors-20260731
+          image: swegen-worker:repo-affinity-runbox-20260802-0049
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           envFrom:
@@ -282,10 +309,138 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: swegen-reward-repair
+  namespace: swegen-pipeline
+spec:
+  # Held at 0: swegen-worker:reward-repair-20260731 is not present on any node
+  # (imagePullPolicy is Never, so the Pods sit in ErrImageNeverPull) and the
+  # swegen_reward_repair PGMQ queue does not exist yet. Build and import the
+  # image, create the queue, then scale up.
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 20%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-worker
+      swegen.pgcode/stage: reward_repair
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-worker
+        swegen.pgcode/stage: reward_repair
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: worker
+          image: swegen-worker:reward-repair-20260731
+          imagePullPolicy: Never
+          args: ["--stage", "reward_repair"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+            - secretRef:
+                name: swegen-repair-model-credentials
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: "default"
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1200Mi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/swegen-k3s/workspaces
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/swegen-k3s/workspaces
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: swegen-repair
   namespace: swegen-pipeline
 spec:
-  replicas: 4
+  replicas: 64
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -302,10 +457,21 @@ spec:
         swegen.pgcode/stage: repair
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 18000
+      terminationGracePeriodSeconds: 600
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          # Keep Repair balanced across eligible nodes, but do not pin the
+          # entire deployment at one pod per healthy node when another node is
+          # tainted by DiskPressure.
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker
+              swegen.pgcode/stage: repair
       containers:
         - name: worker
-          image: swegen-worker:package-mirrors-20260731
+          image: swegen-worker:buildkit-intermediates-20260802-1424
           imagePullPolicy: Never
           args: ["--stage", "repair"]
           envFrom:
@@ -409,9 +575,12 @@ metadata:
   name: swegen-reward
   namespace: swegen-pipeline
 spec:
-  replicas: 16
+  replicas: 8
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 20%
   selector:
     matchLabels:
       app.kubernetes.io/name: swegen-worker
@@ -423,12 +592,12 @@ spec:
         swegen.pgcode/stage: reward
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 1800
+      terminationGracePeriodSeconds: 600
       nodeSelector:
-        swegen.pgcode/node-ip: 7.244.1.209
+        swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: worker
-          image: swegen-worker:e2e
+          image: swegen-worker:proxy-noproxy-fix-20260801-0356
           imagePullPolicy: Never
           args: ["--stage", "reward"]
           envFrom:
@@ -442,7 +611,7 @@ spec:
             - name: SWEGEN_REWARD_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: swegen-reward-credentials
+                  name: swegen-reward-credentials-arcyleung-20260801
                   key: SWEGEN_REWARD_API_KEY
             - name: POD_NAME
               valueFrom:
@@ -496,9 +665,12 @@ metadata:
   name: swegen-push
   namespace: swegen-pipeline
 spec:
-  replicas: 1
+  replicas: 16
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 20%
   selector:
     matchLabels:
       app.kubernetes.io/name: swegen-worker
@@ -510,12 +682,15 @@ spec:
         swegen.pgcode/stage: push
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 7200
+      # A push that has not finished within an hour is stuck, not slow, so the
+      # grace period stops waiting on it rather than pinning the Pod for the
+      # live 7200s.
+      terminationGracePeriodSeconds: 3600
       nodeSelector:
         swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: worker
-          image: swegen-worker:hybrid-buildkit-proxy-skip-20260730
+          image: swegen-worker:push-remote-digest-fix-20260802-1507
           imagePullPolicy: Never
           args: ["--stage", "push"]
           envFrom:
