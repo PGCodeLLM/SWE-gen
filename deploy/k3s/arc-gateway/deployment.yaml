@@ -18,7 +18,8 @@ metadata:
   name: swegen-arc-gateway
   namespace: swegen-pipeline
 spec:
-  replicas: 1
+  # Disabled while all production workers use the direct gpt-5.6-sol profile.
+  replicas: 0
   strategy:
     type: Recreate
   selector:

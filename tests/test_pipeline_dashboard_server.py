@@ -563,6 +563,66 @@ def test_scaler_uses_allowlisted_kubectl_argument_arrays() -> None:
 
     def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
         commands.append(command)
+        if "get" in command and "deployment/swegen-generate" in command:
+            return CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "spec": {
+                            "template": {
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "worker",
+                                            "image": "swegen-worker:working",
+                                            "envFrom": [
+                                                {
+                                                    "secretRef": {
+                                                        "name": "swegen-model-credentials-sol-direct"
+                                                    }
+                                                }
+                                            ],
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if "get" in command and "deployment/swegen-generate-overflow" in command:
+            return CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "spec": {
+                            "template": {
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "worker",
+                                            "envFrom": [
+                                                {"configMapRef": {"name": "pipeline"}},
+                                                {"secretRef": {"name": "database"}},
+                                                {"secretRef": {"name": "proxy"}},
+                                                {
+                                                    "secretRef": {
+                                                        "name": "swegen-model-credentials-pooled"
+                                                    }
+                                                },
+                                            ],
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
         return CompletedProcess(command, 0, stdout="scaled", stderr="")
 
     applied = K3sScaler(runner=runner).scale(
@@ -576,6 +636,53 @@ def test_scaler_uses_allowlisted_kubectl_argument_arrays() -> None:
         {"deployment": "swegen-generate-overflow", "replicas": 4},
     ]
     assert commands == [
+        [
+            "kubectl",
+            "--request-timeout=10s",
+            "-n",
+            "swegen-pipeline",
+            "get",
+            "deployment/swegen-generate",
+            "-o=json",
+        ],
+        [
+            "kubectl",
+            "--request-timeout=10s",
+            "-n",
+            "swegen-pipeline",
+            "get",
+            "deployment/swegen-generate-overflow",
+            "-o=json",
+        ],
+        [
+            "kubectl",
+            "--request-timeout=10s",
+            "-n",
+            "swegen-pipeline",
+            "set",
+            "image",
+            "deployment/swegen-generate-overflow",
+            "worker=swegen-worker:working",
+        ],
+        [
+            "kubectl",
+            "--request-timeout=10s",
+            "-n",
+            "swegen-pipeline",
+            "patch",
+            "deployment/swegen-generate-overflow",
+            "--type=json",
+            "-p",
+            json.dumps(
+                [
+                    {
+                        "op": "replace",
+                        "path": "/spec/template/spec/containers/0/envFrom/3/secretRef/name",
+                        "value": "swegen-model-credentials-sol-direct",
+                    }
+                ]
+            ),
+        ],
         [
             "kubectl",
             "--request-timeout=10s",
@@ -595,6 +702,20 @@ def test_scaler_uses_allowlisted_kubectl_argument_arrays() -> None:
             "--replicas=4",
         ],
     ]
+
+
+def test_scaler_does_not_touch_overflow_image_when_generate_fits_main_pool() -> None:
+    from swegen.dashboard.server import K3sScaler
+
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        commands.append(command)
+        return CompletedProcess(command, 0, stdout="scaled", stderr="")
+
+    K3sScaler(runner=runner).scale("generate", 80, max_replicas=768)
+
+    assert all("set" not in command and "get" not in command for command in commands)
 
 
 def test_build_slot_controller_uses_snapshot_allowlist_and_atomic_exec() -> None:

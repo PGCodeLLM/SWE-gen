@@ -4,6 +4,7 @@ set -euo pipefail
 namespace="${SWEGEN_K3S_NAMESPACE:-swegen-pipeline}"
 model_secret_name="${SWEGEN_MODEL_SECRET_NAME:-swegen-model-credentials-v2}"
 generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-moedsa-20260802-v2}"
+reward_model_secret_name="${SWEGEN_REWARD_MODEL_SECRET_NAME:-swegen-reward-credentials-gpt56sol-20260803}"
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_directory}/../.." && pwd)"
 runtime_root="${SWEGEN_RUNTIME_ROOT:-/data/work/slurm-swegen/slurm-runtime/20260716-sol-max-full-16w/workspace}"
@@ -51,6 +52,7 @@ normalized_credentials="${temporary_directory}/credentials.env"
 normalized_proxy="${temporary_directory}/proxy.env"
 normalized_reward="${temporary_directory}/reward.env"
 repair_model_env="${temporary_directory}/repair-model.env"
+reward_model_env="${temporary_directory}/reward-model.env"
 merged_docker_config="${temporary_directory}/docker-config.json"
 normalize_env_file "${credentials_env}" "${normalized_credentials}"
 normalize_env_file "${proxy_env}" "${normalized_proxy}"
@@ -168,6 +170,38 @@ destination.write_text(
     "".join(f"{key}={value}\n" for key, value in values.items()),
     encoding="utf-8",
 )
+os.chmod(destination, 0o600)
+PY
+
+uv run --project "${repo_root}" python - "${models_yaml}" "${reward_model_env}" <<'PY'
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import yaml
+
+source, destination = map(Path, sys.argv[1:])
+document = yaml.safe_load(source.read_text(encoding="utf-8"))
+entries = document.get("model_list") if isinstance(document, dict) else None
+model = os.environ.get("SWEGEN_REWARD_MODEL_NAME", "gpt-5.6-sol").strip()
+if not model:
+    raise SystemExit("SWEGEN_REWARD_MODEL_NAME must not be blank")
+matches = [
+    entry for entry in entries or []
+    if isinstance(entry, dict) and entry.get("model_name") == model
+]
+if len(matches) != 1:
+    raise SystemExit(f"models.yaml must contain exactly one {model} entry")
+params = matches[0].get("litellm_params")
+if not isinstance(params, dict):
+    raise SystemExit(f"{model} requires litellm_params")
+api_base = str(params.get("api_base") or "").rstrip("/")
+api_key = str(params.get("api_key") or "")
+parsed = urlsplit(api_base)
+if parsed.scheme not in {"http", "https"} or not parsed.netloc or not api_key:
+    raise SystemExit(f"{model} requires a valid api_base and non-empty api_key")
+destination.write_text(f"SWEGEN_REWARD_API_KEY={api_key}\n", encoding="utf-8")
 os.chmod(destination, 0o600)
 PY
 
@@ -289,6 +323,7 @@ PY
 
 ensure_immutable_env_secret "${model_secret_name}" "${normalized_credentials}"
 ensure_immutable_env_secret "${generate_glm_secret_name}" "${repair_model_env}"
+ensure_immutable_env_secret "${reward_model_secret_name}" "${reward_model_env}"
 
 "${kubectl[@]}" -n "${namespace}" create secret generic swegen-repair-model-credentials \
     --from-env-file="${repair_model_env}" \
@@ -332,6 +367,7 @@ unset postgres_password
 "${kubectl[@]}" -n "${namespace}" get secret \
     "${model_secret_name}" \
     "${generate_glm_secret_name}" \
+    "${reward_model_secret_name}" \
     swegen-repair-model-credentials \
     swegen-runtime-proxy \
     swegen-reward-credentials \
