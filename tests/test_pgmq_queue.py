@@ -253,7 +253,9 @@ def test_send_rejects_a_negative_delay_before_executing_sql() -> None:
     assert connection.calls == []
 
 
-def test_validate_claim_can_start_with_fresh_queue() -> None:
+def test_validate_claim_prefers_repaired_regardless_of_start_queue() -> None:
+    """Repaired work wins even when the worker was seeded with the fresh queue."""
+
     message = queue_message(stage=PipelineStage.VALIDATE)
     connection = RecordingConnection([pgmq_row(message)])
 
@@ -263,8 +265,8 @@ def test_validate_claim_can_start_with_fresh_queue() -> None:
         visibility_timeout_seconds=300,
     )
 
-    assert claims[0].queue is QueueName.VALIDATE
-    assert connection.calls[0][1][0] == "swegen_validate"
+    assert claims[0].queue is QueueName.VALIDATE_REPAIRED
+    assert connection.calls[0][1][0] == "swegen_validate_repaired"
 
 
 def test_validate_start_queue_rejects_unrelated_queue() -> None:
@@ -291,80 +293,54 @@ def test_repair_claim_can_use_isolated_canary_queue() -> None:
     assert connection.calls[0][1][0] == "swegen_repair_canary"
 
 
-def test_validate_claim_alternates_repaired_and_fresh_queues() -> None:
+def test_validate_claim_drains_repaired_before_touching_fresh_queue() -> None:
+    """While repaired work exists, consecutive claims never reach the fresh FIFO."""
+
     message = queue_message(stage=PipelineStage.VALIDATE)
     connection = RecordingConnection([pgmq_row(message)], [pgmq_row(message)])
     queue = PgmqQueue()
 
-    repaired_claims = queue.claim(
-        connection,
-        PipelineStage.VALIDATE,
-        visibility_timeout_seconds=300,
-        quantity=1,
+    first = queue.claim(
+        connection, PipelineStage.VALIDATE, visibility_timeout_seconds=300, quantity=1
     )
-    fresh_claims = queue.claim(
-        connection,
-        PipelineStage.VALIDATE,
-        visibility_timeout_seconds=300,
-        quantity=1,
+    second = queue.claim(
+        connection, PipelineStage.VALIDATE, visibility_timeout_seconds=300, quantity=1
     )
 
-    assert repaired_claims == [
-        ClaimedMessage(
-            queue=QueueName.VALIDATE_REPAIRED,
-            msg_id=71,
-            read_count=2,
-            enqueued_at=PGMQ_ENQUEUED_AT,
-            visible_at=VISIBLE_AT,
-            message=message,
-        )
-    ]
-    assert fresh_claims[0].queue is QueueName.VALIDATE
-    assert connection.calls == [
-        (
-            "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read(%s, %s, %s)",
-            ("swegen_validate_repaired", 300, 1),
-        ),
-        (
-            "SELECT msg_id, read_ct, enqueued_at, vt, message FROM pgmq.read(%s, %s, %s)",
-            ("swegen_validate", 300, 1),
-        ),
+    assert first[0].queue is QueueName.VALIDATE_REPAIRED
+    assert second[0].queue is QueueName.VALIDATE_REPAIRED
+    # Under the old alternating policy the second call read swegen_validate,
+    # which let repaired tasks sit behind a deep fresh backlog.
+    assert [params[0] for _query, params in connection.calls] == [
+        "swegen_validate_repaired",
+        "swegen_validate_repaired",
     ]
 
 
-def test_validate_claim_keeps_missing_side_preferred_after_fallback() -> None:
+def test_validate_claim_returns_to_repaired_after_a_fresh_fallback() -> None:
+    """An empty repaired queue must not stick the worker on the fresh FIFO."""
+
     message = queue_message(stage=PipelineStage.VALIDATE)
     connection = RecordingConnection(
-        [pgmq_row(message)],
         [],
         [pgmq_row(message)],
         [pgmq_row(message)],
     )
     queue = PgmqQueue()
 
-    queue.claim(
-        connection,
-        PipelineStage.VALIDATE,
-        visibility_timeout_seconds=300,
+    fallback = queue.claim(
+        connection, PipelineStage.VALIDATE, visibility_timeout_seconds=300, quantity=1
     )
-    fallback_claims = queue.claim(
-        connection,
-        PipelineStage.VALIDATE,
-        visibility_timeout_seconds=300,
-    )
-    fresh_claims = queue.claim(
-        connection,
-        PipelineStage.VALIDATE,
-        visibility_timeout_seconds=300,
+    recovered = queue.claim(
+        connection, PipelineStage.VALIDATE, visibility_timeout_seconds=300, quantity=1
     )
 
-    assert fallback_claims[0].queue is QueueName.VALIDATE_REPAIRED
-    assert fresh_claims[0].queue is QueueName.VALIDATE
+    assert fallback[0].queue is QueueName.VALIDATE
+    assert recovered[0].queue is QueueName.VALIDATE_REPAIRED
     assert [params[0] for _query, params in connection.calls] == [
         "swegen_validate_repaired",
         "swegen_validate",
         "swegen_validate_repaired",
-        "swegen_validate",
     ]
 
 

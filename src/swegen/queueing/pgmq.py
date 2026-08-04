@@ -135,16 +135,23 @@ class PgmqQueue:
         validate_start_queue: QueueName = QueueName.VALIDATE_REPAIRED,
         repair_claim_queue: QueueName = QueueName.REPAIR,
     ) -> None:
-        # Validate has two independent FIFOs. Alternate the preferred queue
-        # after every successful claim so repaired/retried tasks cannot starve
-        # fresh Generate handoffs. If the preferred queue is empty, claim from
-        # the other queue immediately and keep preferring the missing side on
-        # the next call.
+        # Validate has two independent FIFOs. The repaired queue is drained
+        # first and the fresh queue only when it is empty: a repaired task has
+        # already consumed a Generate run, a Validate run and a Repair run, so
+        # finishing it is worth more than starting another fresh task. The
+        # fallback keeps Validate busy, so strict priority costs no throughput.
+        #
+        # Alternating instead lets the repaired queue sit for hours whenever
+        # the fresh queue is deep, which is the normal state here.
         if validate_start_queue not in queues_for_stage(PipelineStage.VALIDATE):
             raise ValueError("validate_start_queue must be a Validate queue")
         if repair_claim_queue not in {QueueName.REPAIR, QueueName.REPAIR_CANARY}:
             raise ValueError("repair_claim_queue must be a Repair queue")
-        self._next_validate_queue = validate_start_queue
+        # validate_start_queue is still validated and accepted so callers and
+        # tests keep working, but it no longer selects a queue: priority is
+        # fixed. Kept rather than removed to avoid breaking _build_runtime_worker
+        # and its per-worker seeding in the same change.
+        self._validate_start_queue = validate_start_queue
         self._repair_claim_queue = repair_claim_queue
 
     def send(
@@ -206,12 +213,9 @@ class PgmqQueue:
         )
         claim_order = accepted_queues
         if stage is PipelineStage.VALIDATE:
-            fallback_queue = (
-                QueueName.VALIDATE
-                if self._next_validate_queue is QueueName.VALIDATE_REPAIRED
-                else QueueName.VALIDATE_REPAIRED
-            )
-            claim_order = (self._next_validate_queue, fallback_queue)
+            # Strict priority, not alternation: always drain repaired work
+            # first and fall back to fresh tasks only when it is empty.
+            claim_order = (QueueName.VALIDATE_REPAIRED, QueueName.VALIDATE)
 
         for preferred_queue in claim_order[:-1]:
             claims = self._claim_from_queue(
@@ -223,28 +227,15 @@ class PgmqQueue:
                 poll_interval_ms=poll_interval_ms,
             )
             if claims:
-                self._record_validate_claim(stage, claims[0].queue)
                 return claims
 
-        claims = self._claim_from_queue(
+        return self._claim_from_queue(
             connection,
             claim_order[-1],
             visibility_timeout_seconds=visibility_timeout_seconds,
             quantity=quantity,
             max_poll_seconds=max_poll_seconds,
             poll_interval_ms=poll_interval_ms,
-        )
-        if claims:
-            self._record_validate_claim(stage, claims[0].queue)
-        return claims
-
-    def _record_validate_claim(self, stage: PipelineStage, claimed_queue: QueueName) -> None:
-        if stage is not PipelineStage.VALIDATE:
-            return
-        self._next_validate_queue = (
-            QueueName.VALIDATE
-            if claimed_queue is QueueName.VALIDATE_REPAIRED
-            else QueueName.VALIDATE_REPAIRED
         )
 
     def _claim_from_queue(
@@ -476,11 +467,7 @@ class PgmqQueue:
         repair_canary_match = (
             queue is QueueName.REPAIR_CANARY and message.stage is PipelineStage.REPAIR
         )
-        if (
-            queue is not QueueName.DEAD
-            and queue not in accepted_queues
-            and not repair_canary_match
-        ):
+        if queue is not QueueName.DEAD and queue not in accepted_queues and not repair_canary_match:
             raise QueueOperationError(
                 f"Message stage {message.stage.value} does not match queue {queue.value}"
             )

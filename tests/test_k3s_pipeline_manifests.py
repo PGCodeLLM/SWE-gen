@@ -223,9 +223,7 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
 
     reward_env = {
         item["name"]: item
-        for item in deployments["swegen-reward"]["spec"]["template"]["spec"][
-            "containers"
-        ][0]["env"]
+        for item in deployments["swegen-reward"]["spec"]["template"]["spec"]["containers"][0]["env"]
     }
     assert reward_env["SWEGEN_REWARD_API_KEY"]["valueFrom"]["secretKeyRef"]["name"] == (
         "swegen-reward-credentials-gpt56sol-20260803"
@@ -295,17 +293,16 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert 'blocked_prefixes = ("ANTHROPIC_", "CLAUDE_", "OPENAI_"' in secret_helper
 
 
-def test_generate_manifest_uses_versioned_glm_credentials_at_32() -> None:
+def test_generate_manifest_uses_versioned_glm_credentials_at_12() -> None:
     deployment = next(
         document
         for document in _documents()
-        if document["kind"] == "Deployment"
-        and document["metadata"]["name"] == "swegen-generate"
+        if document["kind"] == "Deployment" and document["metadata"]["name"] == "swegen-generate"
     )
     container = deployment["spec"]["template"]["spec"]["containers"][0]
 
-    assert deployment["spec"]["replicas"] == 32
-    assert container["image"] == "swegen-worker:github-auth-fix-20260802-1744"
+    assert deployment["spec"]["replicas"] == 12
+    assert container["image"] == "swegen-worker:generate-validate-20260804"
     assert container["envFrom"][-1]["secretRef"]["name"] == (
         "swegen-model-credentials-glm52-moedsa-20260802-v2"
     )

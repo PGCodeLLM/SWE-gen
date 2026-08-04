@@ -86,7 +86,7 @@ metadata:
   name: swegen-generate
   namespace: swegen-pipeline
 spec:
-  replicas: 32
+  replicas: 12
   strategy:
     type: RollingUpdate
     rollingUpdate:
