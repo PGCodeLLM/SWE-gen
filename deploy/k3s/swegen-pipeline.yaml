@@ -133,7 +133,7 @@ spec:
             - secretRef:
                 name: swegen-runtime-proxy
             - secretRef:
-                name: swegen-model-credentials-glm52-moedsa-20260802-v2
+                name: swegen-model-credentials-sol-direct-20260803
           env:
             - name: POD_NAME
               valueFrom:
