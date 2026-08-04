@@ -181,6 +181,18 @@ def test_aggregate_pipeline_snapshot_builds_queue_task_and_stage_timing() -> Non
         "scraped_at": NOW.isoformat(),
     }
     assert snapshot["queues"]["validate_repaired"]["length"] == 3
+    assert snapshot["queues"]["validate_repaired"]["visible"] == 2
+    assert snapshot["queues"]["validate_repaired"]["in_flight"] == 1
+    assert snapshot["queues"]["validate_new"] == {
+        "queue": "swegen_validate",
+        "length": 4,
+        "visible": 4,
+        "in_flight": 0,
+        "total_messages": 80,
+        "newest_message_age_seconds": 20,
+        "oldest_message_age_seconds": 120,
+        "scraped_at": NOW.isoformat(),
+    }
     assert snapshot["task_counts"] == {
         "total": 2,
         "by_state": {"queued": 2},
@@ -421,10 +433,24 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
             {"stage": "unknown", "processed": 9999},
         ],
         remote_build_rows=[
-            {"status": "submitting", "count": 2},
-            {"status": "queued", "count": 3},
-            {"status": "running", "count": 4},
-            {"status": "success", "count": 11},
+            {
+                "status": "submitting",
+                "recent_count": 2,
+                "stale_count": 10,
+                "latest_updated_at": NOW - timedelta(minutes=1),
+            },
+            {
+                "status": "queued",
+                "recent_count": 3,
+                "stale_count": 20,
+                "latest_updated_at": NOW - timedelta(minutes=2),
+            },
+            {
+                "status": "running",
+                "recent_count": 4,
+                "stale_count": 30,
+                "latest_updated_at": NOW,
+            },
         ],
         remote_build_tracking_available=True,
     )
@@ -457,13 +483,21 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
     }
     assert snapshot["remote_builds"] == {
         "available": True,
-        "pending": 9,
-        "status_counts": {
+        "recent": 9,
+        "stale": 60,
+        "recent_status_counts": {
             "queued": 3,
             "running": 4,
             "submitting": 2,
-            "success": 11,
         },
+        "stale_status_counts": {
+            "queued": 20,
+            "running": 30,
+            "submitting": 10,
+        },
+        "recent_window_seconds": 4200,
+        "latest_updated_at": NOW.isoformat(),
+        "authoritative": False,
     }
 
 

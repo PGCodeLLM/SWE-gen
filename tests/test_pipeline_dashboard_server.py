@@ -340,11 +340,15 @@ def test_remote_buildkit_farm_renders_safe_read_only_status_cards() -> None:
     for title in (
         "Gateway / ready",
         "Backend workers",
-        "Sampled worker queue",
-        "Active builds",
-        "SWEgen remote pending",
+        "Sampled live queue",
+        "Sampled live active",
+        "SWEgen submission ledger",
     ):
         assert title in HTML
+    assert "stale excluded" in HTML
+    assert "database submission ledger only, not live farm state" in HTML
+    assert "resources.last_success_at" in HTML
+    assert "SWEgen remote pending" not in HTML
     assert "registry_password" not in HTML
     assert "registry_username" not in HTML
 
@@ -410,6 +414,19 @@ def test_top_stage_cards_separate_fresh_activity_from_queue_leases() -> None:
     assert "active <b>${a.fresh||0}</b>" in HTML
     assert "leased ${q.in_flight||0}" in HTML
     assert "stale ${stale}" in HTML
+
+
+def test_validator_card_shows_repaired_and_brand_new_queue_totals_and_leases() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert "Freshly repaired" in HTML
+    assert "Brand-new tasks" in HTML
+    assert "pg.queues?.validate_repaired" in HTML
+    assert "pg.queues?.validate_new" in HTML
+    assert "total <b></b> · ready <b></b> · leased/in-flight <b></b>" in HTML
+    assert "queue?.length??'—'" in HTML
+    assert "queue?.visible??'—'" in HTML
+    assert "queue?.in_flight??'—'" in HTML
 
 
 def test_top_stage_cards_show_pod_phases_instead_of_a_ready_fraction() -> None:

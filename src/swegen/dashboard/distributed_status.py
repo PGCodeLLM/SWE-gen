@@ -29,6 +29,11 @@ QUEUE_BY_STAGE = {
 }
 DEAD_QUEUE = "swegen_dead"
 REMOTE_BUILD_PENDING_STATUSES = frozenset({"submitting", "queued", "running"})
+# Remote build rows are best-effort submission tracking, not an authoritative
+# farm queue. A worker killed before terminal writeback can leave one of these
+# rows nonterminal forever. Keep only records updated within the client build
+# deadline plus a small status-writeback grace window in the recent bucket.
+REMOTE_BUILD_TRACKING_RECENT_SECONDS = 70 * 60
 REMOTE_BUILDKIT_DEFAULT_URL = "http://7.156.122.134:32083"
 REMOTE_BUILDKIT_MIN_POLL_SECONDS = 30.0
 REMOTE_BUILDKIT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -335,19 +340,38 @@ def summarize_remote_build_tracking(
     *,
     available: bool,
 ) -> dict[str, Any]:
-    counts = {
-        str(row["status"]): int(row.get("count") or 0)
+    rows = list(rows)
+    recent_counts = {
+        str(row["status"]): int(row.get("recent_count") or 0)
         for row in rows
         if row.get("status") is not None
     }
+    stale_counts = {
+        str(row["status"]): int(row.get("stale_count") or 0)
+        for row in rows
+        if row.get("status") is not None
+    }
+    latest_updates = [value for row in rows if (value := row.get("latest_updated_at")) is not None]
+    latest_updated_at = max(latest_updates) if latest_updates else None
+    if isinstance(latest_updated_at, datetime):
+        latest_updated_at = latest_updated_at.isoformat()
     return {
         "available": available,
-        "pending": (
-            sum(counts.get(status, 0) for status in REMOTE_BUILD_PENDING_STATUSES)
+        "recent": (
+            sum(recent_counts.get(status, 0) for status in REMOTE_BUILD_PENDING_STATUSES)
             if available
             else None
         ),
-        "status_counts": dict(sorted(counts.items())),
+        "stale": (
+            sum(stale_counts.get(status, 0) for status in REMOTE_BUILD_PENDING_STATUSES)
+            if available
+            else None
+        ),
+        "recent_status_counts": dict(sorted(recent_counts.items())),
+        "stale_status_counts": dict(sorted(stale_counts.items())),
+        "recent_window_seconds": REMOTE_BUILD_TRACKING_RECENT_SECONDS,
+        "latest_updated_at": latest_updated_at,
+        "authoritative": False,
     }
 
 
@@ -696,6 +720,7 @@ def aggregate_pipeline_snapshot(
         "queues": {
             "stages": {stage: queue_view(names) for stage, names in QUEUE_BY_STAGE.items()},
             "validate_repaired": queue_view(("swegen_validate_repaired",)),
+            "validate_new": queue_view(("swegen_validate",)),
             "dead": queue_view((DEAD_QUEUE,)),
         },
         "task_counts": {
@@ -881,13 +906,25 @@ class PipelineStatusCollector:
                             remote_build_rows = list(
                                 connection.execute(
                                     """
-                                    SELECT status, count(*) AS count
-                                    FROM pipeline_remote_builds
-                                    WHERE route = 'remote'
-                                      AND status IN ('submitting', 'queued', 'running')
+                                    SELECT
+                                        status,
+                                        count(*) FILTER (WHERE recent) AS recent_count,
+                                        count(*) FILTER (WHERE NOT recent) AS stale_count,
+                                        max(updated_at) AS latest_updated_at
+                                    FROM (
+                                        SELECT
+                                            status,
+                                            updated_at,
+                                            updated_at >= now() - make_interval(secs => %s)
+                                                AS recent
+                                        FROM pipeline_remote_builds
+                                        WHERE route = 'remote'
+                                          AND status IN ('submitting', 'queued', 'running')
+                                    ) AS tracked
                                     GROUP BY status
                                     ORDER BY status
-                                    """
+                                    """,
+                                    (REMOTE_BUILD_TRACKING_RECENT_SECONDS,),
                                 ).fetchall()
                             )
                         remote_build_tracking_available = True
