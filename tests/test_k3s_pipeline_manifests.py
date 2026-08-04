@@ -99,11 +99,10 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     # The pinned stages were consolidated onto one node; the manifest and the
     # running cluster agree, so this table tracks them rather than the earlier
     # one-stage-per-node spread.
-    expected_nodes = {
-        "swegen-generate": "7.244.3.200",
-        "swegen-reward": "7.244.3.200",
-        "swegen-push": "7.244.3.200",
-    }
+    # No stage may pin itself to 7.244.3.200: that node is the k3s
+    # control-plane, and stacking build-capable workers on the same disk as
+    # etcd made the API server unreachable under load.
+    control_plane_node = "7.244.3.200"
     # Replica counts and image tags are retuned constantly during a run, so
     # pinning their literals only produced a permanently red test. Assert the
     # properties that encode intent instead: every worker runs a locally built
@@ -124,10 +123,14 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         "swegen-reward": "reward",
         "swegen-push": "push",
     }
+    # Every worker stage spreads; none is pinned to a single node.
     distributed_deployments = {
+        "swegen-generate",
         "swegen-validate",
         "swegen-repair",
         "swegen-reward-repair",
+        "swegen-reward",
+        "swegen-push",
     }
     # generate joins the docker stages so the agent can build during
     # generation and repair its own Dockerfile from the real error.
@@ -148,34 +151,20 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         assert pod_spec["terminationGracePeriodSeconds"] == expected_grace_seconds[name]
         # Recreate would take every replica of a stage down at once.
         assert deployment["spec"]["strategy"]["type"] == "RollingUpdate"
-        if name in distributed_deployments:
+        # Nothing may be pinned to the control-plane node.
+        assert pod_spec.get("nodeSelector", {}).get("swegen.pgcode/node-ip") != (control_plane_node)
+        if name in distributed_deployments and deployment["spec"]["replicas"] > 0:
             assert "nodeSelector" not in pod_spec
-            if name == "swegen-validate":
-                assert deployment["spec"]["strategy"] == {
-                    "type": "RollingUpdate",
-                    "rollingUpdate": {"maxSurge": 0, "maxUnavailable": "20%"},
-                }
-                assert pod_spec["topologySpreadConstraints"] == [
-                    {
-                        "maxSkew": 1,
-                        "topologyKey": "kubernetes.io/hostname",
-                        "whenUnsatisfiable": "DoNotSchedule",
-                        "labelSelector": {
-                            "matchLabels": {
-                                "app.kubernetes.io/name": "swegen-worker",
-                                "swegen.pgcode/stage": "validate",
-                            }
-                        },
-                    }
-                ]
-            if name == "swegen-repair":
-                assert pod_spec["topologySpreadConstraints"][0]["maxSkew"] == 1
-                assert (
-                    pod_spec["topologySpreadConstraints"][0]["whenUnsatisfiable"]
-                    == "ScheduleAnyway"
-                )
-        else:
-            assert pod_spec["nodeSelector"] == {"swegen.pgcode/node-ip": expected_nodes[name]}
+            constraint = pod_spec["topologySpreadConstraints"][0]
+            assert constraint["maxSkew"] == 1
+            assert constraint["topologyKey"] == "kubernetes.io/hostname"
+            # DoNotSchedule deadlocked a rollout once: replacement Pods were
+            # held Pending against an already-full node and never converged.
+            assert constraint["whenUnsatisfiable"] == "ScheduleAnyway"
+            assert constraint["labelSelector"]["matchLabels"] == {
+                "app.kubernetes.io/name": "swegen-worker",
+                "swegen.pgcode/stage": stage,
+            }
         # imagePullPolicy=Never means the tag must resolve on the node, so the
         # repository still matters even though the tag itself is volatile.
         assert container["image"].startswith("swegen-worker:")

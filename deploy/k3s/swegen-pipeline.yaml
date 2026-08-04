@@ -107,8 +107,19 @@ spec:
       # SWEGEN_GENERATE_TIMEOUT_SECONDS (14400) so an in-flight Claude Code run
       # can finish rather than be killed mid-task.
       terminationGracePeriodSeconds: 18000
-      nodeSelector:
-        swegen.pgcode/node-ip: 7.244.3.200
+      # 7.244.3.200 is the k3s control-plane (etcd + API server). Pinning
+      # it there put 12 build-capable workers on the same disk as etcd, which
+      # is what made the API server unreachable under load.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          # ScheduleAnyway, not DoNotSchedule: a strict skew deadlocks the
+          # rollout when one node fills up or is tainted by DiskPressure.
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker
+              swegen.pgcode/stage: generate
       containers:
         - name: worker
           image: swegen-worker:generate-validate-20260804
@@ -234,7 +245,7 @@ metadata:
   name: swegen-validate
   namespace: swegen-pipeline
 spec:
-  replicas: 180
+  replicas: 240
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -255,14 +266,17 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: DoNotSchedule
+          # ScheduleAnyway, not DoNotSchedule. A strict skew deadlocked this
+          # rollout once already: new Pods were held Pending against a node
+          # that was already full, and the deployment could not converge.
+          whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: swegen-worker
               swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:repo-affinity-runbox-20260802-0049
+          image: swegen-worker:repaired-priority-20260804
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           envFrom:
@@ -502,7 +516,7 @@ metadata:
   name: swegen-repair
   namespace: swegen-pipeline
 spec:
-  replicas: 64
+  replicas: 260
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -660,8 +674,19 @@ spec:
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 600
-      nodeSelector:
-        swegen.pgcode/node-ip: 7.244.3.200
+      # 7.244.3.200 is the k3s control-plane (etcd + API server). Pinning
+      # Reward here was a single-node bootstrap leftover: it mounts no docker
+      # socket and has no node-local state, so nothing tied it to this node.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          # ScheduleAnyway, not DoNotSchedule: a strict skew deadlocks the
+          # rollout when one node fills up or is tainted by DiskPressure.
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker
+              swegen.pgcode/stage: reward
       containers:
         - name: worker
           image: swegen-worker:proxy-noproxy-fix-20260801-0356
@@ -755,8 +780,20 @@ spec:
       # grace period stops waiting on it rather than pinning the Pod for the
       # live 7200s.
       terminationGracePeriodSeconds: 3600
-      nodeSelector:
-        swegen.pgcode/node-ip: 7.244.3.200
+      # 7.244.3.200 is the k3s control-plane (etcd + API server). Pinning
+      # Push here stacked 16 image-build-and-push workers on the control plane.
+      # push_action materializes each task from Postgres and prefers the farm
+      # image, so it needs no node-local state.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          # ScheduleAnyway, not DoNotSchedule: a strict skew deadlocks the
+          # rollout when one node fills up or is tainted by DiskPressure.
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker
+              swegen.pgcode/stage: push
       containers:
         - name: worker
           image: swegen-worker:push-remote-digest-fix-20260802-1507
