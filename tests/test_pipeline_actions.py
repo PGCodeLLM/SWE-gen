@@ -68,6 +68,7 @@ def test_build_generate_command_uses_relay_flags_and_workspace_paths(
     from swegen.pipeline.actions import build_generate_command
 
     monkeypatch.delenv("SWEGEN_REPO_CACHE_DIR", raising=False)
+    monkeypatch.delenv("SWEGEN_GENERATE_VALIDATE", raising=False)
 
     command = build_generate_command(make_task(), tmp_path)
 
@@ -80,6 +81,29 @@ def test_build_generate_command_uses_relay_flags_and_workspace_paths(
     assert command[command.index("--cc-timeout") + 1] == "10800"
     assert {
         "--no-validate",
+        "--force",
+        "--no-require-minimum-difficulty",
+        "--no-require-issue",
+    } <= set(command)
+
+
+def test_build_generate_command_keeps_validation_when_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """SWEGEN_GENERATE_VALIDATE drops --no-validate so the agent can build."""
+
+    from swegen.pipeline.actions import build_generate_command
+
+    monkeypatch.delenv("SWEGEN_REPO_CACHE_DIR", raising=False)
+    monkeypatch.setenv("SWEGEN_GENERATE_VALIDATE", "true")
+
+    command = build_generate_command(make_task(), tmp_path)
+
+    assert "--no-validate" not in command
+    # The remaining relay flags must survive; dropping one would silently
+    # change which candidates the generate stage accepts.
+    assert {
         "--force",
         "--no-require-minimum-difficulty",
         "--no-require-issue",

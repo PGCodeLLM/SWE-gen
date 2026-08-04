@@ -129,7 +129,9 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         "swegen-repair",
         "swegen-reward-repair",
     }
-    docker_stages = {"validate", "repair", "reward_repair", "push"}
+    # generate joins the docker stages so the agent can build during
+    # generation and repair its own Dockerfile from the real error.
+    docker_stages = {"generate", "validate", "repair", "reward_repair", "push"}
     for name, deployment in deployments.items():
         pod_spec = deployment["spec"]["template"]["spec"]
         container = pod_spec["containers"][0]

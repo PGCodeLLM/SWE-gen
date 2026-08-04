@@ -196,7 +196,7 @@ def build_generate_command(task: PipelineTask, workspace: Path) -> list[str]:
         "SWEGEN_CC_TIMEOUT_SECONDS",
         DEFAULT_CC_TIMEOUT_SECONDS,
     )
-    return [
+    command = [
         "swegen",
         "create",
         "--repo",
@@ -211,11 +211,23 @@ def build_generate_command(task: PipelineTask, workspace: Path) -> list[str]:
         str(repo_cache_dir),
         "--cc-timeout",
         str(cc_timeout),
-        "--no-validate",
-        "--force",
-        "--no-require-minimum-difficulty",
-        "--no-require-issue",
     ]
+    # Under --no-validate the agent is told not to run Docker, so it never sees
+    # a build failure and the continuation loop can only check that the files
+    # exist and contain no TODO. Enabling validation lets the agent build, read
+    # the error and amend its own Dockerfile before the task ever reaches the
+    # validate stage. It costs a build per attempt, so it stays opt-in and
+    # requires the docker socket to be mounted into the generate pod.
+    if not _environment_boolean("SWEGEN_GENERATE_VALIDATE"):
+        command.append("--no-validate")
+    command.extend(
+        [
+            "--force",
+            "--no-require-minimum-difficulty",
+            "--no-require-issue",
+        ]
+    )
+    return command
 
 
 def _generate_environment(task: PipelineTask) -> dict[str, str]:

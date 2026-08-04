@@ -111,7 +111,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: worker
-          image: swegen-worker:github-auth-fix-20260802-1744
+          image: swegen-worker:generate-validate-20260804
           imagePullPolicy: Never
           args: ["--stage", "generate"]
           envFrom:
@@ -132,6 +132,27 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Build wiring, matching validate/repair. SWEGEN_GENERATE_VALIDATE
+            # is what actually turns generation-time builds on: with it set the
+            # agent runs Docker, sees its own build failures and can amend the
+            # Dockerfile, instead of deferring every failure to validate.
+            - name: SWEGEN_GENERATE_VALIDATE
+              value: "true"
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: "default"
+            - name: COMPOSE_BAKE
+              value: "false"
+            # /opt/swegen/bin must precede the real docker: it holds the shim
+            # that flocks a shared host build slot, so generate's builds queue
+            # with validate/repair instead of swamping the node daemon.
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
             - name: NO_PROXY
               valueFrom:
                 configMapKeyRef:
@@ -162,6 +183,21 @@ spec:
               mountPath: /etc/swegen/combined-ca.crt
               subPath: combined-ca.crt
               readOnly: true
+            # Generate builds only when SWEGEN_GENERATE_VALIDATE is set; the
+            # socket is mounted unconditionally so the flag can be flipped
+            # without a rollout. Same wiring as validate/repair, which routes
+            # through the shared build slots and the remote farm.
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
       volumes:
         - name: workspace
           hostPath:
@@ -171,6 +207,22 @@ spec:
           hostPath:
             path: /data/swegen-k3s/cache
             type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 256
         - name: private-files
           secret:
             secretName: swegen-private-files
