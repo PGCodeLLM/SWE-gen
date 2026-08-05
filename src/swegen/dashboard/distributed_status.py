@@ -20,6 +20,13 @@ import psycopg
 from psycopg.rows import dict_row
 
 STAGES = ("generate", "validate", "repair", "reward", "push")
+
+# Some stages run under an auxiliary deployment with a distinct pod label so it
+# can scale independently of the primary rollout (e.g. the generate-overflow
+# deployment shares the generate image and the swegen_generate queue). Fold
+# those aliases back onto their canonical stage so the dashboard counts the
+# combined worker fleet instead of only the primary deployment's pods.
+STAGE_ALIASES = {"generate-overflow": "generate"}
 QUEUE_BY_STAGE = {
     "generate": ("swegen_generate",),
     "validate": ("swegen_validate_repaired", "swegen_validate"),
@@ -1270,6 +1277,7 @@ class K3sStatusCollector:
                     .get("matchLabels", {})
                     .get("swegen.pgcode/stage")
                 )
+            stage = STAGE_ALIASES.get(stage, stage)
             if stage not in stages:
                 continue
             if item.get("kind") == "Deployment":

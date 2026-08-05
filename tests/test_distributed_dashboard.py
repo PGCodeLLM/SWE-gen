@@ -718,6 +718,61 @@ def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:
     assert stage["pod_phases"] == {}
 
 
+def test_k3s_collector_folds_generate_overflow_alias_into_generate() -> None:
+    # The overflow deployment carries a distinct pod label (generate-overflow)
+    # so it can scale independently, but it shares the generate image and the
+    # swegen_generate queue. Its deployment replicas and its pods must be
+    # counted under "generate" rather than dropped for not matching a stage.
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    nodes = {"items": [{"metadata": {"name": "node-a"}, "status": {}}]}
+    workloads = {
+        "items": [
+            {
+                "kind": "Deployment",
+                "metadata": {"name": "swegen-generate"},
+                "spec": {
+                    "replicas": 92,
+                    "selector": {"matchLabels": {"swegen.pgcode/stage": "generate"}},
+                },
+                "status": {"readyReplicas": 92},
+            },
+            {
+                "kind": "Deployment",
+                "metadata": {"name": "swegen-generate-overflow"},
+                "spec": {
+                    "replicas": 228,
+                    "selector": {
+                        "matchLabels": {"swegen.pgcode/stage": "generate-overflow"}
+                    },
+                },
+                "status": {"readyReplicas": 228},
+            },
+            _pod("gen-1", "generate", {"phase": "Running"}),
+            _pod("ovf-1", "generate-overflow", {"phase": "Running"}),
+            _pod("ovf-2", "generate-overflow", {"phase": "Running"}),
+        ]
+    }
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "nodes" in command:
+            document = nodes
+        elif "deployments" in command:
+            document = _only_kinds(workloads, {"Deployment"})
+        else:
+            document = _only_kinds(workloads, {"Pod"})
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    stages = K3sStatusCollector(runner=runner).collect()["stages"]
+
+    # 92 + 228 desired, and all three Running pods, roll up under "generate".
+    assert stages["generate"]["desired"] == 320
+    assert stages["generate"]["pod_phases"].get("Running") == 3
+    assert stages["generate"]["nodes"].get("node-a") == 3
+    # The alias must not leak out as its own stage key.
+    assert "generate-overflow" not in stages
+
+
 def _pod(name: str, stage: str, status: dict[str, object], **metadata: object) -> dict[str, object]:
     return {
         "kind": "Pod",
