@@ -8,7 +8,9 @@ import os
 import re
 import signal
 import socket
+import sys
 import tempfile
+import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
@@ -222,6 +224,20 @@ def _temporary_workspace(*, root: Path, prefix: str):
 # fails identically every time), so a third delivery mostly re-burns build
 # capacity that newly enqueued tasks are waiting for.
 _DEFAULT_MAX_DELIVERIES = 2
+
+# Claim-rate cooldown for a pod that is failing every task near-instantly — the
+# signature of overlayfs rootfs corruption (missing swegen/python), which fails
+# in ~15ms and otherwise drains the queue at 60+ messages/sec, one zombie pod
+# out-claiming hundreds of healthy pods. A claim that both FAILED and returned
+# faster than this threshold counts toward a streak; a healthy pod's rare
+# failures take seconds of real work and never streak.
+_FAST_FAILURE_SECONDS = 2.0
+# After this many consecutive fast failures, sleep before the next claim so the
+# pod cannot drain the queue in the window before the liveness probe restarts
+# it. The sleep grows with the streak up to the cap.
+_FAST_FAILURE_STREAK_LIMIT = 3
+_FAST_FAILURE_BACKOFF_BASE_SECONDS = 2.0
+_FAST_FAILURE_BACKOFF_CAP_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,6 +518,9 @@ class PipelineWorker:
         self.stop_event = stop_event or Event()
         self._heartbeat_factory = heartbeat_factory or ClaimHeartbeat
         self._workspace_factory = workspace_factory or _temporary_workspace
+        # Set by _process_claim; read by run_once to track a fast-failure streak.
+        self._last_claim_failed = False
+        self._fast_failure_streak = 0
 
     def request_stop(
         self,
@@ -543,7 +562,18 @@ class PipelineWorker:
             if self.stop_event.is_set():
                 self._release_claim(claim)
                 continue
+            claim_started = time.monotonic()
+            self._last_claim_failed = False
             self._process_claim(claim)
+            # A corrupted pod fails every claim in ~15ms. Track a streak of
+            # such fast failures so run_forever can back off and stop it from
+            # draining the queue before the liveness probe restarts it. A
+            # healthy pod's occasional failure takes seconds and never streaks.
+            elapsed = time.monotonic() - claim_started
+            if self._last_claim_failed and elapsed < _FAST_FAILURE_SECONDS:
+                self._fast_failure_streak += 1
+            else:
+                self._fast_failure_streak = 0
         return True
 
     def _seed_repair_candidate(self) -> bool:
@@ -607,6 +637,21 @@ class PipelineWorker:
             except Exception as error:
                 LOGGER.error("pipeline worker poll failed: %s", _safe_error_text(error))
                 self.stop_event.wait(self.settings.poll_seconds)
+                continue
+            if self._fast_failure_streak >= _FAST_FAILURE_STREAK_LIMIT:
+                backoff = min(
+                    _FAST_FAILURE_BACKOFF_CAP_SECONDS,
+                    _FAST_FAILURE_BACKOFF_BASE_SECONDS
+                    * 2 ** (self._fast_failure_streak - _FAST_FAILURE_STREAK_LIMIT),
+                )
+                LOGGER.warning(
+                    "worker %s: %d consecutive fast failures; backing off %.0fs before "
+                    "next claim (likely rootfs corruption — liveness probe should restart)",
+                    self.worker_id,
+                    self._fast_failure_streak,
+                    backoff,
+                )
+                self.stop_event.wait(backoff)
 
     def _process_claim(self, claim: ClaimedMessage) -> None:
         started_at = self._now()
@@ -684,6 +729,7 @@ class PipelineWorker:
                     _safe_error_text(error),
                 )
                 return
+            self._last_claim_failed = True
             self._retry_or_dead_letter(claim, error, started_at=started_at)
 
     def _load_task(self, claim: ClaimedMessage) -> tuple[PipelineTask, tuple[TaskFile, ...]]:
@@ -898,8 +944,37 @@ def _build_runtime_worker(stage: PipelineStage) -> PipelineWorker:
     )
 
 
+def _verify_runtime_integrity() -> None:
+    """Exit immediately if this pod's rootfs is missing its own runtime.
+
+    crun/overlayfs snapshot corruption under pod churn can strip /app and the
+    venv interpreter from a Running pod. Without this guard the worker would
+    still enter the claim loop, fail every task in ~15ms, and drain the queue
+    at 60+ messages/sec — one zombie out-claiming hundreds of healthy pods.
+    Crashing at boot (before the first claim) turns the pod into a restart the
+    kubelet reschedules onto a fresh overlay, and it never claims a message.
+    """
+    interpreter = Path(sys.executable) if sys.executable else None
+    if not (Path("/app").is_dir() and interpreter is not None and interpreter.exists()):
+        sys.stderr.write(
+            "runtime integrity check failed: /app or the interpreter is missing "
+            "(overlayfs corruption); exiting so the kubelet reschedules this pod\n"
+        )
+        raise SystemExit(70)  # EX_SOFTWARE
+    try:
+        import swegen.cli  # noqa: F401  (importability is the check)
+    except Exception as error:  # pragma: no cover - exercised only on corruption
+        sys.stderr.write(
+            f"runtime integrity check failed: cannot import swegen.cli ({error!r}); "
+            "exiting so the kubelet reschedules this pod\n"
+        )
+        raise SystemExit(70) from error
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one configured stage worker via ``python -m``."""
+
+    _verify_runtime_integrity()
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", required=True, type=_parse_stage)

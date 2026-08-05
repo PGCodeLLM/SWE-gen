@@ -261,7 +261,6 @@ def test_every_worker_has_a_rootfs_integrity_probe() -> None:
         and document["spec"]["template"]["spec"]["containers"][0]["name"] == "worker"
     ]
     assert worker_deployments, "expected at least one worker deployment"
-    probe_command = ["/app/.venv/bin/python", "-c", "import swegen.cli"]
     for deployment in worker_deployments:
         container = deployment["spec"]["template"]["spec"]["containers"][0]
         name = deployment["metadata"]["name"]
@@ -269,8 +268,17 @@ def test_every_worker_has_a_rootfs_integrity_probe() -> None:
         startup = container.get("startupProbe")
         assert liveness is not None, f"{name} missing livenessProbe"
         assert startup is not None, f"{name} missing startupProbe"
-        assert liveness["exec"]["command"] == probe_command, name
-        assert startup["exec"]["command"] == probe_command, name
+        for probe in (liveness, startup):
+            cmd = probe["exec"]["command"]
+            # The probe MUST run through /bin/sh, not the venv python directly.
+            # overlayfs corruption can delete /app/.venv/bin/python; an exec
+            # probe whose binary is missing errors into "unknown state", which
+            # kubelet does NOT count toward failureThreshold — a gutted pod
+            # would never restart. /bin/sh always exists, so the probe launches
+            # and returns exit 127 (a real failure) when python is gone.
+            assert cmd[0] == "/bin/sh", f"{name} probe must be shell-wrapped: {cmd}"
+            assert "import swegen.cli" in cmd[-1], name
+            assert "/app/.venv/bin/python" in cmd[-1], name
         # Liveness must actually fail a wedged pod (finite failureThreshold)
         # rather than tolerate it indefinitely.
         assert liveness["failureThreshold"] <= 3, name

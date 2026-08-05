@@ -192,7 +192,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -201,7 +208,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
@@ -369,7 +376,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -378,7 +392,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
@@ -530,7 +544,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -539,7 +560,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
@@ -685,7 +706,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -694,7 +722,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
@@ -847,7 +875,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -856,7 +891,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
@@ -1002,7 +1037,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -1011,7 +1053,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
@@ -1138,7 +1180,14 @@ spec:
           # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
           startupProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              # Run through /bin/sh, NOT the venv python directly: overlayfs
+              # corruption can delete /app/.venv/bin/python itself, and an exec
+              # probe whose binary is missing ERRORS ("unknown state") instead
+              # of failing — kubelet does not count unknown toward
+              # failureThreshold, so a gutted pod would never restart. /bin/sh
+              # always exists, so the probe launches and exits 127 (a real
+              # failure) when python/swegen is gone.
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             # import swegen.cli is ~1.7-2s cold and slower under load, so the
             # exec needs a generous timeout: the 1s default times out on a
             # perfectly healthy pod and restart-loops the whole fleet.
@@ -1147,7 +1196,7 @@ spec:
             failureThreshold: 12
           livenessProbe:
             exec:
-              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
             initialDelaySeconds: 30
             periodSeconds: 60
             timeoutSeconds: 10
