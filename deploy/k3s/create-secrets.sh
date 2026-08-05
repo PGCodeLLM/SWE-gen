@@ -3,7 +3,7 @@ set -euo pipefail
 
 namespace="${SWEGEN_K3S_NAMESPACE:-swegen-pipeline}"
 model_secret_name="${SWEGEN_MODEL_SECRET_NAME:-swegen-model-credentials-v2}"
-generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-moedsa-20260802-v2}"
+generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-thinking-npu-20260804}"
 reward_model_secret_name="${SWEGEN_REWARD_MODEL_SECRET_NAME:-swegen-reward-credentials-gpt56sol-20260803}"
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_directory}/../.." && pwd)"
@@ -128,7 +128,7 @@ import yaml
 source, destination = map(Path, sys.argv[1:])
 document = yaml.safe_load(source.read_text(encoding="utf-8"))
 entries = document.get("model_list") if isinstance(document, dict) else None
-model = os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-moedsa").strip()
+model = os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-thinking-npu").strip()
 if not model:
     raise SystemExit("SWEGEN_REPAIR_MODEL_NAME must not be blank")
 matches = [

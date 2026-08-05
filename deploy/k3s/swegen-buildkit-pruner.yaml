@@ -85,6 +85,41 @@ spec:
                   # is intentionally not mounted into this DaemonSet.
                   timeout 120 docker image prune --force || true
 
+                  # Reclaim task images that SWR already holds. Each candidate
+                  # is removed only after its manifest is confirmed present in
+                  # the registry, so a push that never landed keeps its local
+                  # copy. An unreachable registry makes every check fail, which
+                  # skips deletion rather than discarding unverified images.
+                  if [ "${SWEGEN_SWR_PRUNE_ENABLED}" = "true" ]; then
+                    swr_checked=0
+                    swr_deleted=0
+                    swr_unverified=0
+                    swr_deadline="$((
+                      $(date -u +%s) + SWEGEN_SWR_PRUNE_BUDGET_SECONDS
+                    ))"
+                    docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+                      | grep -F "${SWEGEN_SWR_HOST}" \
+                      | grep -v '<none>' \
+                      | sort -u > /tmp/swegen-swr-candidates.txt || true
+                    while read -r swr_image; do
+                      [ -n "${swr_image}" ] || continue
+                      [ "$(date -u +%s)" -lt "${swr_deadline}" ] || break
+                      swr_checked="$((swr_checked + 1))"
+                      if timeout "${SWEGEN_SWR_MANIFEST_TIMEOUT_SECONDS}" \
+                        docker manifest inspect "${swr_image}" >/dev/null 2>&1
+                      then
+                        if timeout 60 docker rmi "${swr_image}" >/dev/null 2>&1; then
+                          swr_deleted="$((swr_deleted + 1))"
+                        fi
+                      else
+                        swr_unverified="$((swr_unverified + 1))"
+                      fi
+                    done < /tmp/swegen-swr-candidates.txt
+                    printf '%s node=%s swr-image cleanup checked=%s deleted=%s unverified_kept=%s\n' \
+                      "$(date -Iseconds)" "${NODE_NAME}" "${swr_checked}" \
+                      "${swr_deleted}" "${swr_unverified}"
+                  fi
+
                   cutoff_epoch="$((
                     $(date -u +%s) - SWEGEN_DOCKER_CONTAINER_MAX_AGE_SECONDS
                   ))"
@@ -164,6 +199,23 @@ spec:
               value: 100GB
             - name: SWEGEN_BUILDKIT_RESERVED_SPACE
               value: 20GB
+            - name: SWEGEN_SWR_PRUNE_ENABLED
+              value: "true"
+            - name: SWEGEN_SWR_HOST
+              value: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
+            # Registry round-trips dominate this step, so cap the work per
+            # cycle instead of letting it outlast the prune interval.
+            - name: SWEGEN_SWR_PRUNE_BUDGET_SECONDS
+              value: "300"
+            - name: SWEGEN_SWR_MANIFEST_TIMEOUT_SECONDS
+              value: "30"
+            - name: DOCKER_CONFIG
+              value: /swegen-docker
+            # The registry auth Secret above is intentionally read-only, but
+            # Buildx writes local state under $DOCKER_CONFIG/buildx by default.
+            # Keep those files in the Pod's writable ephemeral filesystem.
+            - name: BUILDX_CONFIG
+              value: /tmp/swegen-buildx
           resources:
             requests:
               cpu: 25m
@@ -178,11 +230,19 @@ spec:
               mountPath: /host-run-lock
             - name: build-slots
               mountPath: /run/swegen-build-slots
+            # Registry credentials for the SWR manifest checks. Read-only: the
+            # pruner never writes Docker config.
+            - name: swegen-docker-config
+              mountPath: /swegen-docker
+              readOnly: true
       volumes:
         - name: docker-sock
           hostPath:
             path: /var/run/docker.sock
             type: Socket
+        - name: swegen-docker-config
+          secret:
+            secretName: swegen-docker-config
         - name: host-run-lock
           hostPath:
             path: /run/lock

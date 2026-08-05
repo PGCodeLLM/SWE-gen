@@ -83,7 +83,27 @@ _INSERT_STAGE_RESULT_SQL = """
         pgmq_msg_id, pgmq_read_count, worker_id, node_name,
         started_at, finished_at, result, error
     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-    ON CONFLICT (task_id, task_version, stage, attempt) DO NOTHING
+    -- The QueueMessage carries a fixed attempt number, so a re-delivered task
+    -- collides on the same (task, version, stage, attempt) key. Plain
+    -- DO NOTHING dropped a later success that landed on an earlier failure's
+    -- row, so the win was recorded as nothing-new and never handed off to the
+    -- next stage. Upgrade a prior non-success to succeeded (overwriting the
+    -- failure and RETURNING the row so the caller treats it as newly completed
+    -- and enqueues the successor). An existing success is left untouched and
+    -- RETURNS nothing, so a duplicate success neither double-handoffs nor
+    -- regresses to a failure.
+    ON CONFLICT (task_id, task_version, stage, attempt) DO UPDATE SET
+        status = EXCLUDED.status,
+        pgmq_msg_id = EXCLUDED.pgmq_msg_id,
+        pgmq_read_count = EXCLUDED.pgmq_read_count,
+        worker_id = EXCLUDED.worker_id,
+        node_name = EXCLUDED.node_name,
+        started_at = EXCLUDED.started_at,
+        finished_at = EXCLUDED.finished_at,
+        result = EXCLUDED.result,
+        error = EXCLUDED.error
+    WHERE pipeline_stage_results.status <> 'succeeded'
+      AND EXCLUDED.status = 'succeeded'
     RETURNING task_id, task_version, stage, attempt
 """
 _UPDATE_TASK_SQL = """

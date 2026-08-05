@@ -830,6 +830,18 @@ validations.
 
 MAX_INCOMPLETE_CONTINUATIONS = 3
 
+# Some model backends (e.g. glm-5.2-thinking-npu behind the gateway) finish the
+# work but never surface a terminal ``ResultMessage`` — the final stream chunk
+# carrying ``stop_reason: end_turn`` is dropped, so ``receive_response()`` would
+# otherwise block until the whole-session timeout. When the message stream goes
+# quiet for this many seconds AND the task output is already complete (no TODOs
+# left), treat the turn as finished: the deliverable exists, only the end-of-turn
+# signal was lost. Kept well above a normal inter-message gap so a slow-but-alive
+# turn is never cut short.
+IDLE_COMPLETION_TIMEOUT_SECONDS = float(
+    os.environ.get("SWEGEN_CC_IDLE_COMPLETION_SECONDS", "180")
+)
+
 
 def run_claude_code_session(
     repo: str,
@@ -1168,21 +1180,57 @@ async def _run_claude_code_session_async(
                 async with asyncio.timeout(timeout):
                     async with ClaudeSDKClient(options=options) as client:
                         next_prompt = prompt_text
-                        for turn in range(MAX_INCOMPLETE_CONTINUATIONS + 1):
-                            await client.query(next_prompt)
-                            async for message in client.receive_response():
-                                if verbose:
-                                    print_sdk_message(message)
-
+                        def _current_state() -> ClaudeCodeResult:
                             if validate:
-                                state = _check_validation_state(
+                                return _check_validation_state(
                                     jobs_dir,
                                     task_id,
                                     logger,
                                     baseline=validation_baseline,
                                 )
-                            else:
-                                state = _check_generation_state(task_dir)
+                            return _check_generation_state(task_dir)
+
+                        for turn in range(MAX_INCOMPLETE_CONTINUATIONS + 1):
+                            await client.query(next_prompt)
+                            # ``receive_response()`` only stops after a terminal
+                            # ResultMessage. Some backends complete the work but
+                            # never emit it (dropped ``end_turn``), which would
+                            # hang here until the session timeout. Consume with an
+                            # idle watchdog: if the stream goes quiet and the task
+                            # output is already complete, the turn is effectively
+                            # done — stop waiting for a signal that was lost.
+                            responses = client.receive_response().__aiter__()
+                            idle_complete = False
+                            while True:
+                                try:
+                                    message = await asyncio.wait_for(
+                                        responses.__anext__(),
+                                        timeout=IDLE_COMPLETION_TIMEOUT_SECONDS,
+                                    )
+                                except StopAsyncIteration:
+                                    break
+                                except TimeoutError:
+                                    # No message for the idle window. If the
+                                    # deliverable is already complete, accept it;
+                                    # otherwise keep waiting (slow, still working).
+                                    if _current_state().success:
+                                        logger.warning(
+                                            "Claude Code stream idle %.0fs with %s "
+                                            "already complete; treating turn as "
+                                            "finished (missing end-of-turn signal)",
+                                            IDLE_COMPLETION_TIMEOUT_SECONDS,
+                                            "validation" if validate else "task files",
+                                        )
+                                        idle_complete = True
+                                        break
+                                    continue
+                                if verbose:
+                                    print_sdk_message(message)
+
+                            state = _current_state()
+                            if idle_complete and not state.success:
+                                # Race: state regressed between check and break.
+                                state = _current_state()
                             if state.success:
                                 if verbose:
                                     print("-" * 60, flush=True)

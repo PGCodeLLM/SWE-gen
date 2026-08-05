@@ -214,3 +214,120 @@ def test_generate_only_session_completes_files_without_harbor(tmp_path, monkeypa
     assert len(prompts) == 1
     assert "Do not run Harbor" in prompts[0]
     assert "--agent nop" not in prompts[0]
+
+
+def test_idle_stream_with_complete_task_is_treated_as_finished(tmp_path, monkeypatch) -> None:
+    """A backend that finishes the work but never emits a terminal ResultMessage
+    (dropped end_turn) must not hang: the idle watchdog accepts the completed
+    deliverable once the stream goes quiet."""
+    prompts: list[str] = []
+
+    repo_path = tmp_path / "repo"
+    task_dir = tmp_path / "tasks" / "owner__repo-1"
+    environment_dir = task_dir / "environment"
+    tests_dir = task_dir / "tests"
+    repo_path.mkdir()
+    environment_dir.mkdir(parents=True)
+    tests_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("# TODO: fill runtime\n")
+    (tests_dir / "test.sh").write_text("# TODO: run tests\n")
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def query(self, prompt):
+            prompts.append(prompt)
+            # Agent completes the deliverable (clears the TODOs)...
+            (environment_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            (tests_dir / "test.sh").write_text("#!/bin/sh\nnpm test\n")
+
+        async def receive_response(self):
+            # ...but never emits a ResultMessage: the stream just goes quiet.
+            while True:
+                await asyncio.sleep(3600)
+                yield None  # pragma: no cover - never reached
+
+    # Short idle window so the watchdog fires quickly in the test.
+    monkeypatch.setenv("SWEGEN_CC_IDLE_COMPLETION_SECONDS", "0.2")
+    monkeypatch.setattr(runner, "IDLE_COMPLETION_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(runner, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(runner, "load_model_settings", lambda: ModelSettings(model="test-model"))
+
+    result = asyncio.run(
+        runner._run_claude_code_session_async(
+            repo="owner/repo",
+            pr_number=1,
+            repo_path=repo_path,
+            task_dir=task_dir,
+            task_id="owner__repo-1",
+            dataset_path=task_dir.parent,
+            test_files=[],
+            timeout=30,
+            jobs_dir=tmp_path / "jobs",
+            validate=False,
+        )
+    )
+
+    assert result.success is True
+    assert len(prompts) == 1
+
+
+def test_idle_stream_with_incomplete_task_keeps_waiting(tmp_path, monkeypatch) -> None:
+    """When the stream is idle but the task is NOT complete, the watchdog must
+    keep waiting (not falsely accept) until the session timeout fires."""
+    repo_path = tmp_path / "repo"
+    task_dir = tmp_path / "tasks" / "owner__repo-1"
+    environment_dir = task_dir / "environment"
+    tests_dir = task_dir / "tests"
+    repo_path.mkdir()
+    environment_dir.mkdir(parents=True)
+    tests_dir.mkdir()
+    # TODOs remain -> _check_generation_state reports failure the whole time.
+    (environment_dir / "Dockerfile").write_text("# TODO: fill runtime\n")
+    (tests_dir / "test.sh").write_text("# TODO: run tests\n")
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def query(self, prompt):
+            pass
+
+        async def receive_response(self):
+            while True:
+                await asyncio.sleep(3600)
+                yield None  # pragma: no cover
+
+    monkeypatch.setattr(runner, "IDLE_COMPLETION_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(runner, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(runner, "load_model_settings", lambda: ModelSettings(model="test-model"))
+
+    # Session timeout should fire (never falsely returns success) -> timed_out result.
+    result = asyncio.run(
+        runner._run_claude_code_session_async(
+            repo="owner/repo",
+            pr_number=1,
+            repo_path=repo_path,
+            task_dir=task_dir,
+            task_id="owner__repo-1",
+            dataset_path=task_dir.parent,
+            test_files=[],
+            timeout=1,
+            jobs_dir=tmp_path / "jobs",
+            validate=False,
+        )
+    )
+    assert result.success is False

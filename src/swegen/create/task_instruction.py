@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 from openai import OpenAI
 
 from .utils import CombinedPRTaskEvaluation
+
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL | re.IGNORECASE)
 
 MAX_LINKED_ISSUES = 5
 MAX_ISSUE_BODY_LENGTH = 2500
@@ -331,6 +334,17 @@ def _tolerant_parse_content(content: str) -> CombinedPRTaskEvaluation:
     except Exception:
         pass
 
+    # Some backends (e.g. glm-5.2-thinking-npu) wrap the JSON answer in a
+    # markdown code fence (```json ... ```) instead of returning raw JSON.
+    # Strip fences and retry the fast path before falling back to the
+    # brace-scanner below.
+    fence_match = _CODE_FENCE_RE.search(text)
+    if fence_match:
+        try:
+            return CombinedPRTaskEvaluation.model_validate_json(fence_match.group(1).strip())
+        except Exception:
+            pass
+
     # Robust path: find every top-level JSON object and keep the last valid one.
     decoder = json.JSONDecoder()
     best: CombinedPRTaskEvaluation | None = None
@@ -459,16 +473,22 @@ def evaluate_and_generate_task(
             if result is None:
                 raise RuntimeError("LLM returned no parsed result")
         except Exception as parse_exc:
-            # Fallback only for reasoning backends that wrap the JSON answer in a
-            # <think>...</think> block (strict parse() then fails on non-JSON at
-            # column 1). Re-request without strict parsing and tolerate the block.
+            # Fallback for two related failure modes:
+            #  1. Reasoning backends that wrap the JSON answer in a
+            #     <think>...</think> block (strict parse() fails on non-JSON
+            #     at column 1).
+            #  2. Backends that don't enforce the json_schema grammar behind
+            #     response_format at all (e.g. glm-5.2-thinking-npu) and just
+            #     free-write markdown prose per the system prompt's writing
+            #     instructions, sometimes fenced, sometimes not JSON at all.
+            # For (2), relying on response_format alone isn't enough - the
+            # retry also spells out the schema in-prompt so the model has an
+            # explicit instruction to answer with, not just the API-level hint.
             logger.warning(
-                "Structured parse failed (%s); retrying with <think>-tolerant parsing",
+                "Structured parse failed (%s); retrying with explicit JSON instructions",
                 type(parse_exc).__name__,
             )
             try:
-                # Send the same json_schema the parse() path uses, so the request
-                # to the model is identical; we just parse the content leniently.
                 try:
                     from openai.lib._parsing import type_to_response_format_param
 
@@ -478,9 +498,22 @@ def evaluate_and_generate_task(
                 except Exception:
                     response_format = {"type": "json_object"}
 
+                schema_hint = json.dumps(
+                    CombinedPRTaskEvaluation.model_json_schema(), indent=2
+                )
+                json_instruction = {
+                    "role": "user",
+                    "content": (
+                        "Respond with ONLY a single JSON object matching this schema - "
+                        "no markdown code fences, no commentary before or after, no "
+                        "<think> blocks:\n\n" + schema_hint
+                    ),
+                }
+                retry_messages = messages + [json_instruction]
+
                 raw = client.chat.completions.create(
                     model=model,
-                    messages=messages,
+                    messages=retry_messages,
                     response_format=response_format,
                     max_completion_tokens=MAX_COMPLETION_TOKENS,
                 )
@@ -488,9 +521,16 @@ def evaluate_and_generate_task(
                 if not content:
                     raise RuntimeError("LLM returned empty content")
                 result = _tolerant_parse_content(content)
-            except Exception:
-                # Recovery failed; surface the original strict-parse failure.
-                raise parse_exc
+            except Exception as retry_exc:
+                # Recovery failed too. Surface the retry's own failure (not the
+                # original parse_exc) - it reflects what the model actually
+                # returned after being told the schema explicitly, which is
+                # what's needed to diagnose backends that keep free-writing
+                # prose despite the instruction.
+                raise RuntimeError(
+                    f"Structured parse failed ({type(parse_exc).__name__}); "
+                    f"explicit-JSON retry also failed ({type(retry_exc).__name__}): {retry_exc}"
+                ) from retry_exc
 
         logger.debug(
             f"Combined evaluation: is_substantial={result.is_substantial}, reason={result.reason[:DEBUG_REASON_TRUNCATE_LENGTH]}..."

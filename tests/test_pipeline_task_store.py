@@ -66,17 +66,12 @@ INSERT_FILE_SQL = normalize_sql(
     ) VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
 )
-INSERT_STAGE_RESULT_SQL = normalize_sql(
-    """
-    INSERT INTO pipeline_stage_results (
-        task_id, task_version, stage, attempt, status,
-        pgmq_msg_id, pgmq_read_count, worker_id, node_name,
-        started_at, finished_at, result, error
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-    ON CONFLICT (task_id, task_version, stage, attempt) DO NOTHING
-    RETURNING task_id, task_version, stage, attempt
-    """
-)
+# Reference the module's own SQL so the assertion tracks the real query
+# (which now upgrades a prior non-success to succeeded on conflict) instead of
+# duplicating a literal that silently drifts.
+from swegen.pipeline.task_store import _INSERT_STAGE_RESULT_SQL as _MODULE_INSERT_STAGE_RESULT_SQL
+
+INSERT_STAGE_RESULT_SQL = normalize_sql(_MODULE_INSERT_STAGE_RESULT_SQL)
 UPDATE_TASK_SQL = normalize_sql(
     """
     UPDATE pipeline_tasks
@@ -1633,3 +1628,33 @@ def test_record_stage_result_requires_an_aware_clock() -> None:
         )
 
     assert connection.calls == []
+
+
+def test_stage_result_insert_upgrades_prior_failure_to_success_on_conflict() -> None:
+    """The QueueMessage carries a fixed attempt, so a re-delivered task that
+    previously failed collides on the same (task, version, stage, attempt) key.
+    The insert must UPGRADE that row to succeeded (and RETURN it so the caller
+    hands off to the next stage), never silently DO NOTHING which stranded the
+    win at 'queued/generate' with no nop/oracle handoff."""
+    from swegen.pipeline.task_store import _INSERT_STAGE_RESULT_SQL
+
+    # Strip the explanatory ``-- ...`` comment lines (which mention the old
+    # DO NOTHING for context) before asserting on the executable SQL.
+    sql = normalize_sql(
+        " ".join(
+            line
+            for line in _INSERT_STAGE_RESULT_SQL.splitlines()
+            if not line.strip().startswith("--")
+        )
+    )
+    # Conflict must upgrade, not drop.
+    assert "ON CONFLICT (task_id, task_version, stage, attempt) DO UPDATE" in sql
+    assert "DO NOTHING" not in sql
+    # Only a real fail->success transition upgrades: an existing success is left
+    # intact (returns nothing -> no double-handoff), and a non-success incoming
+    # status never overwrites (no success->fail regression).
+    assert "WHERE pipeline_stage_results.status <> 'succeeded'" in sql
+    assert "AND EXCLUDED.status = 'succeeded'" in sql
+    # It must still RETURN the identity so record_stage_result sees a row and
+    # treats the upgrade as newly-completed.
+    assert sql.rstrip().endswith("RETURNING task_id, task_version, stage, attempt")

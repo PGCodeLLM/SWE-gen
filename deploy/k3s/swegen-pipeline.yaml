@@ -133,7 +133,7 @@ spec:
             - secretRef:
                 name: swegen-runtime-proxy
             - secretRef:
-                name: swegen-model-credentials-sol-direct-20260803
+                name: swegen-model-credentials-glm52-thinking-npu-20260804
           env:
             - name: POD_NAME
               valueFrom:
@@ -143,12 +143,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # Build wiring, matching validate/repair. SWEGEN_GENERATE_VALIDATE
-            # is what actually turns generation-time builds on: with it set the
-            # agent runs Docker, sees its own build failures and can amend the
-            # Dockerfile, instead of deferring every failure to validate.
+            # Generate needs GitHub/API egress but the corporate proxy DNS name
+            # is not resolvable from pods. Route it through the node-local ATS
+            # gateway; explicit env values override swegen-runtime-proxy.
+            - name: HTTP_PROXY
+              value: http://7.244.3.78:3128
+            - name: HTTPS_PROXY
+              value: http://7.244.3.78:3128
+            - name: http_proxy
+              value: http://7.244.3.78:3128
+            - name: https_proxy
+              value: http://7.244.3.78:3128
+            # Keep generation lightweight and defer NOP/Oracle validation to
+            # the dedicated validate stage. actions.py appends --no-validate
+            # whenever SWEGEN_GENERATE_VALIDATE is false.
             - name: SWEGEN_GENERATE_VALIDATE
-              value: "true"
+              value: "false"
             - name: DOCKER_BUILDKIT
               value: "1"
             - name: BUILDX_BUILDER
@@ -194,10 +204,161 @@ spec:
               mountPath: /etc/swegen/combined-ca.crt
               subPath: combined-ca.crt
               readOnly: true
-            # Generate builds only when SWEGEN_GENERATE_VALIDATE is set; the
-            # socket is mounted unconditionally so the flag can be flipped
-            # without a rollout. Same wiring as validate/repair, which routes
-            # through the shared build slots and the remote farm.
+            # The socket stays mounted so validation can be re-enabled without
+            # rebuilding the image; normal builds run in validate/repair.
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: build-slots
+              mountPath: /run/swegen-build-slots
+            - name: swegen-bin
+              mountPath: /opt/swegen/bin
+              readOnly: true
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: workspace
+          hostPath:
+            path: /data/swegen-k3s/workspaces
+            type: DirectoryOrCreate
+        - name: repo-cache
+          hostPath:
+            path: /data/swegen-k3s/cache
+            type: DirectoryOrCreate
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: build-slots
+          hostPath:
+            path: /data/swegen-k3s/build-slots
+            type: DirectoryOrCreate
+        - name: swegen-bin
+          hostPath:
+            path: /data/swegen-k3s/bin
+            type: DirectoryOrCreate
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 256
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swegen-generate-overflow
+  namespace: swegen-pipeline
+spec:
+  # Kept at 0 and only scaled up by the dashboard once swegen-generate hits
+  # GENERATE_MAIN_CAPACITY (see K3sScaler.plan in dashboard/server.py). The
+  # dashboard syncs this deployment's worker image and model Secret from the
+  # live swegen-generate deployment before scaling it up, so the values below
+  # are just a valid starting point, not the source of truth.
+  replicas: 0
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 16
+      maxUnavailable: 16
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-worker
+      swegen.pgcode/stage: generate-overflow
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-worker
+        swegen.pgcode/stage: generate-overflow
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 18000
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swegen-worker
+              swegen.pgcode/stage: generate-overflow
+      containers:
+        - name: worker
+          image: swegen-worker:generate-validate-20260804
+          imagePullPolicy: Never
+          args: ["--stage", "generate"]
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+            - secretRef:
+                name: swegen-model-credentials-glm52-thinking-npu-20260804
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HTTP_PROXY
+              value: http://7.244.3.78:3128
+            - name: HTTPS_PROXY
+              value: http://7.244.3.78:3128
+            - name: http_proxy
+              value: http://7.244.3.78:3128
+            - name: https_proxy
+              value: http://7.244.3.78:3128
+            - name: SWEGEN_GENERATE_VALIDATE
+              value: "false"
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: BUILDX_BUILDER
+              value: "default"
+            - name: COMPOSE_BAKE
+              value: "false"
+            - name: PATH
+              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: SWEGEN_REAL_DOCKER
+              value: /usr/bin/docker
+            - name: SWEGEN_BUILD_SLOT_DIR
+              value: /run/swegen-build-slots
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          resources:
+            requests:
+              cpu: 500m
+              memory: 200Mi
+            limits:
+              cpu: "16"
+              memory: 32Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/swegen-k3s/workspaces
+            - name: repo-cache
+              mountPath: /data/swegen-k3s/cache
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
             - name: docker-sock
               mountPath: /var/run/docker.sock
             - name: build-slots
@@ -418,7 +579,7 @@ spec:
             - secretRef:
                 name: swegen-runtime-proxy
             - secretRef:
-                name: swegen-repair-model-credentials
+                name: swegen-model-credentials-glm52-thinking-npu-20260804
           env:
             - name: POD_NAME
               valueFrom:

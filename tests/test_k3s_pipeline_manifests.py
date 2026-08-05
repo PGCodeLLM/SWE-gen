@@ -37,11 +37,17 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     documents = _documents()
     namespace = next(document for document in documents if document["kind"] == "Namespace")
     config_map = next(document for document in documents if document["kind"] == "ConfigMap")
-    deployments = {
+    all_deployments = {
         document["metadata"]["name"]: document
         for document in documents
         if document["kind"] == "Deployment"
     }
+    # swegen-generate-overflow is a secondary pool the dashboard only scales
+    # above GENERATE_MAIN_CAPACITY (see K3sScaler.plan); it mirrors
+    # swegen-generate's pod spec but isn't one of the primary one-per-stage
+    # deployments the rest of this test asserts properties over.
+    overflow_deployment = all_deployments.pop("swegen-generate-overflow")
+    deployments = all_deployments
 
     assert namespace["metadata"]["name"] == "swegen-pipeline"
     assert config_map["metadata"]["namespace"] == "swegen-pipeline"
@@ -218,10 +224,33 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         "swegen-reward-credentials-gpt56sol-20260803"
     )
 
+    # swegen-generate-overflow starts parked at 0 and must exist ahead of time:
+    # the dashboard's K3sScaler always issues a `kubectl scale` for it (even
+    # to just set 0 replicas) whenever generate is scaled, so a missing
+    # deployment 404s the whole scaling request.
+    overflow_pod_spec = overflow_deployment["spec"]["template"]["spec"]
+    overflow_container = overflow_pod_spec["containers"][0]
+    assert overflow_deployment["spec"]["replicas"] == 0
+    assert overflow_deployment["spec"]["strategy"]["type"] == "RollingUpdate"
+    assert overflow_container["name"] == "worker"
+    assert overflow_container["args"] == ["--stage", "generate"]
+    assert overflow_container["imagePullPolicy"] == "Never"
+    # Its own selector/labels, distinct from swegen-generate's, so scaling one
+    # deployment never double-counts or steals the other's pods.
+    assert overflow_deployment["spec"]["selector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "swegen-worker",
+        "swegen.pgcode/stage": "generate-overflow",
+    }
+    assert (
+        overflow_deployment["spec"]["selector"]["matchLabels"]
+        != deployments["swegen-generate"]["spec"]["selector"]["matchLabels"]
+    )
+
 
 def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert (DEPLOY_DIR / "create-secrets.sh").is_file()
     assert (DEPLOY_DIR / "build-import-worker.sh").is_file()
+    assert (DEPLOY_DIR / "sync-worker-image.sh").is_file()
     assert not (DEPLOY_DIR / "docker-cache-cleaner.sh").exists()
 
     dockerignore = (ROOT / ".dockerignore").read_text().splitlines()
@@ -245,12 +274,26 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert "normalize_env_file" in secret_helper
     assert "s/^export[[:space:]]+//" in secret_helper
     assert "merged_docker_config" in secret_helper
+
+    # sync-worker-image.sh guarantees a tag lands on every node (avoiding the
+    # ErrImageNeverPull failure when a scaled Pod lands on a node missing the
+    # image). It must relay through the invoking host, not assume node-to-node
+    # SSH, because the cluster's inter-node SSH mesh is not fully connected.
+    sync_helper = (DEPLOY_DIR / "sync-worker-image.sh").read_text()
+    assert "k3s ctr -n k8s.io images export" in sync_helper
+    assert "k3s ctr -n k8s.io images import" in sync_helper
+    assert "k3s crictl inspecti" in sync_helper
+    assert "--all" in sync_helper
+    assert "SWEGEN_K3S_NODES" in sync_helper
     assert '"httpProxy"' in secret_helper
     assert '"httpsProxy"' in secret_helper
     assert '"noProxy"' in secret_helper
     assert '--from-file=config.json="${merged_docker_config}"' in secret_helper
     assert "swegen-repair-model-credentials" in secret_helper
-    assert 'os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-moedsa")' in secret_helper
+    assert (
+        'os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-thinking-npu")'
+        in secret_helper
+    )
     assert 'entry.get("model_name") == model' in secret_helper
     assert '"CLAUDE_CODE_MAX_CONTEXT_TOKENS", "160000"' in secret_helper
     assert '"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "150000"' in secret_helper
@@ -264,7 +307,7 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
         in secret_helper
     )
     assert (
-        'generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-moedsa-20260802-v2}"'
+        'generate_glm_secret_name="${SWEGEN_GENERATE_GLM_SECRET_NAME:-swegen-model-credentials-glm52-thinking-npu-20260804}"'
         in secret_helper
     )
     assert (

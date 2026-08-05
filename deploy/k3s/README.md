@@ -370,6 +370,28 @@ the tag. With `imagePullPolicy: Never`, every schedulable node must have the
 image before a rollout. This includes nodes that are currently full but may
 become schedulable later.
 
+### Keeping images synced across all nodes
+
+Because `imagePullPolicy: Never` means a Pod only starts on a node that already
+has its image, a scale-up or rollout that lands a Pod on a node missing the tag
+fails with `ErrImageNeverPull`. `sync-worker-image.sh` guarantees a tag is
+present on every node:
+
+```bash
+# sync one tag to any node missing it
+./deploy/k3s/sync-worker-image.sh swegen-worker:REPLACE_WITH_IMMUTABLE_TAG
+
+# sync every tag referenced by live swegen-pipeline Deployments (run this
+# after any deploy/scale so no node can hit ErrImageNeverPull)
+./deploy/k3s/sync-worker-image.sh --all
+```
+
+It exports the tag from a node that has it, relays the tarball through the
+invoking host (the cluster's node-to-node SSH mesh is not fully connected, so
+it does not assume direct node->node scp), imports on each missing node, and
+verifies via `crictl`. A tag present on no node is reported so it can be built
+with `build-import-worker.sh` first.
+
 ## Create Kubernetes secrets
 
 The helper requires these root-readable source files:
@@ -398,15 +420,18 @@ The script prompts for the PostgreSQL password unless
 creates only Kubernetes Secret objects and never writes plaintext credentials
 to the repository. Repair credentials are stored separately in
 `swegen-repair-model-credentials`; the helper sets the primary and fast Claude
-Code model variables to `glm-5.2-moedsa` without printing the API key. It also
+Code model variables to `glm-5.2-thinking-npu` without printing the API key.
+Generate and Repair both load the immutable
+`swegen-model-credentials-glm52-thinking-npu-20260804` Secret generated from
+the matching `models.yaml` entry. It also
 sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS=160000` and
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000` so repair sessions compact before the
 model deployment's context limit. Override either value in the helper's process
 environment when targeting a deployment with a different context window.
-Set `SWEGEN_REPAIR_MODEL_NAME=gpt-5.6-sol` when Repair should use the same
-`models.yaml` entry and `1.95.77.23:3000` endpoint as Generate; the helper
-selects the matching model entry and recreates only the repair credential
-Secret with those values.
+Set `SWEGEN_REPAIR_MODEL_NAME` and `SWEGEN_GENERATE_GLM_SECRET_NAME` together
+when rotating Generate and Repair to a different `models.yaml` entry; the
+immutable Secret name must also be added to `credential-guard.yaml` before the
+Generate deployment can reference it.
 
 ## Configure and deploy the pipeline
 
