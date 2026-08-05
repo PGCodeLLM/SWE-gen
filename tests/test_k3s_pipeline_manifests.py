@@ -247,6 +247,35 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     )
 
 
+def test_every_worker_has_a_rootfs_integrity_probe() -> None:
+    # crun/overlayfs snapshot corruption under pod churn can strip /app/.venv
+    # (python + swegen) from a Running pod, which then fails every task in
+    # ~13ms and drains the queue while k8s still reports it Ready. Each worker
+    # container must carry an exec probe that imports swegen so such a pod is
+    # restarted onto a fresh overlay instead of silently shredding work.
+    documents = _documents()
+    worker_deployments = [
+        document
+        for document in documents
+        if document["kind"] == "Deployment"
+        and document["spec"]["template"]["spec"]["containers"][0]["name"] == "worker"
+    ]
+    assert worker_deployments, "expected at least one worker deployment"
+    probe_command = ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+    for deployment in worker_deployments:
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        name = deployment["metadata"]["name"]
+        liveness = container.get("livenessProbe")
+        startup = container.get("startupProbe")
+        assert liveness is not None, f"{name} missing livenessProbe"
+        assert startup is not None, f"{name} missing startupProbe"
+        assert liveness["exec"]["command"] == probe_command, name
+        assert startup["exec"]["command"] == probe_command, name
+        # Liveness must actually fail a wedged pod (finite failureThreshold)
+        # rather than tolerate it indefinitely.
+        assert liveness["failureThreshold"] <= 3, name
+
+
 def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert (DEPLOY_DIR / "create-secrets.sh").is_file()
     assert (DEPLOY_DIR / "build-import-worker.sh").is_file()

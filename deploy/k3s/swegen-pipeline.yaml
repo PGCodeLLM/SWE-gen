@@ -184,6 +184,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             requests:
               cpu: 500m
@@ -339,6 +361,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             requests:
               cpu: 500m
@@ -478,6 +522,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             # Sized from measured usage across 400 live pods: median 12m CPU /
             # 254Mi, p90 78m / 462Mi. The old 250m/1200Mi reserved roughly 20x
@@ -611,6 +677,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             # Sized from measured usage across 400 live pods: median 12m CPU /
             # 254Mi, p90 78m / 462Mi. The old 250m/1200Mi reserved roughly 20x
@@ -751,6 +839,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             # Sized from measured usage across 400 live pods: median 12m CPU /
             # 254Mi, p90 78m / 462Mi. The old 250m/1200Mi reserved roughly 20x
@@ -884,6 +994,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             # Measured median 1m CPU / 92Mi across 8 live pods; limits unchanged
             # so a heavy reward run can still burst.
@@ -998,6 +1130,28 @@ spec:
                 configMapKeyRef:
                   name: swegen-pipeline-config
                   key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
+          # heavy pod churn can silently strip /app/.venv (python + swegen)
+          # from a Running pod, which then fails every task in ~13ms and
+          # shreds the queue while k8s still reports it Ready. Validating the
+          # import turns such a pod into a restart (fresh overlay) instead of
+          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
+          startupProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            # import swegen.cli is ~1.7-2s cold and slower under load, so the
+            # exec needs a generous timeout: the 1s default times out on a
+            # perfectly healthy pod and restart-loops the whole fleet.
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/app/.venv/bin/python", "-c", "import swegen.cli"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
           resources:
             # Measured median 1m CPU / 91Mi across 16 live pods. The old 2-CPU
             # request reserved 32 cores cluster-wide that were never used.
