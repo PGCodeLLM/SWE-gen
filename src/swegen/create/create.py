@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import random
 import time
 import traceback
 from datetime import UTC, datetime
@@ -414,6 +416,35 @@ def _run_harbor_validations(
     return results_rows, job_dirs
 
 
+def _pick_github_token() -> str | None:
+    """Choose the GitHub token this process uses for PR/issue API calls.
+
+    Precedence: an explicit ``GITHUB_TOKEN`` env wins; otherwise pick one token
+    at random from the ``[github].gh_tokens`` pool in swegen.toml. Picking once
+    per process (module import time) spreads a fleet of worker pods across the
+    pool on startup, so no single token's 5000/hr budget is oversubscribed.
+
+    Without this, PRToHarborPipeline was constructed with no token and the
+    fetcher fell back to unauthenticated GitHub (60/hr per egress IP), which a
+    few hundred pods exhaust instantly — surfacing as api.github.com read
+    timeouts and a runaway generate failure rate.
+    """
+    env_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if env_token:
+        return env_token
+    from swegen.model_settings import load_github_tokens
+
+    pool = load_github_tokens()
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
+# Chosen once per process so every task a pod generates reuses the same token
+# and the pool is balanced across pods rather than re-rolled per task.
+_PROCESS_GITHUB_TOKEN = _pick_github_token()
+
+
 def run_reversal(config: CreateConfig) -> None:
     """Convert a merged PR into a Harbor task.
 
@@ -422,7 +453,9 @@ def run_reversal(config: CreateConfig) -> None:
     """
     rich_traceback_install(show_locals=False)
     console = Console()
-    pipeline = PRToHarborPipeline(repo=config.repo, pr_number=config.pr)
+    pipeline = PRToHarborPipeline(
+        repo=config.repo, pr_number=config.pr, github_token=_PROCESS_GITHUB_TOKEN
+    )
     # Configure file logging for detailed generation logs
     logs_root = Path(config.state_dir) / "logs"
     logs_root.mkdir(parents=True, exist_ok=True)
