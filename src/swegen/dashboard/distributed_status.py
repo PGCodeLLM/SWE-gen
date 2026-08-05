@@ -26,7 +26,13 @@ STAGES = ("generate", "validate", "repair", "reward", "push")
 # deployment shares the generate image and the swegen_generate queue). Fold
 # those aliases back onto their canonical stage so the dashboard counts the
 # combined worker fleet instead of only the primary deployment's pods.
-STAGE_ALIASES = {"generate-overflow": "generate"}
+# generate-moedsa is a second generate pool pinned to a different model engine
+# (glm-5.2-moedsa-thinking) behind the same endpoint; it also drains the
+# swegen_generate queue, so it counts as generate too.
+STAGE_ALIASES = {
+    "generate-overflow": "generate",
+    "generate-moedsa": "generate",
+}
 QUEUE_BY_STAGE = {
     "generate": ("swegen_generate",),
     "validate": ("swegen_validate_repaired", "swegen_validate"),

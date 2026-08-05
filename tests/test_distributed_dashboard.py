@@ -751,6 +751,8 @@ def test_k3s_collector_folds_generate_overflow_alias_into_generate() -> None:
             _pod("gen-1", "generate", {"phase": "Running"}),
             _pod("ovf-1", "generate-overflow", {"phase": "Running"}),
             _pod("ovf-2", "generate-overflow", {"phase": "Running"}),
+            # A second generate pool on a different model engine, distinct label.
+            _pod("moe-1", "generate-moedsa", {"phase": "Running"}),
         ]
     }
 
@@ -765,12 +767,14 @@ def test_k3s_collector_folds_generate_overflow_alias_into_generate() -> None:
 
     stages = K3sStatusCollector(runner=runner).collect()["stages"]
 
-    # 92 + 228 desired, and all three Running pods, roll up under "generate".
+    # 92 + 228 desired, and all four Running pods (2 overflow + 1 moedsa + 1
+    # primary), roll up under "generate".
     assert stages["generate"]["desired"] == 320
-    assert stages["generate"]["pod_phases"].get("Running") == 3
-    assert stages["generate"]["nodes"].get("node-a") == 3
-    # The alias must not leak out as its own stage key.
+    assert stages["generate"]["pod_phases"].get("Running") == 4
+    assert stages["generate"]["nodes"].get("node-a") == 4
+    # Neither alias may leak out as its own stage key.
     assert "generate-overflow" not in stages
+    assert "generate-moedsa" not in stages
 
 
 def _pod(name: str, stage: str, status: dict[str, object], **metadata: object) -> dict[str, object]:
