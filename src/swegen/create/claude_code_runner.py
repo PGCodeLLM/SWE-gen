@@ -507,6 +507,28 @@ You MUST pass the specific test file paths as arguments to run ONLY the tests fr
 Some repos use a test runner that discovers fixtures, not direct test files.
 In this case, run the discovery test file, not the individual fixtures.
 
+## Iterating on the Dockerfile — build EPHEMERALLY, never leave images behind
+
+While you are iterating on the `environment/Dockerfile` to get it to build, you
+only care WHETHER it builds and which step fails — you do NOT need the resulting
+image. Persisting an image on every attempt bloats the node's Docker store with
+orphaned `-debug`/`-debug2`/`-debug3` images that are never pushed and never
+cleaned up. To check that the Dockerfile builds WITHOUT loading any image into
+the local store, use BuildKit's cache-only output:
+
+```bash
+# Validates the full build (shows the failing step, warms the layer cache) but
+# loads ZERO image into the local store — no orphan image to clean up:
+docker buildx build --output type=cacheonly --progress=plain .
+```
+
+Iterate with this until the build succeeds. Do NOT run `docker build -t
+some-name .` or `docker build -t <instance>-debug .` for these checks — every
+such tag leaves a persisted image behind. The ONLY build that should persist and
+be tagged is the final sanctioned intermediate base image (`SUGGESTED_IMAGE_REF`
+below), which is explicitly pushed to SWR. If you ever do create a throwaway
+tagged image while debugging, `docker rmi -f <tag>` it before you finish.
+
 ## Harbor Validation Commands
 
 For each validation attempt, increment the run number (-1, -2, -3, etc.):
@@ -676,6 +698,15 @@ Inspect `environment/Dockerfile`, `environment/bug.patch`, `solution/fix.patch`,
 `solution/solve.sh`, and `tests/test.sh`. Typical repairs include runtime and
 dependency pins, CA/proxy setup, build steps, copied test fixtures, test command
 scope, and post-patch rebuilds. Preserve the task identity and Harbor layout.
+
+When iterating on `environment/Dockerfile` to check that it builds, build
+EPHEMERALLY — you only care whether it builds, not the resulting image. Use
+`docker buildx build --output type=cacheonly --progress=plain .` which validates
+the full build and warms the cache but loads NO image into the local store. Do
+NOT run `docker build -t <name>-debug .`; every such tag leaves an orphaned
+image that is never pushed and never cleaned up. Only the sanctioned
+`SUGGESTED_IMAGE_REF` base build (below) should persist and be pushed. If you do
+create a throwaway tagged image, `docker rmi -f <tag>` it before finishing.
 
 ### Repository dependency intermediates
 
