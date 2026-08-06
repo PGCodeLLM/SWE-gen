@@ -49,9 +49,12 @@ data:
   SWEGEN_SWR_REPOSITORY: swesandbox/public/swe-gen/feature-implementation/generated
   SWEGEN_SWR_REGISTRY: platform
   SWEGEN_SWR_SUFFIX: _platform
-  # Fill node-local BuildKit slots first, then overflow immediately to the
-  # remote farm rather than waiting in the local slot wrapper.
-  SWEGEN_BUILD_ROUTER_MODE: local_overflow
+  # Build 100% locally: the remote farm (7.156.122.134:32083) went down (504),
+  # and local_overflow was sending the overflow there to hang until timeout,
+  # collapsing validate throughput. 'local' waits in the node-local slot
+  # wrapper instead of ever touching the farm. Restore local_overflow (and
+  # PERCENT/FALLBACK below) once the farm is healthy again.
+  SWEGEN_BUILD_ROUTER_MODE: local
   SWEGEN_REMOTE_BUILDKIT_URL: http://7.156.122.134:32083
   SWEGEN_REMOTE_BUILDKIT_REGISTRY: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
   SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/swesandbox
