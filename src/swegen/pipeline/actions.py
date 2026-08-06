@@ -230,16 +230,93 @@ def build_generate_command(task: PipelineTask, workspace: Path) -> list[str]:
     return command
 
 
+def _task_github_token(task: PipelineTask) -> str | None:
+    """Pick this task's GitHub token: env override, else the pool by trace_id.
+
+    Deterministic per (task, pool) so nop and oracle passes of the same task use
+    the same token, while different tasks spread across the pool. Mirrors the
+    selection in :func:`_generate_environment`.
+    """
+
+    env_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    tokens = load_github_tokens()
+    if not tokens:
+        return None
+    return tokens[task.trace_id.int % len(tokens)]
+
+
 def _generate_environment(task: PipelineTask) -> dict[str, str]:
     """Return a subprocess environment with a stable legacy GitHub token."""
 
     environment = dict(os.environ)
     if environment.get("GITHUB_TOKEN", "").strip():
         return environment
-    tokens = load_github_tokens()
-    if tokens:
-        environment["GITHUB_TOKEN"] = tokens[task.trace_id.int % len(tokens)]
+    token = _task_github_token(task)
+    if token:
+        environment["GITHUB_TOKEN"] = token
     return environment
+
+
+# Sentinel so the injected git-auth step is found and never duplicated across
+# the nop/oracle passes (which rewrite the same Dockerfile twice).
+_GITHUB_CREDENTIAL_MARKER = "# swegen: github credential"
+
+
+def _inject_github_credential(task_dir: Path, token: str | None) -> bool:
+    """Authenticate in-Dockerfile ``git clone https://github.com`` clones.
+
+    Task Dockerfiles ``RUN git clone https://github.com/...`` inside the build
+    container, which has no GitHub credential locally. When builds ran on the
+    remote farm the farm supplied auth; local builds do not, so clones fail with
+    ``could not read Username`` or hang until the build timeout.
+
+    Prepend a ``git config --global url.<tokenized>.insteadOf`` so every
+    ``https://github.com/`` fetch in the build authenticates. The token is a
+    literal in the task's ephemeral Dockerfile (never committed or pushed; the
+    validation image is built then deleted), and ``redact_sensitive_text``
+    scrubs the tokenized URL from any persisted build log. Idempotent via
+    ``_GITHUB_CREDENTIAL_MARKER``.
+    """
+
+    if not token:
+        return False
+    dockerfile = task_dir / "environment" / "Dockerfile"
+    if not dockerfile.is_file():
+        return False
+    text = dockerfile.read_text()
+    if _GITHUB_CREDENTIAL_MARKER in text:
+        return True
+    if "github.com" not in text:
+        return False
+
+    rewrite = (
+        f'{_GITHUB_CREDENTIAL_MARKER}\n'
+        f'RUN git config --global '
+        f'url."https://x-access-token:{token}@github.com/".insteadOf '
+        f'"https://github.com/"\n'
+    )
+    # Insert immediately before the first line that clones from github.com, so
+    # git is already installed (the clone itself needs it) when the config runs.
+    # git config writes the global ~/.gitconfig that every later clone consults.
+    lines = text.splitlines(keepends=True)
+    insert_at: int | None = None
+    for index, line in enumerate(lines):
+        if "git clone" in line and "github.com" in line:
+            # Walk back over an instruction's continuation lines to the RUN start.
+            start = index
+            while start > 0 and lines[start - 1].rstrip().endswith("\\"):
+                start -= 1
+            insert_at = start
+            break
+    if insert_at is None:
+        return False
+    updated = "".join(lines[:insert_at]) + rewrite + "".join(lines[insert_at:])
+    if updated == text:
+        return False
+    dockerfile.write_text(updated)
+    return True
 
 
 def _ensure_proxy_ca_runtime_environment(task_dir: Path) -> bool:
@@ -389,6 +466,7 @@ def validate_action(
     task_dir = workspace / "tasks" / task.task_id
     rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
+    _inject_github_credential(task_dir, _task_github_token(task))
     local_tag = local_image_tag(task.task_id)
     try:
         nop_reward = _validation_reward(
@@ -438,6 +516,7 @@ def _task_repair_action_without_image_cleanup(
         raise RuntimeError(f"materialized task directory is missing: {task.task_id}")
     rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
+    _inject_github_credential(task_dir, _task_github_token(task))
     original_files = capture_task_files(task_dir)
     if not original_files:
         raise RuntimeError(f"repair input task directory is empty: {task.task_id}")
@@ -487,6 +566,7 @@ def _task_repair_action_without_image_cleanup(
     )
     rewrite_ubuntu_mirrors(task_dir / "environment" / "Dockerfile")
     _ensure_proxy_ca_runtime_environment(task_dir)
+    _inject_github_credential(task_dir, _task_github_token(task))
     files = capture_task_files(task_dir)
     if not files:
         raise RuntimeError(f"repaired task directory is empty: {task.task_id}")
