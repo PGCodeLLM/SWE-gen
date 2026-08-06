@@ -20,8 +20,13 @@ from swegen.dashboard.distributed_status import (
 
 SCALE_MIN = 0
 BUILD_SLOT_MIN = 1
-GENERATE_MAIN_CAPACITY = 92
+# One deployment per stage. Generate used to fan out into a primary +
+# "overflow" pool (split at a 92-replica cap, with the overflow's image and
+# model Secret copied from the live primary on every scale-up). That sync
+# silently reverted the fleet to a stale image, so generate is now a single
+# deployment scaled directly like every other stage.
 PRIMARY_DEPLOYMENTS = {
+    "generate": "swegen-generate",
     "validate": "swegen-validate",
     "repair": "swegen-repair",
     "reward": "swegen-reward",
@@ -36,8 +41,6 @@ class ScalingBusyError(RuntimeError):
 class K3sScaler:
     """Strictly allowlisted, argv-only deployment scaling."""
 
-    _GENERATE_DEPLOYMENT = "swegen-generate"
-    _GENERATE_OVERFLOW_DEPLOYMENT = "swegen-generate-overflow"
     _WORKER_CONTAINER = "worker"
 
     def __init__(
@@ -57,10 +60,7 @@ class K3sScaler:
         *,
         max_replicas: object,
     ) -> list[tuple[str, int]]:
-        if not isinstance(stage, str) or stage not in {
-            "generate",
-            *PRIMARY_DEPLOYMENTS,
-        }:
+        if not isinstance(stage, str) or stage not in PRIMARY_DEPLOYMENTS:
             raise ValueError("unknown stage")
         if isinstance(replicas, bool) or not isinstance(replicas, int):
             raise ValueError("replicas must be an integer")
@@ -72,18 +72,6 @@ class K3sScaler:
             raise ValueError("cluster scaling capacity is unavailable")
         if not SCALE_MIN <= replicas <= max_replicas:
             raise ValueError(f"replicas must be between {SCALE_MIN} and {max_replicas}")
-        if stage == "generate":
-            main = min(replicas, GENERATE_MAIN_CAPACITY)
-            overflow = max(0, replicas - GENERATE_MAIN_CAPACITY)
-            if replicas < GENERATE_MAIN_CAPACITY:
-                return [
-                    (K3sScaler._GENERATE_OVERFLOW_DEPLOYMENT, 0),
-                    (K3sScaler._GENERATE_DEPLOYMENT, main),
-                ]
-            return [
-                (K3sScaler._GENERATE_DEPLOYMENT, main),
-                (K3sScaler._GENERATE_OVERFLOW_DEPLOYMENT, overflow),
-            ]
         return [(PRIMARY_DEPLOYMENTS[stage], replicas)]
 
     def _run(self, command: list[str], *, failure: str) -> subprocess.CompletedProcess[str]:
@@ -99,113 +87,6 @@ class K3sScaler:
             raise RuntimeError(message)
         return completed
 
-    def _sync_generate_overflow_profile(self) -> tuple[str, str]:
-        """Copy the live Generate image and model Secret to its overflow pool."""
-
-        get_command = [
-            "kubectl",
-            "--request-timeout=10s",
-            "-n",
-            self.namespace,
-            "get",
-            f"deployment/{self._GENERATE_DEPLOYMENT}",
-            "-o=json",
-        ]
-        completed = self._run(get_command, failure="kubectl get failed")
-        try:
-            deployment = json.loads(completed.stdout)
-            containers = deployment["spec"]["template"]["spec"]["containers"]
-            worker = next(
-                container
-                for container in containers
-                if container.get("name") == self._WORKER_CONTAINER
-            )
-            image = worker["image"]
-            model_secrets = [
-                source["secretRef"]["name"]
-                for source in worker.get("envFrom", [])
-                if source.get("secretRef", {}).get("name", "").startswith(
-                    "swegen-model-credentials-"
-                )
-            ]
-        except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as exc:
-            raise RuntimeError("live Generate deployment has no worker profile") from exc
-        if not isinstance(image, str) or not image.strip() or image != image.strip():
-            raise RuntimeError("live Generate deployment has an invalid worker image")
-        if len(model_secrets) != 1:
-            raise RuntimeError("live Generate deployment must use one model Secret")
-        model_secret = model_secrets[0]
-
-        overflow_get_command = [
-            "kubectl",
-            "--request-timeout=10s",
-            "-n",
-            self.namespace,
-            "get",
-            f"deployment/{self._GENERATE_OVERFLOW_DEPLOYMENT}",
-            "-o=json",
-        ]
-        overflow_completed = self._run(
-            overflow_get_command,
-            failure="kubectl get overflow failed",
-        )
-        try:
-            overflow = json.loads(overflow_completed.stdout)
-            overflow_containers = overflow["spec"]["template"]["spec"]["containers"]
-            worker_index, overflow_worker = next(
-                (index, container)
-                for index, container in enumerate(overflow_containers)
-                if container.get("name") == self._WORKER_CONTAINER
-            )
-            model_source_indices = [
-                index
-                for index, source in enumerate(overflow_worker.get("envFrom", []))
-                if source.get("secretRef", {}).get("name", "").startswith(
-                    "swegen-model-credentials-"
-                )
-            ]
-        except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as exc:
-            raise RuntimeError("Generate overflow deployment has no worker profile") from exc
-        if len(model_source_indices) != 1:
-            raise RuntimeError("Generate overflow deployment must use one model Secret")
-        model_source_index = model_source_indices[0]
-
-        set_image_command = [
-            "kubectl",
-            "--request-timeout=10s",
-            "-n",
-            self.namespace,
-            "set",
-            "image",
-            f"deployment/{self._GENERATE_OVERFLOW_DEPLOYMENT}",
-            f"{self._WORKER_CONTAINER}={image}",
-        ]
-        self._run(set_image_command, failure="kubectl set image failed")
-
-        patch_profile = [
-            {
-                "op": "replace",
-                "path": (
-                    f"/spec/template/spec/containers/{worker_index}/envFrom/"
-                    f"{model_source_index}/secretRef/name"
-                ),
-                "value": model_secret,
-            }
-        ]
-        patch_command = [
-            "kubectl",
-            "--request-timeout=10s",
-            "-n",
-            self.namespace,
-            "patch",
-            f"deployment/{self._GENERATE_OVERFLOW_DEPLOYMENT}",
-            "--type=json",
-            "-p",
-            json.dumps(patch_profile),
-        ]
-        self._run(patch_command, failure="kubectl patch overflow profile failed")
-        return image, model_secret
-
     def scale(
         self,
         stage: object,
@@ -217,11 +98,6 @@ class K3sScaler:
         if not self._lock.acquire(blocking=False):
             raise ScalingBusyError("another scaling request is already running")
         try:
-            if any(
-                deployment == self._GENERATE_OVERFLOW_DEPLOYMENT and count > 0
-                for deployment, count in plan
-            ):
-                self._sync_generate_overflow_profile()
             applied = []
             for deployment, count in plan:
                 command = [

@@ -37,17 +37,13 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     documents = _documents()
     namespace = next(document for document in documents if document["kind"] == "Namespace")
     config_map = next(document for document in documents if document["kind"] == "ConfigMap")
-    all_deployments = {
+    # Generate is a single deployment (the primary/overflow split was removed):
+    # one deployment per stage, all asserted below.
+    deployments = {
         document["metadata"]["name"]: document
         for document in documents
         if document["kind"] == "Deployment"
     }
-    # swegen-generate-overflow is a secondary pool the dashboard only scales
-    # above GENERATE_MAIN_CAPACITY (see K3sScaler.plan); it mirrors
-    # swegen-generate's pod spec but isn't one of the primary one-per-stage
-    # deployments the rest of this test asserts properties over.
-    overflow_deployment = all_deployments.pop("swegen-generate-overflow")
-    deployments = all_deployments
 
     assert namespace["metadata"]["name"] == "swegen-pipeline"
     assert config_map["metadata"]["namespace"] == "swegen-pipeline"
@@ -224,28 +220,6 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
         "swegen-reward-credentials-gpt56sol-20260803"
     )
 
-    # swegen-generate-overflow starts parked at 0 and must exist ahead of time:
-    # the dashboard's K3sScaler always issues a `kubectl scale` for it (even
-    # to just set 0 replicas) whenever generate is scaled, so a missing
-    # deployment 404s the whole scaling request.
-    overflow_pod_spec = overflow_deployment["spec"]["template"]["spec"]
-    overflow_container = overflow_pod_spec["containers"][0]
-    assert overflow_deployment["spec"]["replicas"] == 0
-    assert overflow_deployment["spec"]["strategy"]["type"] == "RollingUpdate"
-    assert overflow_container["name"] == "worker"
-    assert overflow_container["args"] == ["--stage", "generate"]
-    assert overflow_container["imagePullPolicy"] == "Never"
-    # Its own selector/labels, distinct from swegen-generate's, so scaling one
-    # deployment never double-counts or steals the other's pods.
-    assert overflow_deployment["spec"]["selector"]["matchLabels"] == {
-        "app.kubernetes.io/name": "swegen-worker",
-        "swegen.pgcode/stage": "generate-overflow",
-    }
-    assert (
-        overflow_deployment["spec"]["selector"]["matchLabels"]
-        != deployments["swegen-generate"]["spec"]["selector"]["matchLabels"]
-    )
-
 
 def test_every_worker_has_a_rootfs_integrity_probe() -> None:
     # crun/overlayfs snapshot corruption under pod churn can strip /app/.venv
@@ -282,6 +256,12 @@ def test_every_worker_has_a_rootfs_integrity_probe() -> None:
         # Liveness must actually fail a wedged pod (finite failureThreshold)
         # rather than tolerate it indefinitely.
         assert liveness["failureThreshold"] <= 3, name
+        # The container must run from / (not the image WORKDIR /app). When
+        # corruption deletes /app, the OCI runtime cannot chdir into the
+        # workdir to LAUNCH the probe exec, so it errors into "unknown state"
+        # (never counted toward failureThreshold) and the pod is never
+        # restarted. Running from / lets the probe always launch and fail.
+        assert container.get("workingDir") == "/", name
 
 
 def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
@@ -468,6 +448,39 @@ def test_buildkit_pruner_is_a_bounded_node_local_daemonset() -> None:
     assert script.index("docker image prune --force") < script.index("docker rm --force")
     assert script.index("docker rm --force") < script.index("docker buildx prune")
     assert "--all" in script and "--force" in script
+
+    # The failed-image cleanup needs DB credentials, which it draws from the
+    # swegen-database secret the same way the worker container does. Without
+    # this envFrom the batched status query has no SWEGEN_PG_* to connect with.
+    envfrom_secrets = {
+        entry["secretRef"]["name"]
+        for entry in container.get("envFrom", [])
+        if "secretRef" in entry
+    }
+    assert "swegen-database" in envfrom_secrets
+    assert env["SWEGEN_FAILED_IMAGE_PRUNE_ENABLED"] == "true"
+    assert env["SWEGEN_FAILED_IMAGE_PRUNE_BUDGET_SECONDS"] == "300"
+
+    # The per-task failed-image cleanup: it selects the node's -swegenimage
+    # tags, is gated behind SWEGEN_FAILED_IMAGE_PRUNE_ENABLED, derives the
+    # task_id by stripping the hb__ prefix and -swegenimage suffix, and queries
+    # the DB once (ANY(%s)) for terminally-failed, non-active tasks before
+    # deleting. It is fail-safe: an unreachable DB deletes nothing.
+    assert "grep -- '-swegenimage'" in script
+    assert '"${SWEGEN_FAILED_IMAGE_PRUNE_ENABLED}" = "true"' in script
+    assert "${failed_tag%-swegenimage}" in script
+    assert "${failed_task#hb__}" in script
+    assert "/app/.venv/bin/python -" in script
+    assert "task.task_id = ANY(%s)" in script
+    assert "state IN ('failed', 'rejected')" in script
+    assert "current_stage IN ('validate', 'reward', 'repair')" in script
+    assert "heartbeat_at >= now() - interval '5 minutes'" in script
+    assert "timeout 60 docker rmi" in script
+    assert "failed-image cleanup checked=" in script
+    # The whole cleanup must run BEFORE the buildkit-cache prune so freed
+    # per-task images are reclaimed first.
+    assert script.index("grep -- '-swegenimage'") < script.index("docker buildx prune")
+    assert script.index("failed-image cleanup checked=") < script.index("docker buildx prune")
     assert env["SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS"] == "600"
     assert env["SWEGEN_BUILDKIT_PRUNE_START_DELAY_SECONDS"] == "600"
     assert env["SWEGEN_BUILDKIT_PRUNE_TIMEOUT_SECONDS"] == "3600"

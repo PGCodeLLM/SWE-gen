@@ -86,7 +86,9 @@ metadata:
   name: swegen-generate
   namespace: swegen-pipeline
 spec:
-  replicas: 12
+  # Sole generate deployment (the old primary/overflow split was removed). The
+  # dashboard scales this directly; replicas here is the manifest baseline.
+  replicas: 228
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -122,9 +124,14 @@ spec:
               swegen.pgcode/stage: generate
       containers:
         - name: worker
-          image: swegen-worker:generate-validate-20260804
+          image: swegen-worker:ephemeral-build-fix-20260806
           imagePullPolicy: Never
           args: ["--stage", "generate"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime
+          # then cannot chdir into it to launch the liveness probe, so the
+          # probe ERRORS ("unknown state") and never restarts the pod. Run
+          # from / so the probe exec always launches and can fail properly.
+          workingDir: /
           envFrom:
             - configMapRef:
                 name: swegen-pipeline-config
@@ -279,188 +286,6 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: swegen-generate-overflow
-  namespace: swegen-pipeline
-spec:
-  # Kept at 0 and only scaled up by the dashboard once swegen-generate hits
-  # GENERATE_MAIN_CAPACITY (see K3sScaler.plan in dashboard/server.py). The
-  # dashboard syncs this deployment's worker image and model Secret from the
-  # live swegen-generate deployment before scaling it up, so the values below
-  # are just a valid starting point, not the source of truth.
-  replicas: 0
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 16
-      maxUnavailable: 16
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: swegen-worker
-      swegen.pgcode/stage: generate-overflow
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: swegen-worker
-        swegen.pgcode/stage: generate-overflow
-    spec:
-      automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 18000
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: swegen-worker
-              swegen.pgcode/stage: generate-overflow
-      containers:
-        - name: worker
-          image: swegen-worker:generate-validate-20260804
-          imagePullPolicy: Never
-          args: ["--stage", "generate"]
-          envFrom:
-            - configMapRef:
-                name: swegen-pipeline-config
-            - secretRef:
-                name: swegen-database
-            - secretRef:
-                name: swegen-runtime-proxy
-            - secretRef:
-                name: swegen-model-credentials-glm52-thinking-npu-20260804
-          env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: HTTP_PROXY
-              value: http://7.244.3.78:3128
-            - name: HTTPS_PROXY
-              value: http://7.244.3.78:3128
-            - name: http_proxy
-              value: http://7.244.3.78:3128
-            - name: https_proxy
-              value: http://7.244.3.78:3128
-            - name: SWEGEN_GENERATE_VALIDATE
-              value: "false"
-            - name: DOCKER_BUILDKIT
-              value: "1"
-            - name: BUILDX_BUILDER
-              value: "default"
-            - name: COMPOSE_BAKE
-              value: "false"
-            - name: PATH
-              value: /opt/swegen/bin:/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
-            - name: SWEGEN_REAL_DOCKER
-              value: /usr/bin/docker
-            - name: SWEGEN_BUILD_SLOT_DIR
-              value: /run/swegen-build-slots
-            - name: NO_PROXY
-              valueFrom:
-                configMapKeyRef:
-                  name: swegen-pipeline-config
-                  key: SWEGEN_NO_PROXY
-            - name: no_proxy
-              valueFrom:
-                configMapKeyRef:
-                  name: swegen-pipeline-config
-                  key: SWEGEN_NO_PROXY
-          # Rootfs-integrity probe: crun/overlayfs snapshot corruption under
-          # heavy pod churn can silently strip /app/.venv (python + swegen)
-          # from a Running pod, which then fails every task in ~13ms and
-          # shreds the queue while k8s still reports it Ready. Validating the
-          # import turns such a pod into a restart (fresh overlay) instead of
-          # a queue-draining zombie. Cheap (~50ms) when the venv is intact.
-          startupProbe:
-            exec:
-              # Run through /bin/sh, NOT the venv python directly: overlayfs
-              # corruption can delete /app/.venv/bin/python itself, and an exec
-              # probe whose binary is missing ERRORS ("unknown state") instead
-              # of failing — kubelet does not count unknown toward
-              # failureThreshold, so a gutted pod would never restart. /bin/sh
-              # always exists, so the probe launches and exits 127 (a real
-              # failure) when python/swegen is gone.
-              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
-            # import swegen.cli is ~1.7-2s cold and slower under load, so the
-            # exec needs a generous timeout: the 1s default times out on a
-            # perfectly healthy pod and restart-loops the whole fleet.
-            timeoutSeconds: 10
-            periodSeconds: 10
-            failureThreshold: 12
-          livenessProbe:
-            exec:
-              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
-            initialDelaySeconds: 30
-            periodSeconds: 60
-            timeoutSeconds: 10
-            failureThreshold: 2
-          resources:
-            requests:
-              cpu: 500m
-              memory: 200Mi
-            limits:
-              cpu: "16"
-              memory: 32Gi
-          volumeMounts:
-            - name: workspace
-              mountPath: /data/swegen-k3s/workspaces
-            - name: repo-cache
-              mountPath: /data/swegen-k3s/cache
-            - name: private-files
-              mountPath: /etc/swegen/swegen.toml
-              subPath: swegen.toml
-              readOnly: true
-            - name: private-files
-              mountPath: /etc/swegen/combined-ca.crt
-              subPath: combined-ca.crt
-              readOnly: true
-            - name: docker-sock
-              mountPath: /var/run/docker.sock
-            - name: build-slots
-              mountPath: /run/swegen-build-slots
-            - name: swegen-bin
-              mountPath: /opt/swegen/bin
-              readOnly: true
-            - name: docker-config
-              mountPath: /root/.docker/config.json
-              subPath: config.json
-              readOnly: true
-      volumes:
-        - name: workspace
-          hostPath:
-            path: /data/swegen-k3s/workspaces
-            type: DirectoryOrCreate
-        - name: repo-cache
-          hostPath:
-            path: /data/swegen-k3s/cache
-            type: DirectoryOrCreate
-        - name: docker-sock
-          hostPath:
-            path: /var/run/docker.sock
-            type: Socket
-        - name: build-slots
-          hostPath:
-            path: /data/swegen-k3s/build-slots
-            type: DirectoryOrCreate
-        - name: swegen-bin
-          hostPath:
-            path: /data/swegen-k3s/bin
-            type: DirectoryOrCreate
-        - name: docker-config
-          secret:
-            secretName: swegen-docker-config
-            defaultMode: 256
-        - name: private-files
-          secret:
-            secretName: swegen-private-files
-            defaultMode: 0400
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: swegen-validate
   namespace: swegen-pipeline
 spec:
@@ -498,6 +323,11 @@ spec:
           image: swegen-worker:repaired-priority-20260804
           imagePullPolicy: Never
           args: ["--stage", "validate"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime
+          # then cannot chdir into it to launch the liveness probe, so the
+          # probe ERRORS ("unknown state") and never restarts the pod. Run
+          # from / so the probe exec always launches and can fail properly.
+          workingDir: /
           envFrom:
             - configMapRef:
                 name: swegen-pipeline-config
@@ -658,6 +488,11 @@ spec:
           image: swegen-worker:reward-repair-20260731
           imagePullPolicy: Never
           args: ["--stage", "reward_repair"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime
+          # then cannot chdir into it to launch the liveness probe, so the
+          # probe ERRORS ("unknown state") and never restarts the pod. Run
+          # from / so the probe exec always launches and can fail properly.
+          workingDir: /
           envFrom:
             - configMapRef:
                 name: swegen-pipeline-config
@@ -827,6 +662,11 @@ spec:
           image: swegen-worker:buildkit-intermediates-20260802-1424
           imagePullPolicy: Never
           args: ["--stage", "repair"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime
+          # then cannot chdir into it to launch the liveness probe, so the
+          # probe ERRORS ("unknown state") and never restarts the pod. Run
+          # from / so the probe exec always launches and can fail properly.
+          workingDir: /
           envFrom:
             - configMapRef:
                 name: swegen-pipeline-config
@@ -998,6 +838,11 @@ spec:
           image: swegen-worker:proxy-noproxy-fix-20260801-0356
           imagePullPolicy: Never
           args: ["--stage", "reward"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime
+          # then cannot chdir into it to launch the liveness probe, so the
+          # probe ERRORS ("unknown state") and never restarts the pod. Run
+          # from / so the probe exec always launches and can fail properly.
+          workingDir: /
           envFrom:
             - configMapRef:
                 name: swegen-pipeline-config
@@ -1134,6 +979,11 @@ spec:
           image: swegen-worker:push-remote-digest-fix-20260802-1507
           imagePullPolicy: Never
           args: ["--stage", "push"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime
+          # then cannot chdir into it to launch the liveness probe, so the
+          # probe ERRORS ("unknown state") and never restarts the pod. Run
+          # from / so the probe exec always launches and can fail properly.
+          workingDir: /
           envFrom:
             - configMapRef:
                 name: swegen-pipeline-config

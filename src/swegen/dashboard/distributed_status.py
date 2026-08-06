@@ -21,18 +21,12 @@ from psycopg.rows import dict_row
 
 STAGES = ("generate", "validate", "repair", "reward", "push")
 
-# Some stages run under an auxiliary deployment with a distinct pod label so it
-# can scale independently of the primary rollout (e.g. the generate-overflow
-# deployment shares the generate image and the swegen_generate queue). Fold
-# those aliases back onto their canonical stage so the dashboard counts the
-# combined worker fleet instead of only the primary deployment's pods.
-# generate-moedsa is a second generate pool pinned to a different model engine
-# (glm-5.2-moedsa-thinking) behind the same endpoint; it also drains the
-# swegen_generate queue, so it counts as generate too.
-STAGE_ALIASES = {
-    "generate-overflow": "generate",
-    "generate-moedsa": "generate",
-}
+# Maps an auxiliary deployment's pod-label stage onto its canonical stage so the
+# dashboard counts the combined worker fleet. Generate used to fan out into
+# generate-overflow / generate-moedsa pools that folded back here; it is now a
+# single swegen-generate deployment, so no aliases are currently needed. Kept as
+# an extension point for future split pools.
+STAGE_ALIASES: dict[str, str] = {}
 QUEUE_BY_STAGE = {
     "generate": ("swegen_generate",),
     "validate": ("swegen_validate_repaired", "swegen_validate"),

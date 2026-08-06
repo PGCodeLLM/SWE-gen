@@ -788,7 +788,7 @@ def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:
             },
             {
                 "kind": "Deployment",
-                "metadata": {"name": "swegen-generate-overflow"},
+                "metadata": {"name": "swegen-generate-canary"},
                 "spec": {
                     "replicas": 4,
                     "selector": {"matchLabels": {"swegen.pgcode/stage": "generate"}},
@@ -818,11 +818,11 @@ def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:
     assert stage["pod_phases"] == {}
 
 
-def test_k3s_collector_folds_generate_overflow_alias_into_generate() -> None:
-    # The overflow deployment carries a distinct pod label (generate-overflow)
-    # so it can scale independently, but it shares the generate image and the
-    # swegen_generate queue. Its deployment replicas and its pods must be
-    # counted under "generate" rather than dropped for not matching a stage.
+def test_k3s_collector_counts_only_the_single_generate_deployment() -> None:
+    # Generate is now one deployment (the overflow/moedsa split was removed and
+    # STAGE_ALIASES is empty). Its replicas and pods count under "generate";
+    # pods carrying stale generate-overflow / generate-moedsa labels from a
+    # partly-drained cutover must NOT be folded into the generate count.
     from swegen.dashboard.distributed_status import K3sStatusCollector
 
     nodes = {"items": [{"metadata": {"name": "node-a"}, "status": {}}]}
@@ -832,26 +832,16 @@ def test_k3s_collector_folds_generate_overflow_alias_into_generate() -> None:
                 "kind": "Deployment",
                 "metadata": {"name": "swegen-generate"},
                 "spec": {
-                    "replicas": 92,
-                    "selector": {"matchLabels": {"swegen.pgcode/stage": "generate"}},
-                },
-                "status": {"readyReplicas": 92},
-            },
-            {
-                "kind": "Deployment",
-                "metadata": {"name": "swegen-generate-overflow"},
-                "spec": {
                     "replicas": 228,
-                    "selector": {
-                        "matchLabels": {"swegen.pgcode/stage": "generate-overflow"}
-                    },
+                    "selector": {"matchLabels": {"swegen.pgcode/stage": "generate"}},
                 },
                 "status": {"readyReplicas": 228},
             },
             _pod("gen-1", "generate", {"phase": "Running"}),
+            _pod("gen-2", "generate", {"phase": "Running"}),
+            # Stale labels from a not-yet-removed overflow/moedsa pool: no alias
+            # exists, so these are ignored rather than counted as generate.
             _pod("ovf-1", "generate-overflow", {"phase": "Running"}),
-            _pod("ovf-2", "generate-overflow", {"phase": "Running"}),
-            # A second generate pool on a different model engine, distinct label.
             _pod("moe-1", "generate-moedsa", {"phase": "Running"}),
         ]
     }
@@ -867,12 +857,12 @@ def test_k3s_collector_folds_generate_overflow_alias_into_generate() -> None:
 
     stages = K3sStatusCollector(runner=runner).collect()["stages"]
 
-    # 92 + 228 desired, and all four Running pods (2 overflow + 1 moedsa + 1
-    # primary), roll up under "generate".
-    assert stages["generate"]["desired"] == 320
-    assert stages["generate"]["pod_phases"].get("Running") == 4
-    assert stages["generate"]["nodes"].get("node-a") == 4
-    # Neither alias may leak out as its own stage key.
+    # Only the single deployment's 228 replicas and its two generate-labelled
+    # Running pods count.
+    assert stages["generate"]["desired"] == 228
+    assert stages["generate"]["pod_phases"].get("Running") == 2
+    assert stages["generate"]["nodes"].get("node-a") == 2
+    # The stale-label pools are not counted and do not leak as stage keys.
     assert "generate-overflow" not in stages
     assert "generate-moedsa" not in stages
 
