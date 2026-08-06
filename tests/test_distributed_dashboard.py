@@ -501,6 +501,106 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
     }
 
 
+def test_summarize_swr_push_sync_computes_registry_counts_and_out_of_sync_ids() -> None:
+    from swegen.dashboard.distributed_status import summarize_swr_push_sync
+
+    summary = summarize_swr_push_sync(
+        {
+            "platform_count": 11372,
+            "trajectory_count": 10023,
+            "in_sync": 10158,
+            "platform_only": 1214,
+            "trajectory_only": 135,
+        },
+        [
+            {"instance": "img-a", "on_platform": True, "on_trajectory": False},
+            {"instance": "img-b", "on_platform": False, "on_trajectory": True},
+        ],
+        available=True,
+    )
+
+    assert summary["available"] is True
+    assert summary["platform_count"] == 11372
+    assert summary["trajectory_count"] == 10023
+    assert summary["in_sync"] == 10158
+    assert summary["platform_only"] == 1214
+    assert summary["trajectory_only"] == 135
+    # platform_only + trajectory_only, independent of the truncated id list.
+    assert summary["out_of_sync_total"] == 1349
+    assert summary["out_of_sync_instances"] == [
+        {"instance": "img-a", "registry": "platform"},
+        {"instance": "img-b", "registry": "trajectory"},
+    ]
+    # The list was capped well below the true total, so it is flagged truncated.
+    assert summary["out_of_sync_list_truncated"] is True
+
+
+def test_summarize_swr_push_sync_degrades_when_pushed_images_absent() -> None:
+    from swegen.dashboard.distributed_status import summarize_swr_push_sync
+
+    summary = summarize_swr_push_sync(None, available=False)
+
+    assert summary == {
+        "available": False,
+        "platform_count": 0,
+        "trajectory_count": 0,
+        "in_sync": 0,
+        "platform_only": 0,
+        "trajectory_only": 0,
+        "out_of_sync_total": 0,
+        "out_of_sync_instances": [],
+        "out_of_sync_list_limit": 500,
+        "out_of_sync_list_truncated": False,
+    }
+
+
+def test_aggregate_pipeline_snapshot_surfaces_swr_push_sync_section() -> None:
+    from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot(
+        [],
+        [],
+        [],
+        [],
+        now=NOW,
+        swr_push_sync_row={
+            "platform_count": 11372,
+            "trajectory_count": 10023,
+            "in_sync": 10158,
+            "platform_only": 1214,
+            "trajectory_only": 135,
+        },
+        swr_push_sync_out_of_sync_rows=[
+            {"instance": "img-a", "on_platform": True, "on_trajectory": False},
+        ],
+        swr_push_sync_available=True,
+    )
+
+    section = snapshot["swr_push_sync"]
+    assert section["available"] is True
+    assert section["platform_count"] == 11372
+    assert section["trajectory_count"] == 10023
+    assert section["in_sync"] == 10158
+    assert section["platform_only"] == 1214
+    assert section["trajectory_only"] == 135
+    assert section["out_of_sync_total"] == 1349
+    assert section["out_of_sync_instances"] == [
+        {"instance": "img-a", "registry": "platform"},
+    ]
+    # JSON-serializable so it can ride the same payload the other sections use.
+    json.dumps(snapshot)
+
+
+def test_aggregate_pipeline_snapshot_swr_push_sync_defaults_to_unavailable() -> None:
+    from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot([], [], [], [], now=NOW)
+
+    assert snapshot["swr_push_sync"]["available"] is False
+    assert snapshot["swr_push_sync"]["platform_count"] == 0
+    assert snapshot["swr_push_sync"]["out_of_sync_instances"] == []
+
+
 def test_remote_buildkit_resources_support_worker_local_schema() -> None:
     from swegen.dashboard.distributed_status import summarize_remote_buildkit_resources
 

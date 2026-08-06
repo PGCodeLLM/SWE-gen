@@ -52,6 +52,9 @@ REMOTE_BUILDKIT_MIN_POLL_SECONDS = 30.0
 REMOTE_BUILDKIT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 LOCAL_DISK_IO_POLL_SECONDS = 30.0
 ACTIVITY_STALE_AFTER_SECONDS = 120.0
+# Cap on how many out-of-sync instance ids the SWR push-sync panel returns; the
+# summary still reports the true total so the list can be truncated safely.
+SWR_PUSH_SYNC_LIST_LIMIT = 500
 TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
 # Display order for pod states; anything kubectl reports outside this list sorts alphabetically.
 POD_PHASE_ORDER = ("Running", "Pending", "Terminating", "Succeeded", "Failed", "Unknown")
@@ -388,6 +391,59 @@ def summarize_remote_build_tracking(
     }
 
 
+def summarize_swr_push_sync(
+    summary_row: dict[str, Any] | None,
+    out_of_sync_rows: Iterable[dict[str, Any]] = (),
+    *,
+    available: bool,
+    list_limit: int = SWR_PUSH_SYNC_LIST_LIMIT,
+) -> dict[str, Any]:
+    """Fold the SWR push-registry sync counts and a capped out-of-sync id list.
+
+    An instance is "in sync" only when it is pushed to BOTH the data-platform and
+    the data-trajectory registry. ``platform_only`` / ``trajectory_only`` are the
+    two out-of-sync directions. Degrades to zeros when ``pushed_images`` is absent.
+    """
+
+    if not available or summary_row is None:
+        return {
+            "available": False,
+            "platform_count": 0,
+            "trajectory_count": 0,
+            "in_sync": 0,
+            "platform_only": 0,
+            "trajectory_only": 0,
+            "out_of_sync_total": 0,
+            "out_of_sync_instances": [],
+            "out_of_sync_list_limit": list_limit,
+            "out_of_sync_list_truncated": False,
+        }
+
+    platform_only = int(summary_row.get("platform_only") or 0)
+    trajectory_only = int(summary_row.get("trajectory_only") or 0)
+    out_of_sync_total = platform_only + trajectory_only
+    instances = [
+        {
+            "instance": str(row["instance"]),
+            "registry": ("platform" if row.get("on_platform") else "trajectory"),
+        }
+        for row in out_of_sync_rows
+        if row.get("instance") is not None
+    ]
+    return {
+        "available": True,
+        "platform_count": int(summary_row.get("platform_count") or 0),
+        "trajectory_count": int(summary_row.get("trajectory_count") or 0),
+        "in_sync": int(summary_row.get("in_sync") or 0),
+        "platform_only": platform_only,
+        "trajectory_only": trajectory_only,
+        "out_of_sync_total": out_of_sync_total,
+        "out_of_sync_instances": instances,
+        "out_of_sync_list_limit": list_limit,
+        "out_of_sync_list_truncated": out_of_sync_total > len(instances),
+    }
+
+
 def _cpu_millicores(value: str) -> int:
     value = value.strip()
     if value.endswith("m"):
@@ -512,6 +568,9 @@ def aggregate_pipeline_snapshot(
     lifetime_stage_rows: Iterable[dict[str, Any]] = (),
     remote_build_rows: Iterable[dict[str, Any]] = (),
     remote_build_tracking_available: bool = False,
+    swr_push_sync_row: dict[str, Any] | None = None,
+    swr_push_sync_out_of_sync_rows: Iterable[dict[str, Any]] = (),
+    swr_push_sync_available: bool = False,
 ) -> dict[str, Any]:
     """Build a compact JSON-safe pipeline snapshot from database rows."""
 
@@ -763,6 +822,11 @@ def aggregate_pipeline_snapshot(
             remote_build_rows,
             available=remote_build_tracking_available,
         ),
+        "swr_push_sync": summarize_swr_push_sync(
+            swr_push_sync_row,
+            swr_push_sync_out_of_sync_rows,
+            available=swr_push_sync_available,
+        ),
         "tasks": task_views,
     }
 
@@ -943,6 +1007,95 @@ class PipelineStatusCollector:
                         remote_build_tracking_available = True
                     except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
                         remote_build_rows = []
+                swr_push_sync_row: dict[str, Any] | None = None
+                swr_push_sync_out_of_sync_rows: list[dict[str, Any]] = []
+                swr_push_sync_available = False
+                pushed_images_relation = connection.execute(
+                    "SELECT to_regclass('public.pushed_images') AS relation"
+                ).fetchone()
+                if pushed_images_relation and pushed_images_relation["relation"] is not None:
+                    try:
+                        with connection.transaction():
+                            swr_push_sync_row = connection.execute(
+                                """
+                                WITH reg AS (
+                                    SELECT instance,
+                                        CASE
+                                            WHEN swr_url LIKE '%data-platform%' THEN 'platform'
+                                            WHEN swr_url LIKE '%data-trajectory%' THEN 'trajectory'
+                                        END AS registry,
+                                        bool_or(pushed) AS pushed
+                                    FROM public.pushed_images
+                                    WHERE swr_url LIKE '%data-platform%'
+                                       OR swr_url LIKE '%data-trajectory%'
+                                    -- positional refs: `registry` is a CASE
+                                    -- expression, so it can't be named in
+                                    -- GROUP BY directly (GroupingError).
+                                    GROUP BY 1, 2
+                                ),
+                                piv AS (
+                                    SELECT instance,
+                                        bool_or(registry = 'platform' AND pushed) AS on_platform,
+                                        bool_or(registry = 'trajectory' AND pushed) AS on_trajectory
+                                    FROM reg GROUP BY instance
+                                )
+                                SELECT
+                                    count(*) FILTER (WHERE on_platform) AS platform_count,
+                                    count(*) FILTER (WHERE on_trajectory) AS trajectory_count,
+                                    count(*) FILTER (WHERE on_platform AND on_trajectory)
+                                        AS in_sync,
+                                    count(*) FILTER (WHERE on_platform AND NOT on_trajectory)
+                                        AS platform_only,
+                                    count(*) FILTER (WHERE on_trajectory AND NOT on_platform)
+                                        AS trajectory_only
+                                FROM piv
+                                """
+                            ).fetchone()
+                            swr_push_sync_out_of_sync_rows = list(
+                                connection.execute(
+                                    # This query is parameterized (LIMIT %s), so
+                                    # literal % in the LIKE patterns must be
+                                    # doubled to %% or psycopg reads '%d' as a
+                                    # placeholder and raises ProgrammingError.
+                                    """
+                                    WITH reg AS (
+                                        SELECT instance,
+                                            CASE
+                                                WHEN swr_url LIKE '%%data-platform%%'
+                                                    THEN 'platform'
+                                                WHEN swr_url LIKE '%%data-trajectory%%'
+                                                    THEN 'trajectory'
+                                            END AS registry,
+                                            bool_or(pushed) AS pushed
+                                        FROM public.pushed_images
+                                        WHERE swr_url LIKE '%%data-platform%%'
+                                           OR swr_url LIKE '%%data-trajectory%%'
+                                        -- positional refs: `registry` is a CASE
+                                        -- expression, so it can't be named in
+                                        -- GROUP BY directly (GroupingError).
+                                        GROUP BY 1, 2
+                                    ),
+                                    piv AS (
+                                        SELECT instance,
+                                            bool_or(registry = 'platform' AND pushed)
+                                                AS on_platform,
+                                            bool_or(registry = 'trajectory' AND pushed)
+                                                AS on_trajectory
+                                        FROM reg GROUP BY instance
+                                    )
+                                    SELECT instance, on_platform, on_trajectory
+                                    FROM piv
+                                    WHERE on_platform <> on_trajectory
+                                    ORDER BY instance
+                                    LIMIT %s
+                                    """,
+                                    (SWR_PUSH_SYNC_LIST_LIMIT,),
+                                ).fetchall()
+                            )
+                        swr_push_sync_available = True
+                    except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
+                        swr_push_sync_row = None
+                        swr_push_sync_out_of_sync_rows = []
         return aggregate_pipeline_snapshot(
             tasks,
             results,
@@ -954,6 +1107,9 @@ class PipelineStatusCollector:
             lifetime_stage_rows=lifetime_stages,
             remote_build_rows=remote_build_rows,
             remote_build_tracking_available=remote_build_tracking_available,
+            swr_push_sync_row=swr_push_sync_row,
+            swr_push_sync_out_of_sync_rows=swr_push_sync_out_of_sync_rows,
+            swr_push_sync_available=swr_push_sync_available,
         )
 
 
