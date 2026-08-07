@@ -85,6 +85,123 @@ spec:
                   # is intentionally not mounted into this DaemonSet.
                   timeout 120 docker image prune --force || true
 
+                  # Reclaim per-task images whose task terminally failed a
+                  # docker-consuming stage (nop/oracle validate or reward hack).
+                  # The DB is the source of truth: an image is deleted only when
+                  # its task's latest pipeline_tasks row is failed/rejected in a
+                  # validate/reward/repair stage AND no stage is actively
+                  # heartbeating it. An unreachable DB prints nothing and exits
+                  # 0, so a database outage deletes nothing (fail-safe), matching
+                  # the SWR step's unreachable-registry behaviour below.
+                  if [ "${SWEGEN_FAILED_IMAGE_PRUNE_ENABLED}" = "true" ]; then
+                    failed_checked=0
+                    failed_deleted=0
+                    failed_kept=0
+                    failed_deadline="$((
+                      $(date -u +%s) + SWEGEN_FAILED_IMAGE_PRUNE_BUDGET_SECONDS
+                    ))"
+                    : > /tmp/swegen-failed-candidates.txt
+                    docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+                      | grep -- '-swegenimage' \
+                      | grep -v '<none>' \
+                      | sort -u > /tmp/swegen-failed-images.txt || true
+                    while read -r failed_image; do
+                      [ -n "${failed_image}" ] || continue
+                      # Derive task_id: take the tag component (repo may carry a
+                      # registry host), strip a trailing :tag, drop the
+                      # -swegenimage suffix, then strip the leading hb__ prefix.
+                      failed_tag="${failed_image##*/}"
+                      failed_tag="${failed_tag%%:*}"
+                      case "${failed_tag}" in
+                        *-swegenimage) failed_task="${failed_tag%-swegenimage}" ;;
+                        *) continue ;;
+                      esac
+                      case "${failed_task}" in
+                        hb__*) failed_task="${failed_task#hb__}" ;;
+                      esac
+                      [ -n "${failed_task}" ] || continue
+                      printf '%s\t%s\n' "${failed_image}" "${failed_task}" \
+                        >> /tmp/swegen-failed-candidates.txt
+                    done < /tmp/swegen-failed-images.txt
+
+                    # One batched DB round-trip: pass every candidate task_id in
+                    # and read back only the subset that is safe to delete. The
+                    # heredoc body sits at this block scalar's base indentation
+                    # so the emitted script hands python column-0 source and the
+                    # closing PYEOF terminates the heredoc at column 0 too.
+                    cut -f2 /tmp/swegen-failed-candidates.txt | sort -u \
+                      > /tmp/swegen-failed-taskids.txt || true
+                    /app/.venv/bin/python - \
+                      < /tmp/swegen-failed-taskids.txt \
+                      > /tmp/swegen-failed-deletable.txt 2>/dev/null <<'PYEOF' || true
+              import os
+              import sys
+              
+              candidates = [line.strip() for line in sys.stdin if line.strip()]
+              if not candidates:
+                  sys.exit(0)
+              try:
+                  import psycopg
+              
+                  conn = psycopg.connect(
+                      host=os.environ["SWEGEN_PG_HOST"],
+                      port=os.environ["SWEGEN_PG_PORT"],
+                      dbname=os.environ["SWEGEN_PG_DB"],
+                      user=os.environ["SWEGEN_PG_USER"],
+                      password=os.environ["SWEGEN_PG_PASSWORD"],
+                  )
+              except Exception:
+                  # Fail-safe: an unreachable DB deletes nothing.
+                  sys.exit(0)
+              try:
+                  with conn, conn.cursor() as cur:
+                      cur.execute(
+                          """
+                          SELECT task.task_id
+                          FROM pipeline_tasks AS task
+                          WHERE task.task_id = ANY(%s)
+                            AND task.state IN ('failed', 'rejected')
+                            AND task.current_stage IN ('validate', 'reward', 'repair')
+                            AND NOT EXISTS (
+                              SELECT 1
+                              FROM pipeline_stage_activity AS activity
+                              WHERE activity.task_id = task.task_id
+                                AND activity.heartbeat_at >= now() - interval '5 minutes'
+                            )
+                          """,
+                          (candidates,),
+                      )
+                      for (task_id,) in cur.fetchall():
+                          print(task_id)
+              finally:
+                  conn.close()
+              PYEOF
+
+                    while IFS="$(printf '\t')" read -r failed_image failed_task; do
+                      [ -n "${failed_image}" ] || continue
+                      [ -n "${failed_task}" ] || continue
+                      [ "$(date -u +%s)" -lt "${failed_deadline}" ] || break
+                      failed_checked="$((failed_checked + 1))"
+                      # SAFETY: only images whose task_id the DB returned as
+                      # deletable are removed. Unknown, active or succeeded tasks
+                      # (never in the deletable set) fall through to kept.
+                      if grep -Fxq -- "${failed_task}" \
+                        /tmp/swegen-failed-deletable.txt 2>/dev/null
+                      then
+                        if timeout 60 docker rmi "${failed_image}" >/dev/null 2>&1; then
+                          failed_deleted="$((failed_deleted + 1))"
+                        else
+                          failed_kept="$((failed_kept + 1))"
+                        fi
+                      else
+                        failed_kept="$((failed_kept + 1))"
+                      fi
+                    done < /tmp/swegen-failed-candidates.txt
+                    printf '%s node=%s failed-image cleanup checked=%s deleted=%s kept=%s\n' \
+                      "$(date -Iseconds)" "${NODE_NAME}" "${failed_checked}" \
+                      "${failed_deleted}" "${failed_kept}"
+                  fi
+
                   # Reclaim task images that SWR already holds. Each candidate
                   # is removed only after its manifest is confirmed present in
                   # the registry, so a push that never landed keeps its local
@@ -178,6 +295,12 @@ spec:
 
                 sleep "${SWEGEN_BUILDKIT_PRUNE_INTERVAL_SECONDS}"
               done
+          # SWEGEN_PG_HOST/PORT/DB/USER/PASSWORD for the failed-image cleanup's
+          # single batched status query. Mirrors the worker container's
+          # swegen-database secretRef in swegen-pipeline.yaml.
+          envFrom:
+            - secretRef:
+                name: swegen-database
           env:
             - name: NODE_NAME
               valueFrom:
@@ -209,6 +332,15 @@ spec:
               value: "300"
             - name: SWEGEN_SWR_MANIFEST_TIMEOUT_SECONDS
               value: "30"
+            # Delete per-task images whose task terminally failed validate
+            # (nop/oracle) or reward (reward-hack). Gated so it can be disabled
+            # without a rebuild.
+            - name: SWEGEN_FAILED_IMAGE_PRUNE_ENABLED
+              value: "true"
+            # Cap the per-cycle work: a huge on-node image list can't stall the
+            # prune cycle past this budget.
+            - name: SWEGEN_FAILED_IMAGE_PRUNE_BUDGET_SECONDS
+              value: "300"
             - name: DOCKER_CONFIG
               value: /swegen-docker
             # The registry auth Secret above is intentionally read-only, but
