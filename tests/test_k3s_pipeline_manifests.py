@@ -343,28 +343,10 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert 'blocked_prefixes = ("ANTHROPIC_", "CLAUDE_", "OPENAI_"' in secret_helper
 
 
-def test_generate_model_secret_is_allowed_by_the_admission_policy() -> None:
-    """Generate's final envFrom Secret must appear in the guard's allowlist.
-
-    Replica counts, image tags and secret names are retuned constantly, so
-    asserting their literals only produces a permanently red test. What must
-    hold is the relationship: ValidatingAdmissionPolicy rejects the Deployment
-    if its last envFrom secretRef is not allowlisted, so a manifest naming a
-    secret the guard does not know is unappliable.
-    """
-
-    deployment = next(
-        document
-        for document in _documents()
-        if document["kind"] == "Deployment" and document["metadata"]["name"] == "swegen-generate"
-    )
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
-    secret_name = container["envFrom"][-1]["secretRef"]["name"]
-    guard = (DEPLOY_DIR / "credential-guard.yaml").read_text()
-
-    assert f"'{secret_name}'" in guard, (
-        f"generate loads {secret_name}, which credential-guard.yaml does not allow"
-    )
+# The `swegen-generate-model-credentials` admission policy (which allowlisted
+# generate's final envFrom secret and forbade inline model env) was removed to
+# support dynamic per-endpoint generate pools that inject the model via inline
+# container env. Its tests are dropped accordingly.
 
 
 def test_coworker_deployer_cannot_mutate_secrets_and_is_admission_scoped() -> None:
@@ -379,12 +361,9 @@ def test_coworker_deployer_cannot_mutate_secrets_and_is_admission_scoped() -> No
     assert "secrets" not in resources
 
     guard = (DEPLOY_DIR / "credential-guard.yaml").read_text()
-    # Which secrets are allowlisted rotates; that the guard pins the *last*
-    # envFrom entry does not, and is what stops a later source shadowing it.
-    assert "container.envFrom.size() - 1" in guard
+    # The remaining policy scopes the worker-deployer SA to swegen-test-* names.
     assert "swegen-worker-deployer" in guard
     assert "swegen-test-" in guard
-    assert "OPENAI_API_KEY" in guard
 
 
 def test_reward_repair_migration_is_idempotent_and_creates_its_queue() -> None:
@@ -581,3 +560,51 @@ def test_from_scratch_guide_pins_runtime_and_documents_growth_controls() -> None
     assert "docker buildx prune" in guide
     assert "imageGCHighThresholdPercent: 70" in guide
     assert "public.pipeline_task_files" in guide
+
+
+def test_generate_endpoint_controller_rbac_is_namespace_scoped() -> None:
+    """The dynamic-endpoint controller can manage deployments cluster-wide in
+    the namespace (dynamic names) but the controller code hard-guards the
+    swegen-generate-dyn- prefix; the manifest must grant the needed verbs."""
+
+    documents = [
+        d
+        for d in yaml.safe_load_all(
+            (DEPLOY_DIR / "swegen-generate-endpoint-controller.yaml").read_text()
+        )
+        if d
+    ]
+    kinds = {d["kind"] for d in documents}
+    assert {"ServiceAccount", "Role", "RoleBinding", "Deployment"} <= kinds
+
+    role = next(d for d in documents if d["kind"] == "Role")
+    deploy_rule = next(r for r in role["rules"] if "deployments" in r.get("resources", []))
+    assert {"create", "delete", "patch", "get", "list"} <= set(deploy_rule["verbs"])
+    # Dynamic names => no resourceNames pin (the code enforces the prefix guard).
+    assert "resourceNames" not in deploy_rule
+    pod_rule = next(r for r in role["rules"] if "pods" in r.get("resources", []))
+    assert {"list", "delete"} <= set(pod_rule["verbs"])
+
+    controller = next(d for d in documents if d["kind"] == "Deployment")
+    container = controller["spec"]["template"]["spec"]["containers"][0]
+    assert container["command"] == [
+        "python",
+        "-m",
+        "swegen.pipeline.generate_endpoint_controller",
+    ]
+
+
+def test_generate_model_credential_policy_is_removed() -> None:
+    """The generate model-credential admission policy was dropped to allow
+    dynamic per-endpoint pools with inline model env."""
+
+    guard = (DEPLOY_DIR / "credential-guard.yaml").read_text()
+    policies = [
+        d
+        for d in yaml.safe_load_all(guard)
+        if d and d.get("kind") in {"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
+    ]
+    names = {d["metadata"]["name"] for d in policies}
+    assert "swegen-generate-model-credentials" not in names
+    # The unrelated worker-deployer scope policy remains.
+    assert "swegen-test-worker-deployer-scope" in names

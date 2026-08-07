@@ -1,0 +1,679 @@
+"""Reconcile dynamic generate model-endpoint pools to their registry state.
+
+An operator registers ``(base_url, model_id, bearer token, concurrency)`` tuples
+in the ``generate_endpoints`` table (via the dashboard). This controller is the
+reconcile loop that converges the cluster to that desired state:
+
+* one Deployment ``swegen-generate-dyn-<slug>`` per enabled row, cloned from the
+  static ``swegen-generate`` template but with the model endpoint/model/token
+  injected as inline container env (no per-endpoint Secret);
+* replicas driven to the row's ``concurrency``;
+* deleted / disabled / breaker-open rows scaled to zero (and their pods swept),
+  removed rows' Deployments deleted;
+* an active health probe per endpoint that latches a durable per-endpoint
+  breaker on HTTP 5xx/429 (real status, unlike the CLI's free-text task errors),
+  scaling only that endpoint's Deployment to zero. A latch clears only on an
+  explicit operator reset.
+
+The controller only ever creates/patches/deletes Deployments whose name starts
+with ``swegen-generate-dyn-`` so it can never touch the static stage pipeline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import ssl
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Protocol
+
+from swegen import db
+
+_SERVICE_ACCOUNT_ROOT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+
+# Hard prefix guard: the controller must only ever manage its own dynamic
+# Deployments, never the static stage deployments (swegen-generate, etc.).
+DEPLOYMENT_PREFIX = "swegen-generate-dyn-"
+
+# HTTP statuses from an endpoint that count as "endpoint unhealthy".
+DEFAULT_UNHEALTHY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
+
+
+def deployment_name_for(slug: str) -> str:
+    return f"{DEPLOYMENT_PREFIX}{slug}"
+
+
+# --------------------------------------------------------------------------- #
+# Registry access
+# --------------------------------------------------------------------------- #
+
+_SELECT_ENDPOINTS_SQL = """
+    SELECT slug, base_url, model_id, auth_token, concurrency, enabled,
+           breaker_open, consecutive_fail
+    FROM generate_endpoints
+    ORDER BY slug
+"""
+
+_RECORD_PROBE_SQL = """
+    UPDATE generate_endpoints
+    SET last_probe_status = %s, last_probe_at = %s, consecutive_fail = %s,
+        updated_at = now()
+    WHERE slug = %s
+"""
+
+_TRIP_SQL = """
+    UPDATE generate_endpoints
+    SET breaker_open = TRUE, breaker_reason = %s, tripped_at = %s,
+        consecutive_fail = %s, last_probe_status = %s, last_probe_at = %s,
+        updated_at = now()
+    WHERE slug = %s AND NOT breaker_open
+"""
+
+_INSERT_EVENT_SQL = """
+    INSERT INTO generate_endpoint_events (slug, model_id, event, reason, detail)
+    VALUES (%s, %s, %s, %s, %s)
+"""
+
+
+class Connection(Protocol):
+    def execute(self, sql: str, params: Sequence[object] = ...) -> Any: ...
+    def transaction(self) -> Any: ...
+
+
+@dataclass(frozen=True)
+class EndpointRow:
+    slug: str
+    base_url: str
+    model_id: str
+    auth_token: str
+    concurrency: int
+    enabled: bool
+    breaker_open: bool
+    consecutive_fail: int
+
+
+def load_endpoints(connection: Connection) -> list[EndpointRow]:
+    rows = list(connection.execute(_SELECT_ENDPOINTS_SQL).fetchall())
+    endpoints: list[EndpointRow] = []
+    for row in rows:
+        # Support both tuple rows and dict_row.
+        if isinstance(row, Mapping):
+            endpoints.append(
+                EndpointRow(
+                    slug=row["slug"],
+                    base_url=row["base_url"],
+                    model_id=row["model_id"],
+                    auth_token=row["auth_token"],
+                    concurrency=int(row["concurrency"]),
+                    enabled=bool(row["enabled"]),
+                    breaker_open=bool(row["breaker_open"]),
+                    consecutive_fail=int(row["consecutive_fail"]),
+                )
+            )
+        else:
+            endpoints.append(
+                EndpointRow(
+                    slug=row[0],
+                    base_url=row[1],
+                    model_id=row[2],
+                    auth_token=row[3],
+                    concurrency=int(row[4]),
+                    enabled=bool(row[5]),
+                    breaker_open=bool(row[6]),
+                    consecutive_fail=int(row[7]),
+                )
+            )
+    return endpoints
+
+
+def record_probe(
+    connection: Connection,
+    slug: str,
+    *,
+    status: int | None,
+    consecutive_fail: int,
+    now: datetime,
+) -> None:
+    connection.execute(_RECORD_PROBE_SQL, (status, now, consecutive_fail, slug))
+
+
+def trip_endpoint(
+    connection: Connection,
+    row: EndpointRow,
+    *,
+    status: int | None,
+    reason: str,
+    consecutive_fail: int,
+    now: datetime,
+) -> bool:
+    """Latch this endpoint's breaker; returns True on the real transition."""
+
+    result = connection.execute(
+        _TRIP_SQL, (reason, now, consecutive_fail, status, now, row.slug)
+    )
+    tripped = getattr(result, "rowcount", 0) == 1
+    if tripped:
+        connection.execute(
+            _INSERT_EVENT_SQL,
+            (
+                row.slug,
+                row.model_id,
+                "tripped",
+                reason,
+                json.dumps({"last_probe_status": status}),
+            ),
+        )
+    return tripped
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint health probe
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    ok: bool
+    status: int | None
+    detail: str
+
+
+class EndpointProber(Protocol):
+    def probe(self, base_url: str, model_id: str, token: str) -> ProbeResult: ...
+
+
+class HttpEndpointProber:
+    """Probe a model endpoint's Anthropic messages API for real HTTP health."""
+
+    def __init__(self, *, timeout_seconds: float = 20.0) -> None:
+        self._timeout = timeout_seconds
+        self._opener = urllib.request.build_opener()
+
+    def probe(self, base_url: str, model_id: str, token: str) -> ProbeResult:
+        url = base_url.rstrip("/") + "/v1/messages"
+        payload = json.dumps(
+            {
+                "model": model_id,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={
+                "content-type": "application/json",
+                "x-api-key": token,
+                "authorization": f"Bearer {token}",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        try:
+            with self._opener.open(request, timeout=self._timeout) as response:
+                response.read(256)
+                return ProbeResult(ok=True, status=response.status, detail="ok")
+        except urllib.error.HTTPError as error:
+            # A 4xx that is not 429 (e.g. 400/401) means the endpoint is
+            # reachable and answering; only 429 + 5xx count as unhealthy.
+            healthy = error.code not in DEFAULT_UNHEALTHY_STATUSES
+            return ProbeResult(ok=healthy, status=error.code, detail=f"http {error.code}")
+        except urllib.error.URLError as error:
+            return ProbeResult(ok=False, status=None, detail=f"unreachable: {error.reason}")
+        except TimeoutError:
+            return ProbeResult(ok=False, status=None, detail="timeout")
+
+
+# --------------------------------------------------------------------------- #
+# Kubernetes deployment manager
+# --------------------------------------------------------------------------- #
+
+
+class DeploymentManager(Protocol):
+    def list_dynamic(self) -> dict[str, int]: ...
+    def apply(self, slug: str, spec: Mapping[str, object], replicas: int) -> None: ...
+    def scale(self, slug: str, replicas: int) -> None: ...
+    def delete(self, slug: str) -> None: ...
+    def sweep_pods(self, slug: str) -> int: ...
+
+
+class KubernetesDeploymentManager:
+    """In-cluster client that manages only ``swegen-generate-dyn-*`` Deployments."""
+
+    def __init__(self, namespace: str = "swegen-pipeline") -> None:
+        host = os.environ.get("KUBERNETES_SERVICE_HOST", "").strip()
+        port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443").strip()
+        if not host:
+            raise RuntimeError("KUBERNETES_SERVICE_HOST is not set")
+        self._token = (_SERVICE_ACCOUNT_ROOT / "token").read_text(encoding="utf-8").strip()
+        context = ssl.create_default_context(cafile=str(_SERVICE_ACCOUNT_ROOT / "ca.crt"))
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=context),
+        )
+        self._namespace = namespace
+        self._api_root = f"https://{host}:{port}"
+        self._deployments_url = (
+            f"{self._api_root}/apis/apps/v1/namespaces/{namespace}/deployments"
+        )
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, object] | None = None,
+        *,
+        content_type: str = "application/json",
+    ) -> dict[str, object]:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/json",
+                "Content-Type": content_type,
+            },
+        )
+        try:
+            with self._opener.open(request, timeout=15) as response:
+                raw = response.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[-800:]
+            raise RuntimeError(
+                f"Kubernetes API {method} failed with HTTP {error.code}: {detail}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Kubernetes API {method} failed: {error.reason}") from error
+
+    @staticmethod
+    def _guard(slug: str) -> str:
+        name = deployment_name_for(slug)
+        if not name.startswith(DEPLOYMENT_PREFIX) or len(name) <= len(DEPLOYMENT_PREFIX):
+            raise ValueError(f"refusing to manage non-dynamic deployment {name!r}")
+        return name
+
+    def fetch_template(self, source_deployment: str = "swegen-generate") -> dict[str, object]:
+        """Read the live static generate Deployment to use as the clone template.
+
+        Avoids mounting the manifest: the controller already has API read access,
+        and the live Deployment is the authoritative pod-spec source.
+        """
+
+        return self._request("GET", f"{self._deployments_url}/{source_deployment}")
+
+    def list_dynamic(self) -> dict[str, int]:
+        """Return {slug: desired_replicas} for existing dynamic Deployments."""
+
+        listing = self._request("GET", self._deployments_url)
+        items = listing.get("items")
+        out: dict[str, int] = {}
+        if not isinstance(items, list):
+            return out
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            metadata = item.get("metadata")
+            name = metadata.get("name") if isinstance(metadata, Mapping) else None
+            if not isinstance(name, str) or not name.startswith(DEPLOYMENT_PREFIX):
+                continue
+            spec = item.get("spec")
+            replicas = spec.get("replicas") if isinstance(spec, Mapping) else 0
+            out[name[len(DEPLOYMENT_PREFIX):]] = int(replicas or 0)
+        return out
+
+    def apply(self, slug: str, spec: Mapping[str, object], replicas: int) -> None:
+        name = self._guard(slug)
+        url = f"{self._deployments_url}/{name}"
+        try:
+            self._request("GET", url)
+            exists = True
+        except RuntimeError:
+            exists = False
+        if exists:
+            self.scale(slug, replicas)
+            return
+        manifest = dict(spec)
+        self._request("POST", self._deployments_url, dict(manifest))
+
+    def scale(self, slug: str, replicas: int) -> None:
+        name = self._guard(slug)
+        url = f"{self._deployments_url}/{name}"
+        self._request(
+            "PATCH",
+            url,
+            {"spec": {"replicas": max(0, int(replicas))}},
+            content_type="application/merge-patch+json",
+        )
+
+    def delete(self, slug: str) -> None:
+        name = self._guard(slug)
+        url = f"{self._deployments_url}/{name}?propagationPolicy=Foreground"
+        try:
+            self._request("DELETE", url)
+        except RuntimeError:
+            pass
+        self.sweep_pods(slug)
+
+    def sweep_pods(self, slug: str) -> int:
+        self._guard(slug)  # prefix-safety guard; sweep is by label, not name
+        selector = f"app.kubernetes.io/name%3Dswegen-worker,swegen.pgcode%2Fendpoint%3D{slug}"
+        pods_url = f"{self._api_root}/api/v1/namespaces/{self._namespace}/pods?labelSelector={selector}"
+        try:
+            listing = self._request("GET", pods_url)
+        except RuntimeError:
+            return 0
+        items = listing.get("items")
+        if not isinstance(items, list):
+            return 0
+        deleted = 0
+        for item in items:
+            metadata = item.get("metadata") if isinstance(item, Mapping) else None
+            pod = metadata.get("name") if isinstance(metadata, Mapping) else None
+            if not isinstance(pod, str) or not pod:
+                continue
+            url = f"{self._api_root}/api/v1/namespaces/{self._namespace}/pods/{pod}"
+            try:
+                self._request("DELETE", url, {"gracePeriodSeconds": 0})
+                deleted += 1
+            except RuntimeError:
+                continue
+        return deleted
+
+
+# --------------------------------------------------------------------------- #
+# Deployment spec builder (clones the static generate template)
+# --------------------------------------------------------------------------- #
+
+# Env var names the endpoint's inline model config populates. Kept in sync with
+# the model-credential secret contract (deploy/k3s/create-secrets.sh) so a
+# Claude Code worker resolves (endpoint, model, token) exactly as it does from a
+# secret's envFrom (see swegen.model_settings.load_model_settings).
+_MODEL_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "SWEGEN_CLAUDE_FAST_MODEL",
+)
+
+
+def model_env(row: EndpointRow) -> list[dict[str, str]]:
+    base = row.base_url.rstrip("/")
+    openai_base = base if base.endswith("/v1") else base + "/v1"
+    anthropic_base = base[: -len("/v1")] if base.endswith("/v1") else base
+    values = {
+        "ANTHROPIC_BASE_URL": anthropic_base,
+        "ANTHROPIC_MODEL": row.model_id,
+        "ANTHROPIC_AUTH_TOKEN": row.auth_token,
+        "ANTHROPIC_API_KEY": row.auth_token,
+        "OPENAI_BASE_URL": openai_base,
+        "OPENAI_MODEL": row.model_id,
+        "OPENAI_API_KEY": row.auth_token,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": row.model_id,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": row.model_id,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": row.model_id,
+        "ANTHROPIC_SMALL_FAST_MODEL": row.model_id,
+        "SWEGEN_CLAUDE_FAST_MODEL": row.model_id,
+    }
+    return [{"name": key, "value": values[key]} for key in _MODEL_ENV_KEYS]
+
+
+def build_deployment_spec(row: EndpointRow, template: Mapping[str, object]) -> dict[str, object]:
+    """Clone the static generate Deployment template for this endpoint.
+
+    ``template`` is the parsed ``swegen-generate`` Deployment (from the manifest,
+    loaded once at startup). The clone keeps the whole pod spec but: renames to
+    ``swegen-generate-dyn-<slug>``, adds a ``swegen.pgcode/endpoint`` label so the
+    pod sweep and dashboard can attribute pods to this endpoint, drops the
+    model-credential secret from ``envFrom``, appends the inline model env, and
+    sets replicas.
+    """
+
+    import copy
+
+    manifest = copy.deepcopy(dict(template))
+    name = deployment_name_for(row.slug)
+    metadata = manifest.setdefault("metadata", {})
+    metadata["name"] = name
+    metadata.pop("resourceVersion", None)
+    metadata.pop("uid", None)
+    metadata.pop("creationTimestamp", None)
+    metadata.pop("annotations", None)
+
+    spec = manifest.setdefault("spec", {})
+    spec["replicas"] = max(0, int(row.concurrency))
+
+    # Label both selector and pod template with the endpoint slug.
+    tpl = spec.setdefault("template", {})
+    tpl_meta = tpl.setdefault("metadata", {})
+    labels = dict(tpl_meta.get("labels") or {})
+    labels["swegen.pgcode/endpoint"] = row.slug
+    tpl_meta["labels"] = labels
+    selector = spec.setdefault("selector", {})
+    sel_labels = dict(selector.get("matchLabels") or {})
+    sel_labels["swegen.pgcode/endpoint"] = row.slug
+    selector["matchLabels"] = sel_labels
+
+    containers = tpl.get("spec", {}).get("containers", [])
+    for container in containers:
+        if container.get("name") != "worker":
+            continue
+        env_from = [
+            source
+            for source in container.get("envFrom", [])
+            if not str(source.get("secretRef", {}).get("name", "")).startswith(
+                "swegen-model-credentials-"
+            )
+        ]
+        container["envFrom"] = env_from
+        env = [
+            entry
+            for entry in container.get("env", [])
+            if entry.get("name") not in set(_MODEL_ENV_KEYS)
+        ]
+        env.extend(model_env(row))
+        container["env"] = env
+    return manifest
+
+
+# --------------------------------------------------------------------------- #
+# Reconcile
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ReconcilePlan:
+    apply: list[tuple[str, int]] = field(default_factory=list)   # (slug, replicas) create/ensure
+    scale: list[tuple[str, int]] = field(default_factory=list)   # (slug, replicas)
+    delete: list[str] = field(default_factory=list)              # slugs
+
+
+def plan_reconcile(
+    endpoints: Sequence[EndpointRow], existing: Mapping[str, int]
+) -> ReconcilePlan:
+    """Pure planner: given registry rows and existing {slug: replicas}, decide actions.
+
+    A row that is disabled or breaker-open targets 0 replicas (kept, scaled down);
+    an enabled healthy row targets its concurrency. An existing dynamic
+    Deployment whose slug is no longer in the registry is deleted.
+    """
+
+    plan = ReconcilePlan()
+    registry_slugs = {row.slug for row in endpoints}
+    for row in endpoints:
+        target = 0 if (not row.enabled or row.breaker_open) else max(0, row.concurrency)
+        if row.slug not in existing:
+            if target > 0:
+                plan.apply.append((row.slug, target))
+            # target 0 and not existing: nothing to do.
+        elif existing[row.slug] != target:
+            plan.scale.append((row.slug, target))
+    for slug in existing:
+        if slug not in registry_slugs:
+            plan.delete.append(slug)
+    return plan
+
+
+def reconcile_once(
+    connection: Connection,
+    manager: DeploymentManager,
+    prober: EndpointProber,
+    template: Mapping[str, object],
+    *,
+    consecutive_trip_threshold: int = 3,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> ReconcilePlan:
+    """One reconcile + probe pass. Returns the plan that was applied."""
+
+    endpoints = load_endpoints(connection)
+
+    # --- Health probe + breaker (only for enabled, not-yet-open endpoints) ---
+    for row in endpoints:
+        if not row.enabled or row.breaker_open:
+            continue
+        result = prober.probe(row.base_url, row.model_id, row.auth_token)
+        stamp = now()
+        if result.ok:
+            with connection.transaction():
+                record_probe(connection, row.slug, status=result.status, consecutive_fail=0, now=stamp)
+        else:
+            fails = row.consecutive_fail + 1
+            with connection.transaction():
+                if fails >= consecutive_trip_threshold:
+                    reason = (
+                        f"endpoint unhealthy: {result.detail} "
+                        f"({fails} consecutive probe failures)"
+                    )
+                    trip_endpoint(
+                        connection,
+                        row,
+                        status=result.status,
+                        reason=reason,
+                        consecutive_fail=fails,
+                        now=stamp,
+                    )
+                else:
+                    record_probe(
+                        connection, row.slug, status=result.status, consecutive_fail=fails, now=stamp
+                    )
+
+    # Re-read after probing so trips this cycle are reflected in the plan.
+    endpoints = load_endpoints(connection)
+    existing = manager.list_dynamic()
+    plan = plan_reconcile(endpoints, existing)
+    by_slug = {row.slug: row for row in endpoints}
+
+    for slug, replicas in plan.apply:
+        manager.apply(slug, build_deployment_spec(by_slug[slug], template), replicas)
+    for slug, replicas in plan.scale:
+        manager.scale(slug, replicas)
+        if replicas == 0:
+            manager.sweep_pods(slug)
+    for slug in plan.delete:
+        manager.delete(slug)
+    return plan
+
+
+# --------------------------------------------------------------------------- #
+# Template loading + entrypoint
+# --------------------------------------------------------------------------- #
+
+
+def load_generate_template(manifest_path: Path) -> dict[str, object]:
+    """Load the static swegen-generate Deployment from the pipeline manifest."""
+
+    import yaml
+
+    for document in yaml.safe_load_all(manifest_path.read_text(encoding="utf-8")):
+        if (
+            isinstance(document, Mapping)
+            and document.get("kind") == "Deployment"
+            and document.get("metadata", {}).get("name") == "swegen-generate"
+        ):
+            return dict(document)
+    raise RuntimeError(f"swegen-generate Deployment not found in {manifest_path}")
+
+
+def _config_from_environment() -> dict[str, object]:
+    return {
+        "namespace": os.environ.get("SWEGEN_ENDPOINT_NAMESPACE", "swegen-pipeline"),
+        "poll_seconds": float(os.environ.get("SWEGEN_ENDPOINT_POLL_SECONDS", "20")),
+        "probe_timeout": float(os.environ.get("SWEGEN_ENDPOINT_PROBE_TIMEOUT_SECONDS", "20")),
+        "trip_threshold": int(os.environ.get("SWEGEN_ENDPOINT_TRIP_THRESHOLD", "3")),
+        "manifest": os.environ.get(
+            "SWEGEN_ENDPOINT_TEMPLATE_PATH", "/etc/swegen/swegen-pipeline.yaml"
+        ),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+
+    config = _config_from_environment()
+    manager = KubernetesDeploymentManager(namespace=str(config["namespace"]))
+    # Prefer the live static Deployment as the clone template (no manifest mount);
+    # fall back to a mounted manifest path if the source Deployment is absent.
+    try:
+        template = manager.fetch_template()
+    except RuntimeError:
+        template = load_generate_template(Path(str(config["manifest"])))
+    prober = HttpEndpointProber(timeout_seconds=float(config["probe_timeout"]))
+    pool = db.get_pool()
+    stop = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    try:
+        while not stop:
+            try:
+                with pool.connection() as connection:
+                    plan = reconcile_once(
+                        connection,
+                        manager,
+                        prober,
+                        template,
+                        consecutive_trip_threshold=int(config["trip_threshold"]),
+                    )
+                print(
+                    f"reconcile applied={len(plan.apply)} scaled={len(plan.scale)} "
+                    f"deleted={len(plan.delete)}",
+                    flush=True,
+                )
+            except Exception as error:
+                print(
+                    f"endpoint reconcile failed: {type(error).__name__}: {error}",
+                    flush=True,
+                )
+            if args.once:
+                return
+            time.sleep(float(config["poll_seconds"]))
+    finally:
+        db.close_pool()
+
+
+if __name__ == "__main__":
+    main()

@@ -499,3 +499,58 @@ CREATE INDEX IF NOT EXISTS idx_buildkit_intermediates_repo_ready
 CREATE INDEX IF NOT EXISTS idx_buildkit_intermediates_building
     ON buildkit_intermediates (updated_at)
     WHERE status = 'building';
+
+-- ---------------------------------------------------------------------------
+-- Dynamic generate endpoint registry.
+--
+-- The desired state for dynamically-registered generate model pools. An
+-- operator registers an (endpoint, model_id, bearer token, concurrency) tuple
+-- from the dashboard; the generate-endpoint controller reconciles one
+-- Deployment `swegen-generate-dyn-<slug>` per row to match `concurrency`
+-- replicas, actively health-probes each endpoint, and latches `breaker_open`
+-- (scaling that Deployment to zero) when the endpoint returns HTTP 5xx/429.
+-- The latch is durable: only an explicit operator reset re-enables the pool.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS generate_endpoints (
+    id                BIGSERIAL        PRIMARY KEY,
+    slug              TEXT             NOT NULL UNIQUE,
+    base_url          TEXT             NOT NULL,
+    model_id          TEXT             NOT NULL,
+    auth_token        TEXT             NOT NULL,
+    concurrency       INTEGER          NOT NULL DEFAULT 0,
+    enabled           BOOLEAN          NOT NULL DEFAULT TRUE,
+    breaker_open      BOOLEAN          NOT NULL DEFAULT FALSE,
+    breaker_reason    TEXT,
+    tripped_at        TIMESTAMPTZ,
+    reset_at          TIMESTAMPTZ,
+    last_probe_status INTEGER,
+    last_probe_at     TIMESTAMPTZ,
+    consecutive_fail  INTEGER          NOT NULL DEFAULT 0,
+    created_at        TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    -- The slug is embedded in the k8s Deployment name; keep it DNS-label safe
+    -- so `swegen-generate-dyn-<slug>` is always a valid resource name.
+    CONSTRAINT ck_generate_endpoints_slug CHECK (
+        slug ~ '^[a-z0-9]([a-z0-9-]{0,40}[a-z0-9])?$'
+    ),
+    CONSTRAINT ck_generate_endpoints_nonblank CHECK (
+        btrim(base_url) <> '' AND btrim(model_id) <> '' AND btrim(auth_token) <> ''
+    ),
+    CONSTRAINT ck_generate_endpoints_concurrency CHECK (concurrency >= 0),
+    CONSTRAINT ck_generate_endpoints_consecutive CHECK (consecutive_fail >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS generate_endpoint_events (
+    id          BIGSERIAL   PRIMARY KEY,
+    slug        TEXT        NOT NULL,
+    model_id    TEXT        NOT NULL,
+    event       TEXT        NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason      TEXT        NOT NULL,
+    detail      JSONB,
+    CONSTRAINT ck_generate_endpoint_events_event CHECK (
+        event IN ('registered', 'updated', 'scaled', 'deleted', 'tripped', 'reset')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_generate_endpoint_events_recent
+    ON generate_endpoint_events (slug, occurred_at DESC);

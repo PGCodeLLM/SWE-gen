@@ -983,3 +983,285 @@ def test_cache_retains_last_good_capacity_without_dropping_below_configured() ->
     scaling = cache.snapshot()["k3s"]["scaling"]
     assert scaling["max_replicas"] == 800
     assert scaling["stale"] is True
+
+
+class _FakeResult:
+    def __init__(self, rowcount: int = 0, rows: list | None = None) -> None:
+        self.rowcount = rowcount
+        self._rows = rows or []
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeEndpointConn:
+    """In-memory stand-in for an autocommit psycopg connection."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple]] = []
+        self.rows: dict[str, str] = {}
+        self.events: list[tuple] = []
+
+    def __enter__(self) -> _FakeEndpointConn:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def execute(self, sql: str, params: tuple = ()) -> _FakeResult:
+        self.calls.append((sql, params))
+        normalized = sql.strip().upper()
+        if normalized.startswith("SELECT 1"):
+            return _FakeResult(rows=[(1,)] if params[0] in self.rows else [])
+        if normalized.startswith("SELECT MODEL_ID"):
+            slug = params[0]
+            return _FakeResult(rows=[(self.rows[slug],)] if slug in self.rows else [])
+        if normalized.startswith("INSERT INTO GENERATE_ENDPOINTS"):
+            self.rows[params[0]] = params[2]
+            return _FakeResult(rowcount=1)
+        if normalized.startswith("INSERT INTO GENERATE_ENDPOINT_EVENTS"):
+            self.events.append(params)
+            return _FakeResult(rowcount=1)
+        if normalized.startswith("UPDATE"):
+            return _FakeResult(rowcount=1 if params[-1] in self.rows else 0)
+        if normalized.startswith("DELETE"):
+            self.rows.pop(params[0], None)
+            return _FakeResult(rowcount=1)
+        return _FakeResult()
+
+
+def _registry_with(conn: _FakeEndpointConn):
+    from swegen.dashboard.server import GenerateEndpointRegistry
+
+    return GenerateEndpointRegistry(connect=lambda: conn)
+
+
+def test_endpoint_slug_derivation_is_k8s_label_safe() -> None:
+    from swegen.dashboard.server import ENDPOINT_SLUG_RE, derive_endpoint_slug
+
+    slug = derive_endpoint_slug("Claude/Opus 4.8", "https://Api.Example.com:8443/v1")
+    assert ENDPOINT_SLUG_RE.match(slug)
+    assert slug == slug.lower()
+    assert not slug.startswith("-") and not slug.endswith("-")
+    assert len(slug) <= 40
+
+
+def test_register_endpoint_inserts_row_event_and_returns_slug() -> None:
+    conn = _FakeEndpointConn()
+    registry = _registry_with(conn)
+
+    result = registry.register(
+        base_url="https://alpha.example.com/v1",
+        model_id="model-one",
+        auth_token="TOP-SECRET-TOKEN",
+        concurrency=8,
+        max_replicas=100,
+    )
+
+    assert result["ok"] is True
+    slug = result["slug"]
+    assert slug in conn.rows
+    # A registered event is written; its params never carry the token.
+    assert any(params[2] == "registered" for params in conn.events)
+    assert all("TOP-SECRET-TOKEN" not in str(params) for params in conn.events)
+    # The token is not echoed back in the response.
+    assert "TOP-SECRET-TOKEN" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"base_url": "ftp://x", "model_id": "m", "auth_token": "t", "concurrency": 1}, "base_url"),
+        ({"base_url": "not-a-url", "model_id": "m", "auth_token": "t", "concurrency": 1}, "base_url"),
+        ({"base_url": "https://a.com", "model_id": "", "auth_token": "t", "concurrency": 1}, "model_id"),
+        ({"base_url": "https://a.com", "model_id": "m", "auth_token": " ", "concurrency": 1}, "auth_token"),
+        ({"base_url": "https://a.com", "model_id": "m", "auth_token": "t", "concurrency": -1}, "between 0"),
+        ({"base_url": "https://a.com", "model_id": "m", "auth_token": "t", "concurrency": 101}, "between 0"),
+    ],
+)
+def test_register_endpoint_rejects_invalid_input(kwargs: dict, match: str) -> None:
+    registry = _registry_with(_FakeEndpointConn())
+    with pytest.raises(ValueError, match=match):
+        registry.register(max_replicas=100, **kwargs)
+
+
+def test_register_endpoint_rejects_duplicate_slug() -> None:
+    from swegen.dashboard.server import EndpointConflictError
+
+    conn = _FakeEndpointConn()
+    registry = _registry_with(conn)
+    first = registry.register(
+        base_url="https://alpha.example.com",
+        model_id="model-one",
+        auth_token="t",
+        concurrency=1,
+        max_replicas=100,
+    )
+    with pytest.raises(EndpointConflictError):
+        registry.register(
+            base_url="https://alpha.example.com",
+            model_id="model-one",
+            auth_token="t2",
+            concurrency=1,
+            max_replicas=100,
+        )
+    assert first["slug"] in conn.rows
+
+
+def test_scale_endpoint_updates_and_writes_event() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    result = registry.scale(slug="m1-alpha", concurrency=20, max_replicas=100)
+
+    assert result == {"ok": True, "slug": "m1-alpha", "concurrency": 20}
+    assert any(params[2] == "scaled" for params in conn.events)
+
+
+def test_scale_endpoint_rejects_out_of_range_concurrency() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+    with pytest.raises(ValueError, match="between 0"):
+        registry.scale(slug="m1-alpha", concurrency=999, max_replicas=100)
+
+
+def test_scale_endpoint_missing_slug_raises_not_found() -> None:
+    from swegen.dashboard.server import EndpointNotFoundError
+
+    registry = _registry_with(_FakeEndpointConn())
+    with pytest.raises(EndpointNotFoundError):
+        registry.scale(slug="does-not-exist", concurrency=1, max_replicas=100)
+    # A slug that is not even label-shaped is also a 404, not a 500.
+    with pytest.raises(EndpointNotFoundError):
+        registry.scale(slug="Bad Slug!", concurrency=1, max_replicas=100)
+
+
+def test_update_endpoint_changes_api_and_validates() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    result = registry.update(slug="m1-alpha", base_url="https://new.example.com/v1")
+    assert result["ok"] is True
+    assert any(params[2] == "updated" for params in conn.events)
+
+    with pytest.raises(ValueError, match="base_url"):
+        registry.update(slug="m1-alpha", base_url="not-a-url")
+    with pytest.raises(ValueError, match="no fields"):
+        registry.update(slug="m1-alpha")
+
+
+def test_update_endpoint_never_logs_token_in_event() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+    registry.update(slug="m1-alpha", auth_token="ROTATED-SECRET")
+    assert all("ROTATED-SECRET" not in str(params) for params in conn.events)
+
+
+def test_reset_endpoint_clears_breaker_latch() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    result = registry.reset(slug="m1-alpha")
+    assert result == {"ok": True, "slug": "m1-alpha"}
+    reset_calls = [sql for sql, _ in conn.calls if "breaker_open = FALSE" in sql]
+    assert reset_calls, "reset should clear the breaker latch"
+    assert any(params[2] == "reset" for params in conn.events)
+
+
+def test_delete_endpoint_writes_event_before_deleting_row() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    result = registry.delete(slug="m1-alpha")
+    assert result == {"ok": True, "slug": "m1-alpha"}
+    assert "m1-alpha" not in conn.rows
+    # The deleted event is recorded before the DELETE statement runs.
+    event_index = next(
+        i for i, (sql, _) in enumerate(conn.calls) if "GENERATE_ENDPOINT_EVENTS" in sql.upper()
+    )
+    delete_index = next(
+        i for i, (sql, _) in enumerate(conn.calls) if sql.strip().upper().startswith("DELETE")
+    )
+    assert event_index < delete_index
+    assert any(params[2] == "deleted" for params in conn.events)
+
+
+def test_delete_endpoint_missing_slug_raises_not_found() -> None:
+    from swegen.dashboard.server import EndpointNotFoundError
+
+    registry = _registry_with(_FakeEndpointConn())
+    with pytest.raises(EndpointNotFoundError):
+        registry.delete(slug="ghost-endpoint")
+
+
+def test_generate_endpoint_routes_are_allowlisted_in_do_post() -> None:
+    import inspect
+
+    from swegen.dashboard.server import make_handler
+
+    source = inspect.getsource(make_handler)
+    for path in (
+        "/api/generate/endpoints",
+        "/api/generate/endpoints/scale",
+        "/api/generate/endpoints/update",
+        "/api/generate/endpoints/reset",
+        "/api/generate/endpoints/delete",
+    ):
+        assert f'"{path}"' in source
+    # Endpoint errors map to the documented HTTP status codes.
+    assert "EndpointConflictError" in source
+    assert "EndpointNotFoundError" in source
+
+
+def test_dashboard_html_has_generate_endpoints_panel_and_actions() -> None:
+    from swegen.dashboard.server import HTML
+
+    assert "<h2>Generate model endpoints</h2>" in HTML
+    # Registration form: url, model, password token, concurrency, register.
+    assert 'id="endpoint-form"' in HTML
+    assert 'id="endpoint-url"' in HTML
+    assert 'id="endpoint-model"' in HTML
+    assert 'id="endpoint-token" type="password"' in HTML
+    assert 'id="endpoint-concurrency" type="number"' in HTML
+    assert 'id="endpoint-register"' in HTML
+    assert 'id="endpoints"' in HTML
+    # Per-endpoint action buttons wired to their POST routes.
+    assert "submitEndpointScale(ep.slug" in HTML
+    assert "submitEndpointEdit(ep.slug" in HTML
+    assert "submitEndpointReset(ep.slug)" in HTML
+    assert "submitEndpointDelete(ep.slug" in HTML
+    assert "'/api/generate/endpoints/scale'" in HTML
+    assert "'/api/generate/endpoints/update'" in HTML
+    assert "'/api/generate/endpoints/reset'" in HTML
+    assert "'/api/generate/endpoints/delete'" in HTML
+    # CSRF token is sent like the existing scale submit.
+    assert "'X-CSRF-Token':csrfToken" in HTML
+    # Reset only offered when the breaker is latched; delete confirms.
+    assert "if(ep.breaker_open){const resetBtn" in HTML
+    assert "confirm(`Delete endpoint" in HTML
+    # The token input is never rendered back into the table.
+    assert "renderEndpoints(pg.generate_endpoints,k.generate_endpoint_pods||{})" in HTML
+    assert "ep.auth_token" not in HTML
+
+
+def test_dashboard_stage_cards_stack_vertically() -> None:
+    from swegen.dashboard.server import HTML
+
+    # The stage flow container is a single full-width column, not the old
+    # 4-across grid, so each taller diverging-chart card has room.
+    assert ".pipeline-flow{display:grid;grid-template-columns:1fr;" in HTML
+    assert (
+        "minmax(235px,1fr) minmax(520px,2fr) minmax(235px,1fr) minmax(235px,1fr)" not in HTML
+    )
+    # The diverging chart internals are untouched.
+    assert "chart.className='chart chart-diverging'" in HTML
+    assert "card.append(stats,chart)" in HTML

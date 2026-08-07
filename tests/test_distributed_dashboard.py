@@ -1624,3 +1624,207 @@ def test_k3s_collector_excludes_evicted_pods_and_keeps_deployments() -> None:
     deployment_queries = [c for c in commands if "deployments" in c]
     assert len(deployment_queries) == 1
     assert not any("--field-selector" in argument for argument in deployment_queries[0])
+
+
+def test_summarize_generate_endpoints_builds_section_without_token() -> None:
+    from swegen.dashboard.distributed_status import summarize_generate_endpoints
+
+    tripped = datetime(2026, 8, 7, 11, 0, tzinfo=UTC)
+    rows = [
+        {
+            "slug": "m1-alpha",
+            "model_id": "model-one",
+            "base_url": "https://alpha.example.com:8443/v1",
+            "auth_token": "TOP-SECRET-TOKEN",
+            "concurrency": 12,
+            "enabled": True,
+            "breaker_open": False,
+            "breaker_reason": None,
+            "tripped_at": None,
+            "reset_at": None,
+            "last_probe_status": 200,
+            "last_probe_at": NOW,
+            "consecutive_fail": 0,
+        },
+        {
+            "slug": "m2-beta",
+            "model_id": "model-two",
+            "base_url": "https://beta.example.com",
+            "auth_token": "OTHER-SECRET",
+            "concurrency": 4,
+            "enabled": True,
+            "breaker_open": True,
+            "breaker_reason": "endpoint unhealthy: http 503",
+            "tripped_at": tripped,
+            "reset_at": None,
+            "last_probe_status": 503,
+            "last_probe_at": NOW,
+            "consecutive_fail": 3,
+        },
+    ]
+    running = {"m1-alpha": 12, "m2-beta": 0}
+    model_timeseries = {
+        "models": ["model-one", "model-two"],
+        "buckets": [
+            {
+                "t": "2026-08-07T11:45:00+00:00",
+                "by_model": {
+                    "model-one": {"succeeded": 9, "failed": 1, "rejected": 0},
+                    "model-two": {"succeeded": 0, "failed": 5, "rejected": 0},
+                },
+            }
+        ],
+    }
+
+    section = summarize_generate_endpoints(rows, running, model_timeseries)
+
+    assert section["available"] is True
+    assert "TOP-SECRET-TOKEN" not in json.dumps(section)
+    assert "OTHER-SECRET" not in json.dumps(section)
+    assert "auth_token" not in json.dumps(section)
+    by_slug = {e["slug"]: e for e in section["endpoints"]}
+
+    alpha = by_slug["m1-alpha"]
+    assert alpha["model_id"] == "model-one"
+    assert alpha["host"] == "alpha.example.com:8443"
+    assert alpha["concurrency"] == 12
+    # Running count is attributed to the deployment / endpoint label by slug.
+    assert alpha["running"] == 12
+    assert alpha["deployment"] == "swegen-generate-dyn-m1-alpha"
+    assert alpha["breaker_open"] is False
+    assert alpha["recent_succeeded"] == 9 and alpha["recent_failed"] == 1
+    assert alpha["last_probe_status"] == 200
+
+    beta = by_slug["m2-beta"]
+    assert beta["running"] == 0
+    assert beta["breaker_open"] is True
+    assert beta["breaker_reason"] == "endpoint unhealthy: http 503"
+    assert beta["last_probe_status"] == 503
+    assert beta["tripped_at"] is not None
+    assert beta["recent_failed"] == 5
+
+
+def test_summarize_generate_endpoints_degrades_when_table_absent() -> None:
+    from swegen.dashboard.distributed_status import summarize_generate_endpoints
+
+    section = summarize_generate_endpoints([], available=False)
+    assert section == {"available": False, "endpoints": []}
+
+
+def test_aggregate_pipeline_snapshot_embeds_generate_endpoints_section() -> None:
+    from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot(
+        [],
+        [],
+        [],
+        [],
+        now=NOW,
+        generate_endpoint_rows=[
+            {
+                "slug": "m1-alpha",
+                "model_id": "model-one",
+                "base_url": "https://alpha.example.com/v1",
+                "concurrency": 3,
+                "enabled": True,
+                "breaker_open": False,
+                "breaker_reason": None,
+                "tripped_at": None,
+                "reset_at": None,
+                "last_probe_status": 200,
+                "last_probe_at": NOW,
+                "consecutive_fail": 0,
+            }
+        ],
+        generate_endpoints_available=True,
+    )
+
+    section = snapshot["generate_endpoints"]
+    assert section["available"] is True
+    assert [e["slug"] for e in section["endpoints"]] == ["m1-alpha"]
+    assert "auth_token" not in json.dumps(section)
+    # Default (postgres-side) running count is a placeholder; the k3s collector
+    # supplies the live count that the UI joins by slug.
+    assert section["endpoints"][0]["running"] == 0
+
+    empty = aggregate_pipeline_snapshot([], [], [], [], now=NOW)
+    assert empty["generate_endpoints"] == {"available": False, "endpoints": []}
+
+
+def test_k3s_collector_counts_running_endpoint_pods_by_label() -> None:
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    nodes = {
+        "items": [
+            {
+                "metadata": {"name": "node-a"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "allocatable": {"cpu": "8", "memory": "16Gi"},
+                    "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}],
+                },
+            }
+        ]
+    }
+    workloads = {
+        "items": [
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "swegen-generate-dyn-m1-alpha-rs-a",
+                    "labels": {
+                        "swegen.pgcode/endpoint": "m1-alpha",
+                        "swegen.pgcode/stage": "generate",
+                    },
+                },
+                "spec": {"nodeName": "node-a", "containers": []},
+                "status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+            },
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "swegen-generate-dyn-m1-alpha-rs-b",
+                    "labels": {
+                        "swegen.pgcode/endpoint": "m1-alpha",
+                        "swegen.pgcode/stage": "generate",
+                    },
+                },
+                "spec": {"nodeName": "node-a", "containers": []},
+                "status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+            },
+            {
+                # Attributed by deployment name even without the endpoint label.
+                "kind": "Pod",
+                "metadata": {
+                    "name": "swegen-generate-dyn-m2-beta-7d9f8c6b5-abc12",
+                    "labels": {"swegen.pgcode/stage": "generate"},
+                },
+                "spec": {"nodeName": "node-a", "containers": []},
+                "status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+            },
+            {
+                # Pending endpoint pod: not counted as running.
+                "kind": "Pod",
+                "metadata": {
+                    "name": "swegen-generate-dyn-m1-alpha-rs-d",
+                    "labels": {"swegen.pgcode/endpoint": "m1-alpha"},
+                },
+                "spec": {"nodeName": "node-a", "containers": []},
+                "status": {"phase": "Pending"},
+            },
+        ]
+    }
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "top" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="metrics unavailable")
+        if "nodes" in command:
+            document = nodes
+        elif "deployments" in command:
+            document = _only_kinds(workloads, {"Deployment"})
+        else:
+            document = _only_kinds(workloads, {"Pod"})
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    out = K3sStatusCollector(runner=runner).collect()
+    assert out["generate_endpoint_pods"] == {"m1-alpha": 2, "m2-beta": 1}

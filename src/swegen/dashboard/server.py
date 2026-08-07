@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import secrets
 import subprocess
 import threading
@@ -16,10 +17,14 @@ from swegen.dashboard.distributed_status import (
     K3sStatusCollector,
     PipelineStatusCollector,
     RemoteBuildKitFarmCollector,
+    _database_dsn,
 )
 
 SCALE_MIN = 0
 BUILD_SLOT_MIN = 1
+# k8s-label-safe slug, mirroring the generate_endpoints CHECK constraint. The
+# slug is embedded in the Deployment name swegen-generate-dyn-<slug>.
+ENDPOINT_SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,40}[a-z0-9])?$")
 # One deployment per stage. Generate used to fan out into a primary +
 # "overflow" pool (split at a 92-replica cap, with the overflow's image and
 # model Secret copied from the live primary on every scale-up). That sync
@@ -221,6 +226,224 @@ print(json.dumps({'slots':n}))"""
             self._lock.release()
 
 
+class EndpointNotFoundError(LookupError):
+    """Raised when a registry operation targets an absent slug (maps to 404)."""
+
+
+class EndpointConflictError(RuntimeError):
+    """Raised when a register would collide with an existing slug (maps to 409)."""
+
+
+def _validate_base_url(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("base_url must be a string")
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("base_url is required")
+    parsed = urlsplit(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be http(s)://host[:port]")
+    return candidate
+
+
+def _validate_nonblank(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} is required")
+    return value.strip()
+
+
+def _validate_concurrency(value: object, *, max_replicas: object) -> int:
+    if (
+        isinstance(max_replicas, bool)
+        or not isinstance(max_replicas, int)
+        or max_replicas < SCALE_MIN
+    ):
+        raise ValueError("cluster scaling capacity is unavailable")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("concurrency must be an integer")
+    if not SCALE_MIN <= value <= max_replicas:
+        raise ValueError(f"concurrency must be between {SCALE_MIN} and {max_replicas}")
+    return value
+
+
+def derive_endpoint_slug(model_id: str, base_url: str) -> str:
+    """Derive a k8s-label-safe slug from model_id + endpoint host.
+
+    Lowercases, keeps only ``[a-z0-9-]``, collapses runs of dashes, trims to 40
+    chars, and strips leading/trailing dashes so the result matches
+    ``ENDPOINT_SLUG_RE``.
+    """
+
+    host = urlsplit(base_url).hostname or urlsplit(base_url).netloc or ""
+    raw = f"{model_id}-{host}".lower()
+    cleaned = re.sub(r"[^a-z0-9-]+", "-", raw)
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")[:40].strip("-")
+    if not cleaned or not ENDPOINT_SLUG_RE.match(cleaned):
+        raise ValueError("could not derive a valid slug from model_id and endpoint")
+    return cleaned
+
+
+class GenerateEndpointRegistry:
+    """Registry-table writer for dynamic generate endpoints.
+
+    The dashboard only ever WRITES the ``generate_endpoints`` table; a separate
+    controller reconciles rows to Deployments and probes/latches breakers. Every
+    write is committed via a short-lived autocommit connection: a fresh psycopg
+    connection's ``transaction()`` context did not durably persist here, so a
+    committed transaction (autocommit) is used explicitly. The ``auth_token`` is
+    stored but never read back into any response or snapshot.
+    """
+
+    def __init__(self, *, connect: Any = None, dsn: Any = None) -> None:
+        self._connect = connect
+        self._dsn = dsn
+        self._lock = threading.Lock()
+
+    def _connection(self) -> Any:
+        if self._connect is not None:
+            return self._connect()
+        import psycopg
+
+        dsn = self._dsn() if callable(self._dsn) else (self._dsn or _database_dsn())
+        return psycopg.connect(dsn, autocommit=True)
+
+    def register(
+        self,
+        *,
+        base_url: object,
+        model_id: object,
+        auth_token: object,
+        concurrency: object,
+        max_replicas: object,
+    ) -> dict[str, Any]:
+        url = _validate_base_url(base_url)
+        model = _validate_nonblank(model_id, "model_id")
+        token = _validate_nonblank(auth_token, "auth_token")
+        count = _validate_concurrency(concurrency, max_replicas=max_replicas)
+        slug = derive_endpoint_slug(model, url)
+        with self._lock, self._connection() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM generate_endpoints WHERE slug = %s", (slug,)
+            ).fetchone()
+            if existing is not None:
+                raise EndpointConflictError("endpoint already registered")
+            conn.execute(
+                """
+                INSERT INTO generate_endpoints
+                    (slug, base_url, model_id, auth_token, concurrency,
+                     enabled, breaker_open)
+                VALUES (%s, %s, %s, %s, %s, TRUE, FALSE)
+                """,
+                (slug, url, model, token, count),
+            )
+            self._event(conn, slug, model, "registered", "registered via dashboard")
+        return {"ok": True, "slug": slug}
+
+    def scale(self, *, slug: object, concurrency: object, max_replicas: object) -> dict[str, Any]:
+        target = self._require_slug(slug)
+        count = _validate_concurrency(concurrency, max_replicas=max_replicas)
+        with self._lock, self._connection() as conn:
+            model = self._model_for(conn, target)
+            result = conn.execute(
+                "UPDATE generate_endpoints SET concurrency = %s, updated_at = now() "
+                "WHERE slug = %s",
+                (count, target),
+            )
+            if getattr(result, "rowcount", 0) != 1:
+                raise EndpointNotFoundError("endpoint not found")
+            self._event(conn, target, model, "scaled", f"concurrency set to {count}")
+        return {"ok": True, "slug": target, "concurrency": count}
+
+    def update(
+        self,
+        *,
+        slug: object,
+        base_url: object = None,
+        model_id: object = None,
+        auth_token: object = None,
+    ) -> dict[str, Any]:
+        target = self._require_slug(slug)
+        fields: list[str] = []
+        params: list[object] = []
+        if base_url is not None:
+            fields.append("base_url = %s")
+            params.append(_validate_base_url(base_url))
+        if model_id is not None:
+            fields.append("model_id = %s")
+            params.append(_validate_nonblank(model_id, "model_id"))
+        if auth_token is not None:
+            fields.append("auth_token = %s")
+            params.append(_validate_nonblank(auth_token, "auth_token"))
+        if not fields:
+            raise ValueError("no fields to update")
+        with self._lock, self._connection() as conn:
+            model = self._model_for(conn, target)
+            result = conn.execute(
+                f"UPDATE generate_endpoints SET {', '.join(fields)}, updated_at = now() "
+                "WHERE slug = %s",
+                (*params, target),
+            )
+            if getattr(result, "rowcount", 0) != 1:
+                raise EndpointNotFoundError("endpoint not found")
+            new_model = model_id if model_id is not None else model
+            self._event(conn, target, new_model, "updated", "endpoint API updated")
+        return {"ok": True, "slug": target}
+
+    def reset(self, *, slug: object) -> dict[str, Any]:
+        target = self._require_slug(slug)
+        with self._lock, self._connection() as conn:
+            model = self._model_for(conn, target)
+            result = conn.execute(
+                """
+                UPDATE generate_endpoints
+                SET breaker_open = FALSE, breaker_reason = NULL, reset_at = now(),
+                    consecutive_fail = 0, updated_at = now()
+                WHERE slug = %s
+                """,
+                (target,),
+            )
+            if getattr(result, "rowcount", 0) != 1:
+                raise EndpointNotFoundError("endpoint not found")
+            self._event(conn, target, model, "reset", "breaker latch cleared via dashboard")
+        return {"ok": True, "slug": target}
+
+    def delete(self, *, slug: object) -> dict[str, Any]:
+        target = self._require_slug(slug)
+        with self._lock, self._connection() as conn:
+            model = self._model_for(conn, target)
+            if model is None:
+                raise EndpointNotFoundError("endpoint not found")
+            # Write the audit event BEFORE deleting the row.
+            self._event(conn, target, model, "deleted", "deleted via dashboard")
+            conn.execute("DELETE FROM generate_endpoints WHERE slug = %s", (target,))
+        return {"ok": True, "slug": target}
+
+    @staticmethod
+    def _require_slug(slug: object) -> str:
+        if not isinstance(slug, str) or not ENDPOINT_SLUG_RE.match(slug):
+            raise EndpointNotFoundError("endpoint not found")
+        return slug
+
+    @staticmethod
+    def _model_for(conn: Any, slug: str) -> str | None:
+        row = conn.execute(
+            "SELECT model_id FROM generate_endpoints WHERE slug = %s", (slug,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0] if not isinstance(row, dict) else row.get("model_id")
+
+    @staticmethod
+    def _event(conn: Any, slug: str, model_id: object, event: str, reason: str) -> None:
+        conn.execute(
+            """
+            INSERT INTO generate_endpoint_events (slug, model_id, event, reason, detail)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (slug, model_id or "", event, reason, None),
+        )
+
+
 class SnapshotCache:
     def __init__(self, *, refresh_seconds: float = 5.0) -> None:
         self.refresh_seconds = refresh_seconds
@@ -296,8 +519,9 @@ HTML = r"""<!doctype html>
 main{max-width:1500px;margin:auto;padding:12px}h1{font-size:24px;margin:0 0 2px}h2{font-size:18px;margin:14px 0 6px}.muted{color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:6px;margin:8px 0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px}.big{font-size:25px;font-weight:700}
-.pipeline-flow{display:grid;grid-template-columns:minmax(235px,1fr) minmax(520px,2fr) minmax(235px,1fr) minmax(235px,1fr);gap:6px;align-items:stretch;margin:8px 0;overflow-x:auto;padding-bottom:4px}
-.pipeline-flow>.stage-card{min-width:235px}.stage-card{display:flex;flex-direction:column;padding:11px}.stage-stats{min-width:0}.stage-stats>b{display:block;margin-bottom:3px}.stage-stats>.big{margin-bottom:1px}.stage-stats>.pod-phases{color:var(--muted);font-size:11px;line-height:1.3;margin-bottom:4px;overflow-wrap:anywhere}.stage-stats>div:not(.big):not(.pod-phases):not(.scale-controls){line-height:1.35}.validation-loop{min-width:520px;background:#0c1b2f;border:2px solid #365b82;border-radius:10px;padding:9px;display:grid;grid-template-rows:auto minmax(0,1fr) minmax(0,1fr);gap:8px;align-content:stretch}.validation-loop-title{text-align:center;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:1px}.validation-loop>.stage-card{background:var(--card)}.stage-card-horizontal{display:grid;grid-template-columns:240px minmax(0,1fr);gap:12px;align-items:stretch;padding:10px}.stage-card-horizontal .stage-stats{width:240px;text-align:left;justify-self:start;align-self:start}.stage-card-horizontal .stage-chart-wrap{border-left:1px solid var(--line);padding-left:10px}
+.pipeline-flow{display:grid;grid-template-columns:1fr;gap:8px;align-items:stretch;margin:8px 0;padding-bottom:4px}
+.pipeline-flow>.stage-card,.pipeline-flow>.validation-loop{width:100%}
+.pipeline-flow>.stage-card{min-width:0}.stage-card{display:flex;flex-direction:column;padding:11px}.stage-stats{min-width:0}.stage-stats>b{display:block;margin-bottom:3px}.stage-stats>.big{margin-bottom:1px}.stage-stats>.pod-phases{color:var(--muted);font-size:11px;line-height:1.3;margin-bottom:4px;overflow-wrap:anywhere}.stage-stats>div:not(.big):not(.pod-phases):not(.scale-controls){line-height:1.35}.validation-loop{min-width:520px;background:#0c1b2f;border:2px solid #365b82;border-radius:10px;padding:9px;display:grid;grid-template-rows:auto minmax(0,1fr) minmax(0,1fr);gap:8px;align-content:stretch}.validation-loop-title{text-align:center;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:1px}.validation-loop>.stage-card{background:var(--card)}.stage-card-horizontal{display:grid;grid-template-columns:240px minmax(0,1fr);gap:12px;align-items:stretch;padding:10px}.stage-card-horizontal .stage-stats{width:240px;text-align:left;justify-self:start;align-self:start}.stage-card-horizontal .stage-chart-wrap{border-left:1px solid var(--line);padding-left:10px}
 .validate-queue-breakdown{margin:4px 0;padding:4px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);color:var(--muted);font-size:11px}.validate-queue-breakdown>div{overflow-wrap:anywhere}.validate-queue-breakdown b{color:#edf4ff}
 .ok{color:var(--ok)}.bad{color:var(--bad)}table{width:100%;border-collapse:collapse;background:var(--card)}
 th,td{text-align:left;padding:5px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}
@@ -308,10 +532,21 @@ th,td{text-align:left;padding:5px;border-bottom:1px solid var(--line);vertical-a
 .yield-list{margin-top:5px}.yield-row{display:grid;grid-template-columns:1fr auto auto;gap:5px;padding:4px 0;border-bottom:1px solid var(--line)}.yield-row:last-child{border-bottom:0}.yield-value{font-variant-numeric:tabular-nums}.yield-percent{min-width:52px;text-align:right;font-weight:700}
 .scale-controls{width:100%;max-width:174px;display:grid;grid-template-columns:minmax(76px,1fr) 58px;gap:4px;margin:8px auto 0;align-items:center}.scale-controls input,.scale-controls button{min-width:0;border:1px solid var(--line);border-radius:6px;padding:5px 6px;background:#09182b;color:#edf4ff}.scale-controls button{cursor:pointer;background:#174b78}.scale-controls button:disabled{cursor:wait;opacity:.55}.scale-limit{grid-column:1/-1;color:var(--muted);font-size:10px;line-height:1.2;margin-top:-1px;text-align:center}#scale-feedback{min-height:18px;margin-top:4px}
 .slot-cell{display:grid;gap:3px;min-width:190px}.slot-status{font-size:12px;line-height:1.25}.slot-controls{display:grid;grid-template-columns:72px 52px;gap:4px;width:128px;align-items:center}.slot-controls input,.slot-controls button{min-width:0;border:1px solid var(--line);border-radius:6px;padding:4px 5px;background:#09182b;color:#edf4ff}.slot-controls button{cursor:pointer;background:#174b78}.slot-controls button:disabled{cursor:wait;opacity:.55}.slot-limit{grid-column:1/-1;color:var(--muted);font-size:9px;line-height:1.15}#build-slot-feedback{min-height:18px;margin:2px 0 4px}
+.endpoint-form{display:flex;flex-wrap:wrap;gap:6px;align-items:end;margin:6px 0}.endpoint-form label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--muted)}.endpoint-form input{border:1px solid var(--line);border-radius:6px;padding:5px 6px;background:#09182b;color:#edf4ff;min-width:0}.endpoint-form .url-field{flex:2 1 240px}.endpoint-form .model-field{flex:2 1 200px}.endpoint-form .token-field{flex:1 1 160px}.endpoint-form .conc-field{flex:0 0 90px}.endpoint-form button{border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:#174b78;color:#edf4ff;cursor:pointer}.endpoint-form button:disabled{cursor:wait;opacity:.55}#endpoint-feedback{min-height:18px;margin:4px 0}.endpoint-actions{display:flex;flex-wrap:wrap;gap:4px}.endpoint-actions button{border:1px solid var(--line);border-radius:6px;padding:3px 8px;background:#09182b;color:#edf4ff;cursor:pointer;font-size:12px}.endpoint-actions button.danger{background:#3a1220;border-color:#7a2740}.endpoint-actions button:disabled{cursor:wait;opacity:.5}.endpoint-breaker-ok{color:var(--ok)}.endpoint-breaker-latched{color:var(--bad)}
 .warning{padding:8px;border:2px solid #f79009;background:#3b2605;color:#ffd79a;border-radius:8px;margin:6px 0}.path{display:block;max-width:520px;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#b8d8ff}.storage-note{margin-top:3px;color:var(--muted);font-size:12px}
 .farm-status{margin:3px 0 6px}.farm-detail{color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}
 .node-details>summary{list-style-position:inside;cursor:pointer}.node-summary{display:grid;grid-template-columns:minmax(250px,1fr) minmax(190px,.75fr) minmax(190px,.75fr) minmax(280px,1.05fr) minmax(190px,.75fr);gap:12px;align-items:center}.pod-list{margin:12px 0 2px 22px;display:grid;gap:5px}.pod-row{display:grid;grid-template-columns:minmax(300px,2fr) 110px 100px 80px;gap:10px;padding:5px 8px;border-left:2px solid var(--line);font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.stage-counts{color:var(--muted);font-size:11px;margin-left:22px}@media(max-width:800px){.node-summary{grid-template-columns:1fr}.pod-row{grid-template-columns:1fr 1fr}.node-table-head{display:none}}
 </style></head><body><div id="chart-tooltip" class="chart-tooltip" role="tooltip" hidden></div><main><h1>SWE-gen k3s + PGMQ</h1><div id="stamp" class="muted"></div><div id="errors"></div>
+<h2>Generate model endpoints</h2><div class="muted">Register a model endpoint to spin up a dedicated generate worker pool. A controller reconciles pods and latches a breaker on repeated endpoint 5xx/429; the token is stored server-side and never shown.</div>
+<form id="endpoint-form" class="endpoint-form" autocomplete="off">
+<label class="url-field">Endpoint URL<input id="endpoint-url" type="url" placeholder="https://host:port" required></label>
+<label class="model-field">Model ID<input id="endpoint-model" type="text" placeholder="model-id" required></label>
+<label class="token-field">Bearer token<input id="endpoint-token" type="password" placeholder="token" required></label>
+<label class="conc-field">Concurrency<input id="endpoint-concurrency" type="number" min="0" step="1" value="0"></label>
+<button id="endpoint-register" type="submit">Register</button>
+</form>
+<div id="endpoint-feedback" class="muted"></div>
+<div class="scroll"><table><thead><tr><th>Model / endpoint</th><th>Target / running</th><th>5m success / fail</th><th>Breaker</th><th>Actions</th></tr></thead><tbody id="endpoints"></tbody></table></div>
 <h2>Stages</h2><div id="scale-feedback" class="muted"></div><div id="stages" class="pipeline-flow"></div>
 <h2>Hourly yield</h2><div class="muted">Success / all terminal outcomes (success + failed/rejected)</div><div id="yield" class="grid"></div>
 <h2>Cluster resources</h2><div id="resource-status" class="muted"></div><div id="build-slot-feedback" class="muted"></div><div id="resource-summary" class="grid"></div><div id="resource-scroll" class="scroll"><table><thead class="node-table-head"><tr><th>Node / IP and scheduled pods</th><th title="Actual metrics usage / sum of Kubernetes CPU requests / node allocatable CPU. Both percentages use allocatable CPU as denominator.">CPU used / allocated / allocatable</th><th>Memory used / allocatable</th><th>Disk I/O read / write · IOPS · busy</th><th>Local BuildKit slots / waiters</th></tr></thead><tbody id="resource-nodes"></tbody></table></div>
@@ -346,7 +581,7 @@ const modelColor=(model,models)=>{const index=models.indexOf(model);return index
 const chartTickEvery=(pointCount,chartWidth)=>Math.max(1,Math.ceil(52/Math.max(8,chartWidth/Math.max(1,pointCount))));
 const chartScrollSnapshot=chart=>{const maxScroll=Math.max(0,chart.scrollWidth-chart.clientWidth),left=Math.min(Math.max(chart.scrollLeft,0),maxScroll);return {left,followLatest:maxScroll-left<=4}};
 function setText(node,value){node.textContent=value==null?'—':String(value)}
-const uiState={chartScroll:{},expandedTasks:new Set(),expandedNodes:new Set(),resourceScroll:{left:0,top:0},scaleDrafts:{},scaling:false,buildSlotDrafts:{},buildSlotUpdating:false};
+const uiState={chartScroll:{},expandedTasks:new Set(),expandedNodes:new Set(),resourceScroll:{left:0,top:0},scaleDrafts:{},scaling:false,buildSlotDrafts:{},buildSlotUpdating:false,endpointBusy:false};
 function captureUiState(){document.querySelectorAll('.chart[data-stage]').forEach(chart=>{if(chart.dataset.restoringScroll!=='true')uiState.chartScroll[chart.dataset.stage]=chartScrollSnapshot(chart)});document.querySelectorAll('#tasks details[data-task-key]').forEach(details=>{if(details.open)uiState.expandedTasks.add(details.dataset.taskKey);else uiState.expandedTasks.delete(details.dataset.taskKey)});document.querySelectorAll('#resource-nodes details[data-node-key]').forEach(details=>{if(details.open)uiState.expandedNodes.add(details.dataset.nodeKey);else uiState.expandedNodes.delete(details.dataset.nodeKey)});const resourceScroll=el('resource-scroll');if(resourceScroll){uiState.resourceScroll={left:resourceScroll.scrollLeft,top:resourceScroll.scrollTop}}}
 function chartScrollTarget(saved,maxScroll){return saved===undefined||saved.followLatest?maxScroll:Math.min(Math.max(saved.left,0),maxScroll)}
 function restoreChartScroll(chart,stage){const saved=Object.prototype.hasOwnProperty.call(uiState.chartScroll,stage)?uiState.chartScroll[stage]:undefined,followLatest=saved===undefined||saved.followLatest;chart.dataset.restoringScroll='true';const apply=()=>{const maxScroll=Math.max(0,chart.scrollWidth-chart.clientWidth);chart.scrollLeft=chartScrollTarget(saved,maxScroll);uiState.chartScroll[stage]={left:chart.scrollLeft,followLatest}};requestAnimationFrame(()=>requestAnimationFrame(()=>{apply();requestAnimationFrame(()=>{apply();delete chart.dataset.restoringScroll})}))}
@@ -381,6 +616,14 @@ function farmCard(summary,label,value,detail){const card=document.createElement(
 function renderRemoteBuildKit(farm,tracking){const status=el('buildkit-farm-status'),warning=el('buildkit-farm-warning'),summary=el('buildkit-farm-summary'),diskBody=el('buildkit-farm-disk-io');warning.replaceChildren();summary.replaceChildren();diskBody.replaceChildren();const gateway=farm?.gateway||{},ready=farm?.ready||{},resources=farm?.resources||{};const resourceSampledAt=resources.last_success_at;const statusSampledAt=resourceSampledAt||ready.last_success_at||gateway.last_success_at;const sampleState=resources.error?'last successful sample':resources.available?'live sample':'resource sample unavailable';status.className=gateway.ok&&ready.ok&&!resources.error?'farm-status muted':'farm-status bad';setText(status,`${farm?.sampling?'Sampling farm; ':''}gateway ${gateway.status||'unknown'} · readiness ${ready.status||'unknown'} · ${statusSampledAt?`sampled ${statusSampledAt}`:'awaiting first sample'} · ${farm?.poll_interval_seconds||30}s minimum poll`);if(resources.schema_warning||resources.error){warning.className='warning';setText(warning,resources.error||resources.schema_warning)}else{warning.className='';setText(warning,'')}farmCard(summary,'Gateway / ready',`${gateway.ok?'up':'down'} / ${ready.ok?'ready':'not ready'}`,`HTTP ${gateway.http_status??'—'} / ${ready.http_status??'—'}`);const available=resources.available_backend_count==null?'—':resources.available_backend_count;const sampled=resources.backend_count??resources.sampled_worker_count??0;const scope=resources.is_global?'global aggregate':`${resources.scope||'worker-local sample'}${resources.sampled_worker?` · ${resources.sampled_worker}`:''}`;const sampleDetail=`${scope} · ${resourceSampledAt?`${sampleState} ${resourceSampledAt}`:sampleState}`;farmCard(summary,'Backend workers',`${sampled} sampled / ${available} available`,sampleDetail);const queueLabel=resources.is_global?'Farm live queue':'Sampled live queue';farmCard(summary,queueLabel,resources.queue_length==null?'unavailable':`${resources.queue_length} / ${resources.queue_capacity??'—'}`,sampleDetail);const activeLabel=resources.is_global?'Farm live active':'Sampled live active';farmCard(summary,activeLabel,resources.running_builds==null?'unavailable':`${resources.running_builds} running`,`${resources.inflight_builds??'—'} inflight · ${sampleDetail}`);const recentCounts=tracking?.recent_status_counts||{};const recentBreakdown=Object.entries(recentCounts).filter(([,count])=>count>0).map(([name,count])=>`${name} ${count}`).join(' · ');const recentWindow=secs(tracking?.recent_window_seconds);const ledgerDetail=tracking?.available?`${recentBreakdown||'no recent nonterminal records'} · ${tracking?.stale??0} stale excluded · database submission ledger only, not live farm state · updated within ${recentWindow}${tracking?.latest_updated_at?` · latest ${tracking.latest_updated_at}`:''}`:'submission tracking unavailable';farmCard(summary,'SWEgen submission ledger',tracking?.available?`${tracking?.recent??0} recent records`:'unavailable',ledgerDetail);const diskRows=resources.node_disk_io||[];if(!diskRows.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=4;setText(td,'Remote per-node disk I/O telemetry is not exposed by the current worker-local API sample.');tr.append(td);diskBody.append(tr)}else{diskRows.forEach(row=>{const tr=document.createElement('tr');const busy=row.busy_percent==null?'—':`${row.busy_percent.toFixed(1)}%`;[[row.node||'unknown'],[`${rateBytes(row.read_bytes_per_second)} / ${rateBytes(row.write_bytes_per_second)}`],[`${rateOps(row.read_iops)} / ${rateOps(row.write_iops)}`],[`${busy} / ${row.io_current??'—'} inflight`]].forEach(([value])=>{const td=document.createElement('td');setText(td,value);tr.append(td)});diskBody.append(tr)})}}
 function renderHourlyYield(series){el('yield').replaceChildren();const source=series?.stages||{};stages.forEach(stage=>{const rows=source[stage]||[];const card=document.createElement('div');card.className='card';const title=document.createElement('b');setText(title,stageNames[stage]);card.append(title);const list=document.createElement('div');list.className='yield-list';if(!rows.length){const empty=document.createElement('div');empty.className='muted';setText(empty,'No terminal outcomes in the last 12 hours');list.append(empty)}else{rows.forEach(row=>{const line=document.createElement('div');line.className='yield-row';const stamp=document.createElement('span');setText(stamp,new Date(row.bucket).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));const value=document.createElement('span');value.className='yield-value';setText(value,`${row.succeeded} / ${row.processed}`);const percent=document.createElement('span');percent.className='yield-percent';setText(percent,row.yield_percent==null?'—':`${row.yield_percent.toFixed(1)}%`);line.append(stamp,value,percent);list.append(line)})}card.append(list);el('yield').append(card)})}
 function renderSwrPushSync(sync){const status=el('swr-sync-status'),summary=el('swr-sync-summary'),body=el('swr-sync-instances');summary.replaceChildren();body.replaceChildren();if(!sync?.available){status.className='bad';setText(status,'SWR push-registry sync unavailable: public.pushed_images is absent or unreadable.');const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=3;setText(td,'No push-registry sync data.');tr.append(td);body.append(tr);return}const outOfSync=sync.out_of_sync_total||0;status.className=outOfSync?'bad':'muted';setText(status,`${outOfSync} images out of sync${sync.out_of_sync_list_truncated?` · showing first ${sync.out_of_sync_list_limit}`:''} · in sync ${sync.in_sync||0}`);farmCard(summary,'Pushed to -platform',compactChartCount(sync.platform_count||0),`${sync.platform_count||0} distinct images on data-platform`);farmCard(summary,'Pushed to -trajectory',compactChartCount(sync.trajectory_count||0),`${sync.trajectory_count||0} distinct images on data-trajectory`);farmCard(summary,'Platform only (missing -trajectory)',compactChartCount(sync.platform_only||0),'pushed to platform but not trajectory');farmCard(summary,'Trajectory only (missing -platform)',compactChartCount(sync.trajectory_only||0),'pushed to trajectory but not platform');const rows=sync.out_of_sync_instances||[];if(!rows.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=3;setText(td,'All images are in sync across both registries.');tr.append(td);body.append(tr)}else{rows.forEach(row=>{const tr=document.createElement('tr');const pushedTo=row.registry==='platform'?'data-platform':'data-trajectory';const missingFrom=row.registry==='platform'?'data-trajectory':'data-platform';[[row.instance],[pushedTo],[missingFrom]].forEach(([value])=>{const td=document.createElement('td');const code=document.createElement('code');code.className='path';setText(code,value);td.append(code);tr.append(td)});body.append(tr)})}}
+async function postEndpoint(path,body,pendingMessage,successMessage){if(uiState.endpointBusy)return;const feedback=el('endpoint-feedback');uiState.endpointBusy=true;feedback.className='muted';setText(feedback,pendingMessage);renderEndpointButtonsDisabled();try{const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify(body)});const payload=await response.json();if(!response.ok)throw new Error(payload.error||`HTTP ${response.status}`);feedback.className='ok';setText(feedback,successMessage(payload));await poll();return payload}catch(error){feedback.className='bad';setText(feedback,`Endpoint action failed: ${error.message}`)}finally{uiState.endpointBusy=false;renderEndpointButtonsDisabled()}}
+function renderEndpointButtonsDisabled(){document.querySelectorAll('#endpoint-form button,.endpoint-actions button').forEach(button=>{button.disabled=uiState.endpointBusy})}
+async function submitEndpointRegister(){const url=el('endpoint-url').value.trim(),model=el('endpoint-model').value.trim(),token=el('endpoint-token').value,concurrency=Number(el('endpoint-concurrency').value||'0');const feedback=el('endpoint-feedback');if(!url||!model||!token){feedback.className='bad';setText(feedback,'Endpoint URL, model ID and bearer token are all required.');return}const payload=await postEndpoint('/api/generate/endpoints',{base_url:url,model_id:model,auth_token:token,concurrency},`Registering ${model}…`,body=>`Registered ${model} as ${body.slug}.`);if(payload){el('endpoint-token').value='';el('endpoint-url').value='';el('endpoint-model').value=''}}
+function submitEndpointScale(slug,model){const raw=prompt(`Target concurrency (pods) for ${model||slug}`);if(raw==null)return;if(!/^\d+$/.test(raw.trim())){const feedback=el('endpoint-feedback');feedback.className='bad';setText(feedback,'Concurrency must be a whole number.');return}postEndpoint('/api/generate/endpoints/scale',{slug,concurrency:Number(raw.trim())},`Scaling ${slug}…`,body=>`${slug} target concurrency set to ${body.concurrency}.`)}
+function submitEndpointEdit(slug,model){const url=prompt(`New endpoint URL for ${model||slug} (blank to keep)`,'');if(url==null)return;const newModel=prompt(`New model ID for ${model||slug} (blank to keep)`,'');if(newModel==null)return;const token=prompt(`New bearer token for ${model||slug} (blank to keep)`,'');if(token==null)return;const body={slug};if(url.trim())body.base_url=url.trim();if(newModel.trim())body.model_id=newModel.trim();if(token)body.auth_token=token;if(!body.base_url&&!body.model_id&&!body.auth_token){const feedback=el('endpoint-feedback');feedback.className='muted';setText(feedback,'No changes entered.');return}postEndpoint('/api/generate/endpoints/update',body,`Updating ${slug} API…`,()=>`${slug} API updated.`)}
+function submitEndpointReset(slug){postEndpoint('/api/generate/endpoints/reset',{slug},`Clearing breaker for ${slug}…`,()=>`${slug} breaker cleared; controller will re-probe.`)}
+function submitEndpointDelete(slug,model){if(!confirm(`Delete endpoint ${model||slug}? This removes its Deployment and all its pods.`))return;postEndpoint('/api/generate/endpoints/delete',{slug},`Deleting ${slug}…`,()=>`${slug} deleted; controller will remove its pods.`)}
+function renderEndpoints(section,podCounts){const body=el('endpoints');body.replaceChildren();const endpoints=section?.endpoints||[];if(!section?.available){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=5;td.className='muted';setText(td,'Endpoint registry unavailable (schema not migrated).');tr.append(td);body.append(tr);return}if(!endpoints.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=5;td.className='muted';setText(td,'No generate endpoints registered.');tr.append(td);body.append(tr);return}endpoints.forEach(ep=>{const running=(podCounts&&podCounts[ep.slug])??ep.running??0;const tr=document.createElement('tr');const idCell=document.createElement('td');const model=document.createElement('div');setText(model,ep.model_id||ep.slug);const host=document.createElement('div');host.className='muted';setText(host,ep.host||ep.base_url||'—');idCell.append(model,host);const targetCell=document.createElement('td');setText(targetCell,`${ep.concurrency??0} / ${running}`);const outcomeCell=document.createElement('td');const s=document.createElement('span');s.className='ok';setText(s,ep.recent_succeeded??0);const sep=document.createElement('span');setText(sep,' / ');const f=document.createElement('span');f.className='bad';setText(f,ep.recent_failed??0);outcomeCell.append(s,sep,f);const breakerCell=document.createElement('td');if(ep.breaker_open){breakerCell.className='endpoint-breaker-latched';const probe=ep.last_probe_status!=null?` · last HTTP ${ep.last_probe_status}`:'';setText(breakerCell,`LATCHED${ep.breaker_reason?` — ${ep.breaker_reason}`:''}${probe}`)}else{breakerCell.className='endpoint-breaker-ok';setText(breakerCell,ep.enabled?'OK':'disabled')}const actionsCell=document.createElement('td');const actions=document.createElement('div');actions.className='endpoint-actions';const scaleBtn=document.createElement('button');scaleBtn.type='button';setText(scaleBtn,'Scale');scaleBtn.addEventListener('click',()=>submitEndpointScale(ep.slug,ep.model_id));const editBtn=document.createElement('button');editBtn.type='button';setText(editBtn,'Edit API');editBtn.addEventListener('click',()=>submitEndpointEdit(ep.slug,ep.model_id));actions.append(scaleBtn,editBtn);if(ep.breaker_open){const resetBtn=document.createElement('button');resetBtn.type='button';setText(resetBtn,'Reset');resetBtn.addEventListener('click',()=>submitEndpointReset(ep.slug));actions.append(resetBtn)}const deleteBtn=document.createElement('button');deleteBtn.type='button';deleteBtn.className='danger';setText(deleteBtn,'Delete');deleteBtn.addEventListener('click',()=>submitEndpointDelete(ep.slug,ep.model_id));actions.append(deleteBtn);actionsCell.append(actions);tr.append(idCell,targetCell,outcomeCell,breakerCell,actionsCell);body.append(tr)});renderEndpointButtonsDisabled()}
 function render(data){captureUiState();el('stamp').textContent=`Updated ${data.generated_at||'—'} · refreshes every 5s`; el('errors').replaceChildren();
  Object.entries(data.sources||{}).forEach(([n,s])=>{if(!s.ok){const d=document.createElement('div');d.className='banner bad';setText(d,`${n} unavailable: ${s.error}`);el('errors').append(d)}});
  const pg=data.postgres||{}, k=data.k3s||{},maxReplicas=k.scaling?.max_replicas;renderStageFlow(pg,k,maxReplicas);
@@ -389,9 +632,11 @@ function render(data){captureUiState();el('stamp').textContent=`Updated ${data.g
  renderRemoteBuildKit(data.buildkit_farm||{},pg.remote_builds||{});
  renderHourlyYield(pg.hourly_yield);
  renderSwrPushSync(pg.swr_push_sync||{});
+ renderEndpoints(pg.generate_endpoints,k.generate_endpoint_pods||{});
  el('tasks').replaceChildren();(pg.tasks||[]).forEach(task=>{const taskKey=`${task.task_id}:${task.task_version}`;const tr=document.createElement('tr');const timeline=(task.stages||[]).map(s=>`${s.stage}: ${s.state} wait ${secs(s.wait_seconds)} run ${secs(s.run_seconds)}${s.worker_id?' @ '+s.worker_id:''}`).join('\n');[task.task_id,task.state,task.current_stage,secs(task.total_elapsed_seconds)].forEach(v=>{const td=document.createElement('td');setText(td,v);tr.append(td)});const storage=task.storage||{};const storageCell=document.createElement('td');const runtimePath=document.createElement('code');runtimePath.className='path';setText(runtimePath,storage.runtime_path_pattern||'No runtime path recorded');const storageNote=document.createElement('div');storageNote.className='storage-note';setText(storageNote,`${storage.generated_on_node?`node ${storage.generated_on_node} · `:''}${storage.runtime_directory_state||'unknown lifecycle'} · PostgreSQL: ${storage.stored_file_count||0} files / ${bytes(storage.stored_bytes||0)}`);storageCell.append(runtimePath,storageNote);tr.append(storageCell);const td=document.createElement('td');const details=document.createElement('details');details.dataset.taskKey=taskKey;details.open=uiState.expandedTasks.has(taskKey);details.addEventListener('toggle',()=>{if(details.open)uiState.expandedTasks.add(taskKey);else uiState.expandedTasks.delete(taskKey)});const detailsSummary=document.createElement('summary');setText(detailsSummary,'show');const pre=document.createElement('pre');setText(pre,timeline);details.append(detailsSummary,pre);td.append(details);tr.append(td);el('tasks').append(tr)});
 }
 async function poll(){try{const r=await fetch('/api/pipeline/status',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);render(await r.json())}catch(e){el('stamp').textContent=`Dashboard fetch failed: ${e}`}}
+el('endpoint-form').addEventListener('submit',event=>{event.preventDefault();submitEndpointRegister()});
 poll();setInterval(poll,5000);
 </script></main></body></html>"""
 
@@ -401,7 +646,9 @@ def make_handler(
     scaler: K3sScaler,
     build_slot_controller: K3sBuildSlotController,
     csrf_token: str,
+    endpoint_registry: GenerateEndpointRegistry | None = None,
 ) -> type[BaseHTTPRequestHandler]:
+    endpoint_registry = endpoint_registry or GenerateEndpointRegistry()
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             if self.path == "/":
@@ -419,6 +666,11 @@ def make_handler(
             if self.path not in {
                 "/api/pipeline/scale",
                 "/api/pipeline/build-slots",
+                "/api/generate/endpoints",
+                "/api/generate/endpoints/scale",
+                "/api/generate/endpoints/update",
+                "/api/generate/endpoints/reset",
+                "/api/generate/endpoints/delete",
             }:
                 self._send_json(404, {"error": "not found"})
                 return
@@ -441,12 +693,12 @@ def make_handler(
                 if not isinstance(payload, dict):
                     raise ValueError("request body must be a JSON object")
                 current_status = cache.snapshot()
+                max_replicas = (
+                    current_status.get("k3s", {}).get("scaling", {}).get("max_replicas")
+                )
                 if self.path == "/api/pipeline/scale":
                     stage = payload.get("stage")
                     replicas = payload.get("replicas")
-                    max_replicas = (
-                        current_status.get("k3s", {}).get("scaling", {}).get("max_replicas")
-                    )
                     applied: object = scaler.scale(
                         stage,
                         replicas,
@@ -457,7 +709,7 @@ def make_handler(
                         "replicas": replicas,
                         "applied": applied,
                     }
-                else:
+                elif self.path == "/api/pipeline/build-slots":
                     node = payload.get("node")
                     slots = payload.get("slots")
                     applied = build_slot_controller.update(
@@ -470,8 +722,36 @@ def make_handler(
                         "slots": slots,
                         "applied": applied,
                     }
-            except (BuildSlotBusyError, ScalingBusyError) as error:
+                elif self.path == "/api/generate/endpoints":
+                    response_fields = endpoint_registry.register(
+                        base_url=payload.get("base_url"),
+                        model_id=payload.get("model_id"),
+                        auth_token=payload.get("auth_token"),
+                        concurrency=payload.get("concurrency"),
+                        max_replicas=max_replicas,
+                    )
+                elif self.path == "/api/generate/endpoints/scale":
+                    response_fields = endpoint_registry.scale(
+                        slug=payload.get("slug"),
+                        concurrency=payload.get("concurrency"),
+                        max_replicas=max_replicas,
+                    )
+                elif self.path == "/api/generate/endpoints/update":
+                    response_fields = endpoint_registry.update(
+                        slug=payload.get("slug"),
+                        base_url=payload.get("base_url"),
+                        model_id=payload.get("model_id"),
+                        auth_token=payload.get("auth_token"),
+                    )
+                elif self.path == "/api/generate/endpoints/reset":
+                    response_fields = endpoint_registry.reset(slug=payload.get("slug"))
+                else:  # /api/generate/endpoints/delete
+                    response_fields = endpoint_registry.delete(slug=payload.get("slug"))
+            except (BuildSlotBusyError, ScalingBusyError, EndpointConflictError) as error:
                 self._send_json(409, {"error": str(error)})
+                return
+            except EndpointNotFoundError as error:
+                self._send_json(404, {"error": str(error)})
                 return
             except (json.JSONDecodeError, ValueError) as error:
                 self._send_json(400, {"error": str(error)})
@@ -521,13 +801,14 @@ def serve(host: str = "0.0.0.0", port: int = 8766) -> None:
     cache = SnapshotCache()
     scaler = K3sScaler()
     build_slot_controller = K3sBuildSlotController()
+    endpoint_registry = GenerateEndpointRegistry()
     csrf_token = secrets.token_urlsafe(32)
     cache.refresh()
     thread = threading.Thread(target=cache.run, name="dashboard-refresh", daemon=True)
     thread.start()
     server = ThreadingHTTPServer(
         (host, port),
-        make_handler(cache, scaler, build_slot_controller, csrf_token),
+        make_handler(cache, scaler, build_slot_controller, csrf_token, endpoint_registry),
     )
     try:
         server.serve_forever(poll_interval=0.5)

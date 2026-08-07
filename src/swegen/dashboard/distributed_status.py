@@ -439,6 +439,117 @@ def summarize_swr_push_sync(
     }
 
 
+GENERATE_ENDPOINT_DEPLOYMENT_PREFIX = "swegen-generate-dyn-"
+
+
+def generate_endpoint_deployment_name(slug: str) -> str:
+    """Deployment name the controller reconciles for a registry ``slug``."""
+
+    return f"{GENERATE_ENDPOINT_DEPLOYMENT_PREFIX}{slug}"
+
+
+def _endpoint_host(base_url: object) -> str | None:
+    """Return the host[:port] of an endpoint URL for display, never the token."""
+
+    if not isinstance(base_url, str) or not base_url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        return base_url
+    return parsed.netloc or base_url
+
+
+def summarize_generate_endpoints(
+    rows: Iterable[dict[str, Any]],
+    running_by_slug: dict[str, int] | None = None,
+    generate_model_timeseries: dict[str, Any] | None = None,
+    *,
+    available: bool = True,
+) -> dict[str, Any]:
+    """Fold the dynamic generate-endpoint registry into a JSON-safe snapshot.
+
+    Each row is a ``generate_endpoints`` record. ``running_by_slug`` is the live
+    running-pod count per slug (attributed by the pod's
+    ``swegen.pgcode/endpoint`` label / ``swegen-generate-dyn-<slug>`` deployment,
+    supplied by the k3s collector). ``generate_model_timeseries`` is the existing
+    per-generating-model diverging chart (``{"models":[...],"buckets":[...]}``);
+    each endpoint's recent 5m succeeded/failed counts are pulled out of it keyed
+    by the endpoint's ``model_id`` so the UI can show recent outcomes.
+
+    SECURITY: the ``auth_token`` column is never read into the output. Missing
+    registry table degrades to ``available: False`` with an empty list.
+    """
+
+    running_by_slug = running_by_slug or {}
+    recent_by_model = _recent_outcomes_by_model(generate_model_timeseries)
+    endpoints: list[dict[str, Any]] = []
+    for row in rows:
+        slug = row.get("slug")
+        if not slug:
+            continue
+        model_id = row.get("model_id")
+        recent = recent_by_model.get(model_id, {"succeeded": 0, "failed": 0})
+        endpoints.append(
+            {
+                "slug": slug,
+                "model_id": model_id,
+                "host": _endpoint_host(row.get("base_url")),
+                "base_url": row.get("base_url"),
+                "concurrency": int(row.get("concurrency") or 0),
+                "running": int(running_by_slug.get(slug, 0)),
+                "deployment": generate_endpoint_deployment_name(slug),
+                "enabled": bool(row.get("enabled")),
+                "breaker_open": bool(row.get("breaker_open")),
+                "breaker_reason": row.get("breaker_reason"),
+                "tripped_at": _iso(row.get("tripped_at"))
+                if isinstance(row.get("tripped_at"), datetime)
+                else row.get("tripped_at"),
+                "reset_at": _iso(row.get("reset_at"))
+                if isinstance(row.get("reset_at"), datetime)
+                else row.get("reset_at"),
+                "last_probe_status": row.get("last_probe_status"),
+                "last_probe_at": _iso(row.get("last_probe_at"))
+                if isinstance(row.get("last_probe_at"), datetime)
+                else row.get("last_probe_at"),
+                "consecutive_fail": int(row.get("consecutive_fail") or 0),
+                "recent_succeeded": recent["succeeded"],
+                "recent_failed": recent["failed"],
+            }
+        )
+    endpoints.sort(key=lambda entry: (str(entry.get("model_id") or ""), entry["slug"]))
+    return {"available": bool(available), "endpoints": endpoints}
+
+
+def _recent_outcomes_by_model(
+    generate_model_timeseries: dict[str, Any] | None,
+) -> dict[str, dict[str, int]]:
+    """Sum the last (most recent) bucket's per-model succeeded/failed counts.
+
+    Reuses the generate diverging chart so an endpoint's recent outcomes are the
+    same numbers the chart draws, keyed by model_id.
+    """
+
+    if not isinstance(generate_model_timeseries, dict):
+        return {}
+    buckets = generate_model_timeseries.get("buckets") or []
+    if not buckets:
+        return {}
+    latest = buckets[-1]
+    by_model = latest.get("by_model") if isinstance(latest, dict) else None
+    if not isinstance(by_model, dict):
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for model_id, counts in by_model.items():
+        if not isinstance(counts, dict):
+            continue
+        out[model_id] = {
+            "succeeded": int(counts.get("succeeded") or 0),
+            "failed": int(counts.get("failed") or 0),
+        }
+    return out
+
+
 def _cpu_millicores(value: str) -> int:
     value = value.strip()
     if value.endswith("m"):
@@ -741,6 +852,9 @@ def aggregate_pipeline_snapshot(
     swr_push_sync_row: dict[str, Any] | None = None,
     swr_push_sync_out_of_sync_rows: Iterable[dict[str, Any]] = (),
     swr_push_sync_available: bool = False,
+    generate_endpoint_rows: Iterable[dict[str, Any]] = (),
+    generate_endpoint_running_by_slug: dict[str, int] | None = None,
+    generate_endpoints_available: bool = False,
 ) -> dict[str, Any]:
     """Build a compact JSON-safe pipeline snapshot from database rows."""
 
@@ -1042,6 +1156,12 @@ def aggregate_pipeline_snapshot(
             swr_push_sync_row,
             swr_push_sync_out_of_sync_rows,
             available=swr_push_sync_available,
+        ),
+        "generate_endpoints": summarize_generate_endpoints(
+            generate_endpoint_rows,
+            generate_endpoint_running_by_slug,
+            stage_model_timeseries.get("generate"),
+            available=generate_endpoints_available,
         ),
         "tasks": task_views,
     }
@@ -1580,6 +1700,27 @@ class PipelineStatusCollector:
                     except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
                         swr_push_sync_row = None
                         swr_push_sync_out_of_sync_rows = []
+                # Dynamic generate-endpoint registry (read-only). The auth_token
+                # column is deliberately NOT selected: it must never leave the DB
+                # through the dashboard snapshot. A missing table (schema not yet
+                # migrated) degrades to an empty, unavailable section.
+                generate_endpoint_rows: list[dict[str, Any]] = []
+                generate_endpoints_available = False
+                try:
+                    generate_endpoint_rows = list(
+                        connection.execute(
+                            """
+                            SELECT slug, base_url, model_id, concurrency, enabled,
+                                   breaker_open, breaker_reason, tripped_at, reset_at,
+                                   last_probe_status, last_probe_at, consecutive_fail
+                            FROM generate_endpoints
+                            ORDER BY model_id, slug
+                            """
+                        ).fetchall()
+                    )
+                    generate_endpoints_available = True
+                except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
+                    generate_endpoint_rows = []
         # Denominator lives in a separate database (mindforge) on the same host;
         # fetch it on its own connection, after the pipeline transaction closes,
         # so a mindforge outage cannot fail the pipeline read.
@@ -1610,6 +1751,12 @@ class PipelineStatusCollector:
             swr_push_sync_row=swr_push_sync_row,
             swr_push_sync_out_of_sync_rows=swr_push_sync_out_of_sync_rows,
             swr_push_sync_available=swr_push_sync_available,
+            generate_endpoint_rows=generate_endpoint_rows,
+            # Live per-endpoint running-pod counts come from the k3s collector
+            # (postgres has no pod visibility); the UI joins them onto this list
+            # by slug. The registry section itself carries a running:0 placeholder.
+            generate_endpoint_running_by_slug=None,
+            generate_endpoints_available=generate_endpoints_available,
         )
 
 
@@ -1909,9 +2056,24 @@ class K3sStatusCollector:
         pods_by_node: dict[str, list[dict[str, Any]]] = {}
         slot_probe_pod_by_node: dict[str, str] = {}
         storage_mounts: list[dict[str, Any]] = []
+        # Live running-pod count per dynamic generate endpoint. Attributed by the
+        # controller-set pod label ``swegen.pgcode/endpoint=<slug>`` (falling back
+        # to the ``swegen-generate-dyn-<slug>`` deployment name derived from the
+        # pod name). The dashboard joins this onto the registry section by slug.
+        generate_endpoint_pods: Counter[str] = Counter()
         for item in workload_doc.get("items", []):
             if item.get("kind") == "Pod":
                 status = item.get("status", {})
+                labels = item.get("metadata", {}).get("labels", {}) or {}
+                endpoint_slug = labels.get("swegen.pgcode/endpoint")
+                if not endpoint_slug:
+                    owner = deployment_name_from_worker_id(
+                        item.get("metadata", {}).get("name")
+                    )
+                    if owner and owner.startswith(GENERATE_ENDPOINT_DEPLOYMENT_PREFIX):
+                        endpoint_slug = owner[len(GENERATE_ENDPOINT_DEPLOYMENT_PREFIX):]
+                if endpoint_slug and pod_display_phase(item) == "Running":
+                    generate_endpoint_pods[endpoint_slug] += 1
                 node = item.get("spec", {}).get("nodeName") or "unscheduled"
                 pod_name = item.get("metadata", {}).get("name", "unknown")
                 has_build_slot_mount = any(
@@ -2083,6 +2245,7 @@ class K3sStatusCollector:
             "resource_metrics": resource_metrics,
             "storage": storage,
             "scaling": scaling,
+            "generate_endpoint_pods": dict(sorted(generate_endpoint_pods.items())),
         }
 
     def _collect_resource_metrics(
