@@ -62,15 +62,16 @@ data:
   SWEGEN_REMOTE_BUILDKIT_CALLBACK_URL: http://callback-server.buildkit-isolated.svc.cluster.local:9000/callback
   SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_SOURCE_REGISTRY: swr.cn-southwest-2.myhuaweicloud.com
   SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_MIRROR_REGISTRY: swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com
-  SWEGEN_REMOTE_BUILDKIT_PERCENT: "75"
+  # 0 while the farm is down (router mode is 'local' anyway); restore to 75
+  # alongside local_overflow when the remote farm is healthy again.
+  SWEGEN_REMOTE_BUILDKIT_PERCENT: "0"
   SWEGEN_REMOTE_BUILDKIT_TIMEOUT_SECONDS: "3600"
   # Pilot repository affinity. Values are backend pools; the client hashes the
   # exact task context within the pool and allows the farm to fall back if the
   # preferred backend is unavailable.
   SWEGEN_REMOTE_BUILDKIT_REPO_BACKEND_MAP: '{"runbox/runbox7":["buildkit-worker-46"]}'
-  # A remote timeout/network failure is recorded for a later second pass. It
-  # must not re-enter the already saturated node-local BuildKit queue.
-  SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL: "false"
+  # true while the farm is down so any stray remote route falls back local.
+  SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL: "true"
   # Build containers inherit the daemon's proxy settings but not NO_PROXY, so
   # apt must reach these hosts directly. mirrors.aliyun.com only answers
   # through the corporate proxy, which returns 504 under build load; the
@@ -153,17 +154,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # Generate needs GitHub/API egress but the corporate proxy DNS name
-            # is not resolvable from pods. Route it through the node-local ATS
-            # gateway; explicit env values override swegen-runtime-proxy.
+            # Generate needs GitHub/API + crates.io/npm egress. Use the HK
+            # corporate proxy: proxysg-spl was ~10x slower and intermittently
+            # timing out on the crates.io sparse index, blowing the build
+            # timeout on heavy-dep (Rust) repos; proxyhk-spl is fast+stable.
             - name: HTTP_PROXY
-              value: http://7.244.3.78:3128
+              value: http://p_CoderDP:Mq%2A76%21p%2A@proxyhk-spl.huawei.com:8080
             - name: HTTPS_PROXY
-              value: http://7.244.3.78:3128
+              value: http://p_CoderDP:Mq%2A76%21p%2A@proxyhk-spl.huawei.com:8080
             - name: http_proxy
-              value: http://7.244.3.78:3128
+              value: http://p_CoderDP:Mq%2A76%21p%2A@proxyhk-spl.huawei.com:8080
             - name: https_proxy
-              value: http://7.244.3.78:3128
+              value: http://p_CoderDP:Mq%2A76%21p%2A@proxyhk-spl.huawei.com:8080
             # Keep generation lightweight and defer NOP/Oracle validation to
             # the dedicated validate stage. actions.py appends --no-validate
             # whenever SWEGEN_GENERATE_VALIDATE is false.

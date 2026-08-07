@@ -60,9 +60,10 @@ def test_manifest_runs_configured_workers_and_leaves_validation_schedulable() ->
     assert config_map["data"]["SWEGEN_REPAIR_TIMEOUT_SECONDS"] == "14400"
     assert config_map["data"]["SWEGEN_MAX_REWARD_REPAIR_ATTEMPTS"] == "3"
     assert config_map["data"]["SWEGEN_REWARD_REPAIR_TIMEOUT_SECONDS"] == "14400"
-    assert config_map["data"]["SWEGEN_BUILD_ROUTER_MODE"] == "local_overflow"
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PERCENT"] == "75"
-    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL"] == "false"
+    # Builds route 100% local while the remote BuildKit farm is down (504).
+    assert config_map["data"]["SWEGEN_BUILD_ROUTER_MODE"] == "local"
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PERCENT"] == "0"
+    assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_FALLBACK_LOCAL"] == "true"
     assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_PULL_REGISTRY_URL"].endswith("/swesandbox")
     assert config_map["data"]["SWEGEN_REMOTE_BUILDKIT_BASE_IMAGE_SOURCE_REGISTRY"] == (
         "swr.cn-southwest-2.myhuaweicloud.com"
