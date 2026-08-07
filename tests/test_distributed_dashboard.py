@@ -501,6 +501,301 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
     }
 
 
+def test_aggregate_pipeline_snapshot_exposes_per_stage_instance_coverage() -> None:
+    from swegen.dashboard.distributed_status import STAGES, aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot(
+        [],
+        [],
+        [],
+        [],
+        now=NOW,
+        unique_instance_rows=[
+            {"stage": "generate", "unique_instances": 68334},
+            {"stage": "validate", "unique_instances": 50338},
+            {"stage": "repair", "unique_instances": 17276},
+            {"stage": "reward", "unique_instances": 11568},
+            {"stage": "push", "unique_instances": 6217},
+            # A stage the dashboard does not track must be ignored, not leak in.
+            {"stage": "reward_repair", "unique_instances": 42},
+        ],
+        instance_universe_total=208659,
+    )
+
+    coverage = snapshot["instance_coverage"]
+    assert coverage["universe_total"] == 208659
+    # Every tracked stage carries a distinct-task_id count, defaulting to 0.
+    assert set(coverage["unique_instances_processed"]) == set(STAGES)
+    assert coverage["unique_instances_processed"] == {
+        "generate": 68334,
+        "validate": 50338,
+        "repair": 17276,
+        "reward": 11568,
+        "push": 6217,
+    }
+    # The whole payload still serializes for the /api/pipeline/status response.
+    json.dumps(snapshot)
+
+
+def test_aggregate_pipeline_snapshot_instance_coverage_defaults_and_degrades() -> None:
+    from swegen.dashboard.distributed_status import STAGES, aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot([], [], [], [], now=NOW)
+
+    coverage = snapshot["instance_coverage"]
+    # A mindforge outage leaves the denominator None; the UI shows "—" for it.
+    assert coverage["universe_total"] is None
+    # Every stage is present and defaults to zero processed instances.
+    assert coverage["unique_instances_processed"] == dict.fromkeys(STAGES, 0)
+
+
+def test_deployment_name_from_worker_id_strips_replicaset_and_pod_hash() -> None:
+    from swegen.dashboard.distributed_status import deployment_name_from_worker_id
+
+    # The two trailing dash-delimited hash tokens (ReplicaSet + pod) are removed.
+    assert (
+        deployment_name_from_worker_id("swegen-generate-9b75d9789-27tw2")
+        == "swegen-generate"
+    )
+    assert (
+        deployment_name_from_worker_id("swegen-generate-deepseek-exp-6c4f8b9d5-abc12")
+        == "swegen-generate-deepseek-exp"
+    )
+    # A worker_id that is not a pod name is returned unchanged, not dropped.
+    assert deployment_name_from_worker_id("custom-worker") == "custom-worker"
+    assert deployment_name_from_worker_id(None) is None
+    assert deployment_name_from_worker_id("") is None
+
+
+def test_aggregate_generate_model_timeseries_folds_worker_to_model_up_and_down() -> None:
+    from swegen.dashboard.distributed_status import aggregate_generate_model_timeseries
+
+    bucket_a = datetime(2026, 8, 7, 10, 0, tzinfo=UTC)
+    bucket_b = datetime(2026, 8, 7, 10, 15, tzinfo=UTC)
+    rows = [
+        # glm pods (swegen-generate) — two distinct pods in the same bucket fold
+        # into one model_id total.
+        {"bucket": bucket_a, "worker_id": "swegen-generate-9b75d9789-27tw2",
+         "status": "succeeded", "n": 6},
+        {"bucket": bucket_a, "worker_id": "swegen-generate-9b75d9789-aa000",
+         "status": "succeeded", "n": 4},
+        {"bucket": bucket_a, "worker_id": "swegen-generate-9b75d9789-27tw2",
+         "status": "failed", "n": 2},
+        # deepseek pods (swegen-generate-deepseek-exp).
+        {"bucket": bucket_a, "worker_id": "swegen-generate-deepseek-exp-6c4f8b9d5-abc12",
+         "status": "succeeded", "n": 3},
+        {"bucket": bucket_a, "worker_id": "swegen-generate-deepseek-exp-6c4f8b9d5-abc12",
+         "status": "error", "n": 5},
+        # A 'rejected' status is carried in its own third series (neither up nor
+        # down); it never inflates the failure total.
+        {"bucket": bucket_a, "worker_id": "swegen-generate-9b75d9789-27tw2",
+         "status": "rejected", "n": 99},
+        # A later bucket with only glm failures.
+        {"bucket": bucket_b, "worker_id": "swegen-generate-9b75d9789-27tw2",
+         "status": "failed", "n": 3},
+    ]
+    deployment_to_model = {
+        "swegen-generate": "glm-5.2-pretrain-v1",
+        "swegen-generate-deepseek-exp": "deepseek-v4-flash",
+    }
+
+    result = aggregate_generate_model_timeseries(rows, deployment_to_model)
+
+    assert result["models"] == ["deepseek-v4-flash", "glm-5.2-pretrain-v1"]
+    assert [bucket["t"] for bucket in result["buckets"]] == [
+        bucket_a.isoformat(),
+        bucket_b.isoformat(),
+    ]
+    first = result["buckets"][0]["by_model"]
+    # glm: 6+4 up, 2 down; the 'rejected' row lands in its own third series and
+    # is never folded into the failure total.
+    assert first["glm-5.2-pretrain-v1"] == {"succeeded": 10, "failed": 2, "rejected": 99}
+    # deepseek: 'error' counts as a failure (down) alongside 'failed'.
+    assert first["deepseek-v4-flash"] == {"succeeded": 3, "failed": 5, "rejected": 0}
+    second = result["buckets"][1]["by_model"]
+    assert second == {"glm-5.2-pretrain-v1": {"succeeded": 0, "failed": 3, "rejected": 0}}
+
+
+def test_aggregate_generate_model_timeseries_labels_unknown_deployment_by_name() -> None:
+    from swegen.dashboard.distributed_status import aggregate_generate_model_timeseries
+
+    bucket = datetime(2026, 8, 7, 10, 0, tzinfo=UTC)
+    # An empty deployment->model map (kubectl unavailable) still charts the data,
+    # labelling each series by its derived deployment name.
+    result = aggregate_generate_model_timeseries(
+        [{"bucket": bucket, "worker_id": "swegen-generate-9b75d9789-27tw2",
+          "status": "succeeded", "n": 7}],
+        {},
+    )
+    assert result["models"] == ["swegen-generate"]
+    assert result["buckets"][0]["by_model"] == {
+        "swegen-generate": {"succeeded": 7, "failed": 0, "rejected": 0}
+    }
+
+
+def test_aggregate_downstream_stage_model_timeseries_attributes_to_generating_model() -> None:
+    from swegen.dashboard.distributed_status import (
+        aggregate_downstream_stage_model_timeseries,
+        build_task_generating_model_map,
+    )
+
+    bucket = datetime(2026, 8, 7, 11, 0, tzinfo=UTC)
+    # task-1 generated by pretrain, task-2 by deepseek, task-3 generated outside
+    # the 48h window (absent from the map) -> "unknown".
+    task_to_model = build_task_generating_model_map(
+        [
+            {"task_id": "task-1", "worker_id": "swegen-generate-9b75d9789-27tw2"},
+            {"task_id": "task-2", "worker_id": "swegen-generate-deepseek-exp-6c4f8b9d5-abc12"},
+        ],
+        {
+            "swegen-generate": "glm-5.2-pretrain-v1",
+            "swegen-generate-deepseek-exp": "deepseek-v4-flash",
+        },
+    )
+
+    rows = [
+        # A deepseek-generated task that FAILS validate must show under
+        # deepseek's failed/down bucket at validate.
+        {"bucket": bucket, "task_id": "task-2", "stage": "validate", "status": "failed", "n": 1},
+        # A pretrain-generated task that succeeds validate -> pretrain up.
+        {"bucket": bucket, "task_id": "task-1", "stage": "validate", "status": "succeeded", "n": 1},
+        # A validate 'rejected' (nop-oracle) -> pretrain's rejected series.
+        {"bucket": bucket, "task_id": "task-1", "stage": "validate", "status": "rejected", "n": 1},
+        # A task with no known generate row -> unknown model, at reward.
+        {"bucket": bucket, "task_id": "task-3", "stage": "reward", "status": "succeeded", "n": 1},
+        # 'error' folds into failed/down at repair for deepseek.
+        {"bucket": bucket, "task_id": "task-2", "stage": "repair", "status": "error", "n": 1},
+    ]
+
+    result = aggregate_downstream_stage_model_timeseries(rows, task_to_model)
+
+    # All four downstream stages are present even when empty (push here).
+    assert set(result) == {"validate", "repair", "reward", "push"}
+    assert result["push"] == {"models": [], "buckets": []}
+
+    validate = result["validate"]["buckets"][0]["by_model"]
+    assert validate["deepseek-v4-flash"] == {"succeeded": 0, "failed": 1, "rejected": 0}
+    assert validate["glm-5.2-pretrain-v1"] == {"succeeded": 1, "failed": 0, "rejected": 1}
+    # Unknown generating model is charted, not dropped.
+    reward = result["reward"]["buckets"][0]["by_model"]
+    assert reward["unknown"] == {"succeeded": 1, "failed": 0, "rejected": 0}
+    repair = result["repair"]["buckets"][0]["by_model"]
+    assert repair["deepseek-v4-flash"] == {"succeeded": 0, "failed": 1, "rejected": 0}
+
+
+def test_aggregate_pipeline_snapshot_embeds_unified_stage_model_timeseries() -> None:
+    from swegen.dashboard.distributed_status import STAGES, aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot(
+        [],
+        [],
+        [],
+        [],
+        now=NOW,
+        generate_model_bucket_rows=[
+            {"bucket": datetime(2026, 8, 7, 10, 0, tzinfo=UTC),
+             "worker_id": "swegen-generate-9b75d9789-27tw2",
+             "status": "succeeded", "n": 5},
+        ],
+        generate_deployment_to_model={"swegen-generate": "glm-5.2-pretrain-v1"},
+        generate_task_model_rows=[
+            {"task_id": "task-1", "worker_id": "swegen-generate-9b75d9789-27tw2"},
+        ],
+        downstream_model_bucket_rows=[
+            {"bucket": datetime(2026, 8, 7, 10, 0, tzinfo=UTC),
+             "task_id": "task-1", "stage": "validate", "status": "succeeded", "n": 3},
+        ],
+    )
+
+    unified = snapshot["stage_model_timeseries"]
+    assert unified["bucket_seconds"] == 900
+    assert unified["lookback_hours"] == 48
+    # All five stages are present in the unified structure.
+    assert set(unified["stages"]) == set(STAGES)
+    generate = unified["stages"]["generate"]
+    assert generate["models"] == ["glm-5.2-pretrain-v1"]
+    assert generate["buckets"][0]["by_model"] == {
+        "glm-5.2-pretrain-v1": {"succeeded": 5, "failed": 0, "rejected": 0}
+    }
+    # Downstream validate is attributed to task-1's GENERATING model (pretrain).
+    validate = unified["stages"]["validate"]
+    assert validate["models"] == ["glm-5.2-pretrain-v1"]
+    assert validate["buckets"][0]["by_model"] == {
+        "glm-5.2-pretrain-v1": {"succeeded": 3, "failed": 0, "rejected": 0}
+    }
+    # The legacy generate-only key is gone; nothing should read it anymore.
+    assert "generate_model_timeseries" not in snapshot
+    # Defaults to empty per-stage breakdowns when no rows are provided at all.
+    empty = aggregate_pipeline_snapshot([], [], [], [], now=NOW)
+    assert set(empty["stage_model_timeseries"]["stages"]) == set(STAGES)
+    for stage in STAGES:
+        assert empty["stage_model_timeseries"]["stages"][stage] == {
+            "models": [],
+            "buckets": [],
+        }
+    json.dumps(snapshot)
+
+
+def test_resolve_generate_models_from_deployments_reads_last_model_secret() -> None:
+    from swegen.dashboard.distributed_status import (
+        resolve_generate_models_from_deployments,
+    )
+
+    def generate_deployment(name: str, secret: str) -> dict[str, object]:
+        return {
+            "kind": "Deployment",
+            "metadata": {"name": name, "labels": {"swegen.pgcode/stage": "generate"}},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "envFrom": [
+                                    {"configMapRef": {"name": "swegen-pipeline-config"}},
+                                    {"secretRef": {"name": "swegen-database"}},
+                                    # A non-model secret before the model one must
+                                    # not shadow the trailing model credential.
+                                    {"secretRef": {"name": "swegen-runtime-proxy"}},
+                                    {"secretRef": {"name": secret}},
+                                ]
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+
+    items = [
+        generate_deployment(
+            "swegen-generate", "swegen-model-credentials-glm52-pretrain-v1-20260807"
+        ),
+        generate_deployment(
+            "swegen-generate-deepseek-exp",
+            "swegen-model-credentials-deepseek-v4-flash-soldirect-20260807",
+        ),
+        # A non-generate deployment is ignored entirely.
+        {
+            "kind": "Deployment",
+            "metadata": {"name": "swegen-reward", "labels": {"swegen.pgcode/stage": "reward"}},
+            "spec": {"template": {"spec": {"containers": []}}},
+        },
+    ]
+    secret_models = {
+        "swegen-model-credentials-glm52-pretrain-v1-20260807": "glm-5.2-pretrain-v1",
+        "swegen-model-credentials-deepseek-v4-flash-soldirect-20260807": "deepseek-v4-flash",
+    }
+
+    mapping = resolve_generate_models_from_deployments(items, secret_models)
+    assert mapping == {
+        "swegen-generate": "glm-5.2-pretrain-v1",
+        "swegen-generate-deepseek-exp": "deepseek-v4-flash",
+    }
+    # A deployment whose secret value could not be read is left unmapped so the
+    # chart falls back to its deployment-name label.
+    partial = resolve_generate_models_from_deployments(items, {})
+    assert partial == {}
+
+
 def test_summarize_swr_push_sync_computes_registry_counts_and_out_of_sync_ids() -> None:
     from swegen.dashboard.distributed_status import summarize_swr_push_sync
 

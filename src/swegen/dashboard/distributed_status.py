@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -548,6 +549,175 @@ def _empty_stage(stage: str) -> dict[str, Any]:
     }
 
 
+# A worker_id is a pod name shaped like
+# ``<deployment>-<replicaset_hash>-<pod_hash>`` (e.g.
+# ``swegen-generate-9b75d9789-27tw2``). The trailing two dash-delimited hash
+# tokens are the ReplicaSet suffix and the per-pod suffix that Kubernetes
+# appends; stripping them yields the owning Deployment name. The pod suffix is
+# always five [a-z0-9] characters; the ReplicaSet suffix is a variable-length
+# [a-z0-9] token.
+_POD_SUFFIX_RE = re.compile(r"-[a-z0-9]+-[a-z0-9]{5}$")
+# Diverging-chart direction mapping, shared by every stage. 'succeeded' stacks
+# up (good outcome); 'failed'/'error' stack down (infra/terminal failure).
+# 'rejected' (a validate/reward nop-oracle legitimate rejection) is neither a
+# clean success nor an infra failure: it is counted into its own third series so
+# the operator can see it, but the diverging bars only stack succeeded-up and
+# failed-down. The renderer draws rejected as a thin neutral marker on the down
+# side; it is never folded into the failure total. Any other status is ignored.
+_UP_STATUSES = frozenset({"succeeded"})
+_DOWN_STATUSES = frozenset({"failed", "error"})
+_REJECTED_STATUSES = frozenset({"rejected"})
+# Stages downstream of generate; their per-model split is attributed to the
+# model that GENERATED each underlying task (see aggregate_stage_model_timeseries).
+_DOWNSTREAM_STAGES = ("validate", "repair", "reward", "push")
+# Label for a downstream result whose generating model could not be resolved
+# (its generate row fell outside the 48h query window, or its worker_id did not
+# resolve to a deployment). Charted under this bucket rather than dropped.
+_UNKNOWN_MODEL = "unknown"
+
+
+def _diverging_direction(status: object) -> str | None:
+    """Map a stage-result status onto its diverging-chart series, or None."""
+
+    if status in _UP_STATUSES:
+        return "succeeded"
+    if status in _DOWN_STATUSES:
+        return "failed"
+    if status in _REJECTED_STATUSES:
+        return "rejected"
+    return None
+
+
+def deployment_name_from_worker_id(worker_id: str | None) -> str | None:
+    """Derive the owning Deployment name from a worker/pod id, or None.
+
+    Strips the ReplicaSet + pod hash suffix Kubernetes appends. A worker_id that
+    does not match the pod-name shape (no suffix to strip) is returned unchanged
+    so an operator-set custom id still maps to *something* rather than vanishing.
+    """
+
+    if not worker_id:
+        return None
+    stripped = _POD_SUFFIX_RE.sub("", worker_id)
+    return stripped or worker_id
+
+
+def _empty_model_counts() -> dict[str, int]:
+    return {"succeeded": 0, "failed": 0, "rejected": 0}
+
+
+def _fold_model_buckets(
+    entries: Iterable[tuple[str, str, str, int]],
+) -> dict[str, Any]:
+    """Fold ``(bucket, model_id, direction, count)`` tuples into the chart shape.
+
+    ``direction`` is one of succeeded/failed/rejected (already mapped from the
+    raw status). Returns ``{"models": [...], "buckets": [{"t":..,"by_model":..}]}``
+    sorted by bucket time and model_id for stable colour assignment.
+    """
+
+    buckets: dict[str, dict[str, dict[str, int]]] = {}
+    models: set[str] = set()
+    for bucket, model_id, direction, count in entries:
+        models.add(model_id)
+        counts = buckets.setdefault(bucket, {}).setdefault(model_id, _empty_model_counts())
+        counts[direction] += count
+    ordered_buckets = [{"t": bucket, "by_model": buckets[bucket]} for bucket in sorted(buckets)]
+    return {"models": sorted(models), "buckets": ordered_buckets}
+
+
+def aggregate_generate_model_timeseries(
+    generate_bucket_rows: Iterable[dict[str, Any]],
+    deployment_to_model: dict[str, str],
+) -> dict[str, Any]:
+    """Fold per-worker generate buckets into per-(bucket, model_id) up/down counts.
+
+    ``generate_bucket_rows`` are per-(bucket, worker_id, status) counts from the
+    generate time-bucket query. Generate is the one stage split by its OWN
+    worker's model: each worker_id resolves through its Deployment name to a
+    model_id via ``deployment_to_model``; a worker whose deployment is unknown is
+    labelled by its derived deployment name so it is still charted rather than
+    silently dropped. 'succeeded' stacks up; 'failed'/'error' stack down; a stray
+    'rejected' never appears for generate but would land in its own series.
+    """
+
+    def entries() -> Iterable[tuple[str, str, str, int]]:
+        for row in generate_bucket_rows:
+            bucket = _iso(row.get("bucket"))
+            if bucket is None:
+                continue
+            direction = _diverging_direction(row.get("status"))
+            if direction is None:
+                continue
+            deployment = deployment_name_from_worker_id(row.get("worker_id"))
+            model_id = deployment_to_model.get(deployment or "", deployment) or _UNKNOWN_MODEL
+            yield bucket, model_id, direction, int(row.get("n") or 0)
+
+    return _fold_model_buckets(entries())
+
+
+def aggregate_downstream_stage_model_timeseries(
+    downstream_bucket_rows: Iterable[dict[str, Any]],
+    task_to_generating_model: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Split each downstream stage's buckets by the model that GENERATED the task.
+
+    Validate/repair/reward/push each run under a single deployment, so splitting
+    them by their own worker's model would give one trivial series. The useful
+    breakdown is by the model that generated the underlying task: it answers
+    "how do deepseek-generated vs pretrain-generated tasks fare downstream?".
+
+    ``downstream_bucket_rows`` are per-(bucket, task_id, stage, status) rows;
+    each task_id is looked up in ``task_to_generating_model`` (built from the
+    generate-stage rows). A task whose generate row is outside the query window
+    or unresolvable buckets under the "unknown" model rather than being dropped.
+    Returns ``{stage: {"models": [...], "buckets": [...]}}`` for every downstream
+    stage, present even when empty.
+    """
+
+    per_stage: dict[str, list[tuple[str, str, str, int]]] = {
+        stage: [] for stage in _DOWNSTREAM_STAGES
+    }
+    for row in downstream_bucket_rows:
+        stage = row.get("stage")
+        if stage not in per_stage:
+            continue
+        bucket = _iso(row.get("bucket"))
+        if bucket is None:
+            continue
+        direction = _diverging_direction(row.get("status"))
+        if direction is None:
+            continue
+        model_id = task_to_generating_model.get(row.get("task_id"), _UNKNOWN_MODEL)
+        per_stage[stage].append((bucket, model_id, direction, int(row.get("n") or 1)))
+    return {stage: _fold_model_buckets(entries) for stage, entries in per_stage.items()}
+
+
+def build_task_generating_model_map(
+    generate_task_rows: Iterable[dict[str, Any]],
+    deployment_to_model: dict[str, str],
+) -> dict[str, str]:
+    """Map each generate-stage task_id to the model_id that generated it.
+
+    ``generate_task_rows`` are ``(task_id, worker_id)`` rows from the generate
+    stage. worker_id resolves through its Deployment to a model_id, falling back
+    to the deployment name when the model is unresolved. A task_id absent from
+    this map (its generate row fell outside the window) is treated as "unknown"
+    by the downstream aggregation.
+    """
+
+    mapping: dict[str, str] = {}
+    for row in generate_task_rows:
+        task_id = row.get("task_id")
+        if not task_id:
+            continue
+        deployment = deployment_name_from_worker_id(row.get("worker_id"))
+        model_id = deployment_to_model.get(deployment or "", deployment)
+        if model_id:
+            mapping[task_id] = model_id
+    return mapping
+
+
 def aggregate_pipeline_snapshot(
     task_rows: Iterable[dict[str, Any]],
     result_rows: Iterable[dict[str, Any]],
@@ -558,8 +728,14 @@ def aggregate_pipeline_snapshot(
     activity_stale_after_seconds: float = ACTIVITY_STALE_AFTER_SECONDS,
     activity_count_rows: Iterable[dict[str, Any]] = (),
     time_bucket_rows: Iterable[dict[str, Any]] = (),
+    generate_model_bucket_rows: Iterable[dict[str, Any]] = (),
+    generate_deployment_to_model: dict[str, str] | None = None,
+    downstream_model_bucket_rows: Iterable[dict[str, Any]] = (),
+    generate_task_model_rows: Iterable[dict[str, Any]] = (),
     hourly_yield_rows: Iterable[dict[str, Any]] = (),
     lifetime_stage_rows: Iterable[dict[str, Any]] = (),
+    unique_instance_rows: Iterable[dict[str, Any]] = (),
+    instance_universe_total: int | None = None,
     remote_build_rows: Iterable[dict[str, Any]] = (),
     remote_build_tracking_available: bool = False,
     swr_push_sync_row: dict[str, Any] | None = None,
@@ -747,6 +923,23 @@ def aggregate_pipeline_snapshot(
         )
     for rows in stage_time_series.values():
         rows.sort(key=lambda row: row["bucket"] or "")
+    # Unified diverging per-model breakdown for every stage. Generate splits by
+    # its own worker's model; the four downstream stages split by the model that
+    # GENERATED each task (joined via task_id -> generate worker -> model).
+    deployment_to_model = generate_deployment_to_model or {}
+    stage_model_timeseries = {
+        "generate": aggregate_generate_model_timeseries(
+            generate_model_bucket_rows, deployment_to_model
+        ),
+    }
+    task_generating_model = build_task_generating_model_map(
+        generate_task_model_rows, deployment_to_model
+    )
+    stage_model_timeseries.update(
+        aggregate_downstream_stage_model_timeseries(
+            downstream_model_bucket_rows, task_generating_model
+        )
+    )
     hourly_yield = {stage: [] for stage in STAGES}
     for row in hourly_yield_rows:
         stage = row.get("stage")
@@ -769,6 +962,11 @@ def aggregate_pipeline_snapshot(
         stage = row.get("stage")
         if stage in lifetime_processed:
             lifetime_processed[stage] = int(row.get("processed") or 0)
+    unique_instances_processed = dict.fromkeys(STAGES, 0)
+    for row in unique_instance_rows:
+        stage = row.get("stage")
+        if stage in unique_instances_processed:
+            unique_instances_processed[stage] = int(row.get("unique_instances") or 0)
     activity_counts = {stage: {"fresh": 0, "stale": 0, "total": 0} for stage in STAGES}
     for row in activity_count_rows:
         stage = row.get("stage")
@@ -798,6 +996,17 @@ def aggregate_pipeline_snapshot(
             "windows": throughput,
             "lifetime_processed": lifetime_processed,
         },
+        "instance_coverage": {
+            # Feature-PR universe: rows in mindforge's feature-labelled PR table.
+            # None means the denominator query failed and the UI shows "—".
+            "universe_total": (
+                int(instance_universe_total) if instance_universe_total is not None else None
+            ),
+            # Distinct pipeline task_ids each stage has processed (attempted, any
+            # status). task_id already lives in the feature-PR namespace, so this
+            # is a coverage numerator against universe_total directly.
+            "unique_instances_processed": unique_instances_processed,
+        },
         "activity": {
             "stale_after_seconds": activity_stale_after_seconds,
             "stages": activity_counts,
@@ -806,6 +1015,19 @@ def aggregate_pipeline_snapshot(
             "bucket_seconds": 900,
             "lookback_hours": 48,
             "stages": stage_time_series,
+        },
+        # Unified diverging per-model breakdown for ALL five stages. Every stage
+        # card stacks success upward and failure downward, coloured by model_id.
+        # Generate is coloured by its own worker's model; the four downstream
+        # stages are coloured by the model that generated each task, so the
+        # operator can compare how each model's tasks fare downstream. Rejected
+        # results (validate/reward nop-oracle rejections) are carried as a third
+        # per-model count and drawn as a thin neutral marker, not folded into
+        # the failure total.
+        "stage_model_timeseries": {
+            "bucket_seconds": 900,
+            "lookback_hours": 48,
+            "stages": stage_model_timeseries,
         },
         "hourly_yield": {
             "bucket_seconds": 3600,
@@ -841,11 +1063,206 @@ def _database_dsn() -> str:
     )
 
 
+def _mindforge_dsn() -> str:
+    """DSN for the feature-PR universe: same host/port/credentials, dbname=mindforge.
+
+    The coverage denominator lives in a different logical database on the same
+    PostgreSQL host as the pipeline. Only the dbname differs from the pipeline DSN.
+    """
+
+    password = os.environ.get("SWEGEN_PG_PASSWORD", "")
+    if not password:
+        raise RuntimeError("SWEGEN_PG_PASSWORD is not set")
+    return " ".join(
+        (
+            f"host={os.environ.get('SWEGEN_PG_HOST', '7.237.95.141')}",
+            f"port={os.environ.get('SWEGEN_PG_PORT', '5432')}",
+            "dbname=mindforge",
+            f"user={os.environ.get('SWEGEN_PG_USER', 'root')}",
+            f"password={password}",
+            "connect_timeout=5",
+        )
+    )
+
+
+def _fetch_instance_universe_total() -> int | None:
+    """Count feature-labelled PRs in the mindforge universe, or None on failure.
+
+    A mindforge outage must not break the pipeline dashboard, so every failure
+    mode (missing env, connection error, missing table) degrades to None and the
+    UI falls back to showing the numerator with a "—" denominator.
+    """
+
+    try:
+        with psycopg.connect(_mindforge_dsn(), row_factory=dict_row) as connection:
+            with connection.transaction():
+                connection.execute("SET LOCAL statement_timeout = '5s'")
+                connection.execute("SET TRANSACTION READ ONLY")
+                # All constants; no params, so a literal % would never appear here.
+                row = connection.execute(
+                    """
+                    SELECT count(*) AS total
+                    FROM mindforge.go_prs_prs_copy_lang_category_merged
+                    WHERE pr_category = 'feature'
+                    """
+                ).fetchone()
+        if row is None or row.get("total") is None:
+            return None
+        return int(row["total"])
+    except Exception:
+        return None
+
+
+def resolve_generate_models_from_deployments(
+    deployment_items: Iterable[dict[str, Any]],
+    secret_models: dict[str, str],
+) -> dict[str, str]:
+    """Map generate Deployment name -> model_id from deployment specs + secrets.
+
+    ``deployment_items`` are Kubernetes Deployment objects (kubectl JSON items);
+    only those whose stage label is ``generate`` are considered. Each generate
+    worker's last ``envFrom`` entry is the ``swegen-model-credentials-*`` Secret
+    whose ``ANTHROPIC_MODEL`` value is the model_id; ``secret_models`` maps that
+    Secret name to its decoded ``ANTHROPIC_MODEL``. When the secret value is
+    unavailable, the deployment is left out of the map and the chart falls back
+    to labelling that series by its deployment name.
+    """
+
+    mapping: dict[str, str] = {}
+    for item in deployment_items:
+        if item.get("kind") != "Deployment":
+            continue
+        metadata = item.get("metadata", {})
+        spec = item.get("spec", {})
+        labels = metadata.get("labels", {})
+        stage = labels.get("swegen.pgcode/stage") or (
+            spec.get("selector", {}).get("matchLabels", {}).get("swegen.pgcode/stage")
+        )
+        if STAGE_ALIASES.get(stage, stage) != "generate":
+            continue
+        name = metadata.get("name")
+        if not name:
+            continue
+        pod_spec = spec.get("template", {}).get("spec", {})
+        secret_name = None
+        for container in pod_spec.get("containers", []):
+            for source in container.get("envFrom", []):
+                ref = source.get("secretRef") or {}
+                ref_name = ref.get("name")
+                if isinstance(ref_name, str) and ref_name.startswith(
+                    "swegen-model-credentials-"
+                ):
+                    # Last matching envFrom wins: envFrom later in the list
+                    # overrides earlier sources, matching runtime precedence.
+                    secret_name = ref_name
+        if secret_name is None:
+            continue
+        model_id = secret_models.get(secret_name)
+        if model_id:
+            mapping[name] = model_id
+    return mapping
+
+
 class PipelineStatusCollector:
     """Fetch bounded recent task telemetry and complete PGMQ queue metrics."""
 
-    def __init__(self, *, recent_task_limit: int = 100) -> None:
+    def __init__(
+        self,
+        *,
+        recent_task_limit: int = 100,
+        namespace: str = "swegen-pipeline",
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
         self.recent_task_limit = recent_task_limit
+        self.namespace = namespace
+        self.runner = runner
+
+    def _resolve_generate_models(self) -> dict[str, str]:
+        """Best-effort generate Deployment -> model_id map; {} on any failure.
+
+        Reads generate Deployments and, for each distinct model-credential
+        Secret they reference, the decoded ``ANTHROPIC_MODEL`` value. Any
+        kubectl failure (RBAC, timeout, missing objects) degrades to an empty
+        map so a k3s hiccup never breaks the pipeline snapshot.
+        """
+
+        try:
+            deployment_doc = self._kubectl_json(
+                ["-n", self.namespace, "get", "deployments"]
+            )
+        except Exception:
+            return {}
+        deployment_items = deployment_doc.get("items", [])
+        secret_names = set()
+        for item in deployment_items:
+            if item.get("kind") != "Deployment":
+                continue
+            labels = item.get("metadata", {}).get("labels", {})
+            spec = item.get("spec", {})
+            stage = labels.get("swegen.pgcode/stage") or (
+                spec.get("selector", {}).get("matchLabels", {}).get("swegen.pgcode/stage")
+            )
+            if STAGE_ALIASES.get(stage, stage) != "generate":
+                continue
+            pod_spec = spec.get("template", {}).get("spec", {})
+            for container in pod_spec.get("containers", []):
+                for source in container.get("envFrom", []):
+                    ref_name = (source.get("secretRef") or {}).get("name")
+                    if isinstance(ref_name, str) and ref_name.startswith(
+                        "swegen-model-credentials-"
+                    ):
+                        secret_names.add(ref_name)
+        secret_models: dict[str, str] = {}
+        for secret_name in secret_names:
+            model_id = self._read_secret_model(secret_name)
+            if model_id:
+                secret_models[secret_name] = model_id
+        return resolve_generate_models_from_deployments(deployment_items, secret_models)
+
+    def _read_secret_model(self, secret_name: str) -> str | None:
+        """Decode a Secret's ANTHROPIC_MODEL value, or None if unavailable."""
+
+        try:
+            completed = self.runner(
+                [
+                    "kubectl",
+                    "--request-timeout=3s",
+                    "-n",
+                    self.namespace,
+                    "get",
+                    "secret",
+                    secret_name,
+                    "-o",
+                    "jsonpath={.data.ANTHROPIC_MODEL}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return None
+        if completed.returncode != 0:
+            return None
+        encoded = (completed.stdout or "").strip()
+        if not encoded:
+            return None
+        try:
+            return base64.b64decode(encoded).decode("utf-8").strip() or None
+        except Exception:
+            return None
+
+    def _kubectl_json(self, args: list[str]) -> dict[str, Any]:
+        completed = self.runner(
+            ["kubectl", "--request-timeout=3s", *args, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or "kubectl failed")[:500])
+        return json.loads(completed.stdout)
 
     def collect(self) -> dict[str, Any]:
         with psycopg.connect(_database_dsn(), row_factory=dict_row) as connection:
@@ -941,6 +1358,70 @@ class PipelineStatusCollector:
                         """
                     ).fetchall()
                 )
+                # Per-worker generate buckets feed the diverging per-model chart.
+                # worker_id resolves to a deployment and then a model_id in
+                # Python; keeping the split here means the SQL stays a plain
+                # positional-placeholder query with no % literal.
+                generate_model_buckets = list(
+                    connection.execute(
+                        """
+                        SELECT
+                            date_bin(
+                                INTERVAL '15 minutes',
+                                finished_at,
+                                TIMESTAMPTZ '2001-01-01 00:00:00+00'
+                            ) AS bucket,
+                            worker_id,
+                            status,
+                            count(*) AS n
+                        FROM pipeline_stage_results
+                        WHERE stage = 'generate'
+                          AND finished_at >= now() - INTERVAL '48 hours'
+                        GROUP BY bucket, worker_id, status
+                        ORDER BY bucket, worker_id, status
+                        """
+                    ).fetchall()
+                )
+                # Downstream stages split by the GENERATING model of each task:
+                # task_id is carried so the fold can join to the generate-stage
+                # worker->model resolution below. Bucketed to 15 min over 48h to
+                # match the generate chart's window.
+                downstream_model_buckets = list(
+                    connection.execute(
+                        """
+                        SELECT
+                            date_bin(
+                                INTERVAL '15 minutes',
+                                finished_at,
+                                TIMESTAMPTZ '2001-01-01 00:00:00+00'
+                            ) AS bucket,
+                            task_id,
+                            stage,
+                            status,
+                            count(*) AS n
+                        FROM pipeline_stage_results
+                        WHERE stage IN ('validate', 'repair', 'reward', 'push')
+                          AND finished_at >= now() - INTERVAL '48 hours'
+                        GROUP BY bucket, task_id, stage, status
+                        ORDER BY bucket, task_id, stage, status
+                        """
+                    ).fetchall()
+                )
+                # task_id -> generate worker_id, used to attribute each
+                # downstream result to its generating model. Bounded to the same
+                # 48h window; a task generated earlier resolves to "unknown".
+                generate_task_models = list(
+                    connection.execute(
+                        """
+                        SELECT DISTINCT ON (task_id) task_id, worker_id
+                        FROM pipeline_stage_results
+                        WHERE stage = 'generate'
+                          AND status = 'succeeded'
+                          AND finished_at >= now() - INTERVAL '48 hours'
+                        ORDER BY task_id, finished_at DESC
+                        """
+                    ).fetchall()
+                )
                 hourly_yields = list(
                     connection.execute(
                         """
@@ -962,6 +1443,15 @@ class PipelineStatusCollector:
                         SELECT stage, count(*) AS processed
                         FROM pipeline_stage_results
                         WHERE status IN ('succeeded', 'rejected', 'failed')
+                        GROUP BY stage
+                        """
+                    ).fetchall()
+                )
+                unique_instances = list(
+                    connection.execute(
+                        """
+                        SELECT stage, count(DISTINCT task_id) AS unique_instances
+                        FROM pipeline_stage_results
                         GROUP BY stage
                         """
                     ).fetchall()
@@ -1090,6 +1580,16 @@ class PipelineStatusCollector:
                     except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
                         swr_push_sync_row = None
                         swr_push_sync_out_of_sync_rows = []
+        # Denominator lives in a separate database (mindforge) on the same host;
+        # fetch it on its own connection, after the pipeline transaction closes,
+        # so a mindforge outage cannot fail the pipeline read.
+        instance_universe_total = _fetch_instance_universe_total()
+        # Resolve which model_id each generate deployment runs. This is a tiny
+        # map that changes only when a generate deployment is added/rolled, so
+        # it is refreshed once per collect alongside the DB read. A kubectl
+        # failure degrades to an empty map: the chart then labels each series by
+        # its derived deployment name instead of the model_id.
+        generate_deployment_to_model = self._resolve_generate_models()
         return aggregate_pipeline_snapshot(
             tasks,
             results,
@@ -1097,8 +1597,14 @@ class PipelineStatusCollector:
             queues,
             activity_count_rows=activity_counts,
             time_bucket_rows=time_buckets,
+            generate_model_bucket_rows=generate_model_buckets,
+            generate_deployment_to_model=generate_deployment_to_model,
+            downstream_model_bucket_rows=downstream_model_buckets,
+            generate_task_model_rows=generate_task_models,
             hourly_yield_rows=hourly_yields,
             lifetime_stage_rows=lifetime_stages,
+            unique_instance_rows=unique_instances,
+            instance_universe_total=instance_universe_total,
             remote_build_rows=remote_build_rows,
             remote_build_tracking_available=remote_build_tracking_available,
             swr_push_sync_row=swr_push_sync_row,
