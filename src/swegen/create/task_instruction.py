@@ -17,7 +17,24 @@ MAX_PR_BODY_LENGTH = 2500
 MAX_TEST_FILE_LENGTH = 3000  # Max chars per test file
 MAX_TOTAL_TEST_LENGTH = 10000  # Max total chars for all test files
 MIN_INSTRUCTION_LENGTH = 100
-OPENAI_API_TIMEOUT = 90.0
+# Client-side timeout for the structured task-instruction LLM call. Slow
+# reasoning backends (e.g. large Qwen/GLM variants on remote endpoints) can take
+# many minutes for a full structured completion, so this defaults high and is
+# env-overridable per deployment (SWEGEN_OPENAI_API_TIMEOUT, seconds) without a
+# rebuild. Falls back to 600s on an unset/invalid value.
+def _openai_api_timeout() -> float:
+    raw = os.getenv("SWEGEN_OPENAI_API_TIMEOUT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 600.0
+
+
+OPENAI_API_TIMEOUT = _openai_api_timeout()
 MAX_COMPLETION_TOKENS = 4096
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 DEBUG_REASON_TRUNCATE_LENGTH = 100
