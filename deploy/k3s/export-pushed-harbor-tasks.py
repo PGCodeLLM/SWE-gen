@@ -18,6 +18,7 @@ import os
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
@@ -44,6 +45,15 @@ _PUSHED_TASKS_SQL = """
      AND task.task_version = result.task_version
     WHERE result.stage = 'push'
       AND result.status = 'succeeded'
+      AND (%(pushed_through)s::timestamptz IS NULL
+           OR result.finished_at <= %(pushed_through)s)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM jsonb_to_recordset(%(excluded_tasks)s::jsonb)
+               AS excluded(task_id text, task_version integer)
+          WHERE excluded.task_id = result.task_id
+            AND excluded.task_version = result.task_version
+      )
     ORDER BY result.task_id, result.task_version, result.finished_at DESC
 """
 _TASK_FILES_SQL = """
@@ -52,7 +62,17 @@ _TASK_FILES_SQL = """
     JOIN (
         SELECT DISTINCT task_id, task_version
         FROM pipeline_stage_results
-        WHERE stage = 'push' AND status = 'succeeded'
+        WHERE stage = 'push'
+          AND status = 'succeeded'
+          AND (%(pushed_through)s::timestamptz IS NULL
+               OR finished_at <= %(pushed_through)s)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM jsonb_to_recordset(%(excluded_tasks)s::jsonb)
+                   AS excluded(task_id text, task_version integer)
+              WHERE excluded.task_id = pipeline_stage_results.task_id
+                AND excluded.task_version = pipeline_stage_results.task_version
+          )
     ) AS pushed
       ON pushed.task_id = file.task_id
      AND pushed.task_version = file.task_version
@@ -83,20 +103,100 @@ def _task_directory(task_id: str, task_version: int) -> str:
     return f"{task_id}__v{task_version}"
 
 
-def export(destination: Path) -> dict[str, object]:
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"invalid ISO-8601 timestamp: {value!r}") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError("timestamp must include a UTC offset")
+    return parsed.astimezone(UTC)
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                payload = archive.read("manifest.json")
+        else:
+            payload = path.read_bytes()
+        manifest = json.loads(payload)
+    except (OSError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+        raise SystemExit(f"cannot read exclusion manifest from {path}: {error}") from error
+    if not isinstance(manifest, dict):
+        raise SystemExit(f"exclusion manifest must be a JSON object: {path}")
+    return manifest
+
+
+def _load_excluded_tasks(path: Path | None) -> set[tuple[str, int]]:
+    if path is None:
+        return set()
+    manifest = _read_manifest(path)
+    raw_tasks = manifest.get("tasks")
+    if not isinstance(raw_tasks, list):
+        raise SystemExit(f"exclusion manifest has no tasks array: {path}")
+
+    identities: set[tuple[str, int]] = set()
+    for index, entry in enumerate(raw_tasks):
+        if not isinstance(entry, dict):
+            raise SystemExit(f"exclusion manifest task {index} is not an object: {path}")
+        task_id = entry.get("task_id")
+        task_version = entry.get("task_version")
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or isinstance(task_version, bool)
+            or not isinstance(task_version, int)
+            or task_version <= 0
+        ):
+            raise SystemExit(f"exclusion manifest task {index} has an invalid identity: {path}")
+        identity = (task_id, task_version)
+        if identity in identities:
+            raise SystemExit(f"exclusion manifest contains duplicate task {identity!r}: {path}")
+        identities.add(identity)
+    return identities
+
+
+def _query_parameters(
+    excluded_tasks: set[tuple[str, int]], pushed_through: datetime | None
+) -> dict[str, object]:
+    exclusions = [
+        {"task_id": task_id, "task_version": task_version}
+        for task_id, task_version in sorted(excluded_tasks)
+    ]
+    return {
+        "excluded_tasks": json.dumps(exclusions, separators=(",", ":")),
+        "pushed_through": pushed_through,
+    }
+
+
+def export(
+    destination: Path,
+    *,
+    exclude_manifest: Path | None = None,
+    pushed_through: datetime | None = None,
+    expected_task_count: int | None = None,
+) -> dict[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, object]] = []
     file_count = 0
     byte_count = 0
+    excluded_tasks = _load_excluded_tasks(exclude_manifest)
+    query_parameters = _query_parameters(excluded_tasks, pushed_through)
 
     with psycopg.connect(_connection_string(), row_factory=dict_row) as connection:
+        connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         with connection.cursor(name="pushed_tasks") as cursor:
             tasks = {
                 (row["task_id"], row["task_version"]): row
-                for row in cursor.execute(_PUSHED_TASKS_SQL)
+                for row in cursor.execute(_PUSHED_TASKS_SQL, query_parameters)
             }
         if not tasks:
             raise SystemExit("no tasks with a succeeded Push stage were found")
+        if expected_task_count is not None and len(tasks) != expected_task_count:
+            raise SystemExit(
+                f"selected {len(tasks)} tasks, expected {expected_task_count}; archive not written"
+            )
 
         with zipfile.ZipFile(
             destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
@@ -105,7 +205,7 @@ def export(destination: Path) -> dict[str, object]:
             # over a gigabyte and must not be materialised at once.
             with connection.cursor(name="pushed_task_files") as cursor:
                 cursor.itersize = 200
-                for row in cursor.execute(_TASK_FILES_SQL):
+                for row in cursor.execute(_TASK_FILES_SQL, query_parameters):
                     key = (row["task_id"], row["task_version"])
                     directory = _task_directory(*key)
                     path = row["path"]
@@ -153,6 +253,9 @@ def export(destination: Path) -> dict[str, object]:
             manifest = {
                 "generated_at": datetime.now(UTC).isoformat(),
                 "source": "pipeline_stage_results stage=push status=succeeded",
+                "excluded_manifest": str(exclude_manifest) if exclude_manifest else None,
+                "excluded_task_count": len(excluded_tasks),
+                "pushed_through": pushed_through.isoformat() if pushed_through else None,
                 "task_count": len(entries),
                 "file_count": file_count,
                 "uncompressed_bytes": byte_count,
@@ -165,19 +268,45 @@ def export(destination: Path) -> dict[str, object]:
         "file_count": file_count,
         "uncompressed_bytes": byte_count,
         "missing_swr_image": sum(1 for entry in entries if not entry["swr_image"]),
+        "excluded_task_count": len(excluded_tasks),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--exclude-manifest",
+        type=Path,
+        help="Exclude task identities from a manifest JSON or a zip containing manifest.json",
+    )
+    parser.add_argument(
+        "--pushed-through",
+        type=_parse_timestamp,
+        help="Include successful Push results through this inclusive ISO-8601 timestamp",
+    )
+    parser.add_argument(
+        "--expected-task-count",
+        type=int,
+        help="Abort before writing unless the selected task count matches",
+    )
     arguments = parser.parse_args()
-    summary = export(arguments.output.resolve())
+    if arguments.expected_task_count is not None and arguments.expected_task_count <= 0:
+        parser.error("--expected-task-count must be positive")
+    summary = export(
+        arguments.output.resolve(),
+        exclude_manifest=(
+            arguments.exclude_manifest.resolve() if arguments.exclude_manifest else None
+        ),
+        pushed_through=arguments.pushed_through,
+        expected_task_count=arguments.expected_task_count,
+    )
     size = arguments.output.resolve().stat().st_size
     print(f"tasks              : {summary['task_count']}")
     print(f"files              : {summary['file_count']}")
     print(f"uncompressed bytes : {summary['uncompressed_bytes']:,}")
     print(f"tasks missing image: {summary['missing_swr_image']}")
+    print(f"tasks excluded     : {summary['excluded_task_count']}")
     print(f"archive bytes      : {size:,}")
     print(f"archive            : {arguments.output.resolve()}")
 

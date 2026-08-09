@@ -30,8 +30,27 @@ export SWEGEN_PG_PASSWORD="$(kubectl -n swegen-pipeline get secret swegen-databa
   -o jsonpath='{.data.SWEGEN_PG_PASSWORD}' | base64 -d)"
 ```
 
-`--output` is the only argument. Parent directories are created if missing, and
-the path is resolved before use so the summary prints an absolute location.
+`--output` is the only required argument. Parent directories are created if
+missing, and the path is resolved before use so the summary prints an absolute
+location.
+
+For an incremental export, exclude the exact task identities from a previous
+archive's `manifest.json`. A timestamp cutoff pins the new archive even while
+the pipeline keeps completing tasks, and the expected-count guard aborts before
+the zip is opened if the selected set is not the audited set:
+
+```bash
+uv run python deploy/k3s/export-pushed-harbor-tasks.py \
+  --exclude-manifest /data/swegen-exports/previous-export.zip \
+  --pushed-through '2026-08-07T17:07:04+08:00' \
+  --expected-task-count 2544 \
+  --output /data/swegen-exports/pushed-harbor-tasks-incremental.zip
+```
+
+`--exclude-manifest` accepts either a manifest JSON or a zip containing a
+top-level `manifest.json`. A submission state file is not sufficient because it
+contains a count but not the exported `(task_id, task_version)` identities.
+Database selection and file streaming use one repeatable-read snapshot.
 
 ## What gets exported
 
