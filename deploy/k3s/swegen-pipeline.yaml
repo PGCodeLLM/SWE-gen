@@ -128,7 +128,7 @@ spec:
               swegen.pgcode/stage: generate
       containers:
         - name: worker
-          image: swegen-worker:ephemeral-build-fix-20260806
+          image: swegen-worker:openai-timeout-600-20260808
           imagePullPolicy: Never
           args: ["--stage", "generate"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
