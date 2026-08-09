@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -705,12 +705,52 @@ def deployment_name_from_worker_id(worker_id: str | None) -> str | None:
     Strips the ReplicaSet + pod hash suffix Kubernetes appends. A worker_id that
     does not match the pod-name shape (no suffix to strip) is returned unchanged
     so an operator-set custom id still maps to *something* rather than vanishing.
+
+    NOTE: this regex strip is unreliable for long names. A pod name is capped at
+    63 chars, and when ``<deployment>-<10char-hash>-<5char>`` would exceed that,
+    Kubernetes truncates the tail -- often collapsing the ``-<hash>-<rand>`` into
+    a single dashless-in-the-middle blob (e.g. the dynamic
+    ``swegen-generate-dyn-...`` pools hit exactly 63 chars). The regex requires
+    two trailing dash-groups and then leaves such names UNchanged. Prefer
+    ``resolve_worker_model`` (below), which prefix-matches against the known
+    deployment names and is truncation-proof; this helper remains for callers
+    without a deployment set and as that resolver's fallback.
     """
 
     if not worker_id:
         return None
     stripped = _POD_SUFFIX_RE.sub("", worker_id)
     return stripped or worker_id
+
+
+def resolve_worker_model(
+    worker_id: str | None,
+    deployment_to_model: Mapping[str, str],
+) -> str | None:
+    """Resolve a worker/pod id to its model_id via the known deployment names.
+
+    The reliable signal is the set of real Deployment names in
+    ``deployment_to_model``: a pod name always begins with
+    ``<deployment-name>-`` (the ReplicaSet/pod suffix follows), so we
+    prefix-match the worker_id against those names -- longest match wins, so a
+    name that is a prefix of another can't steal its pods. This is immune to the
+    63-char pod-name truncation that defeats the regex strip. Returns the model
+    for the matched deployment, else falls back to the regex-derived deployment
+    name (mapped or raw) so an unknown worker is still charted rather than
+    dropped. ``None`` only when ``worker_id`` is empty.
+    """
+
+    if not worker_id:
+        return None
+    best: str | None = None
+    for name in deployment_to_model:
+        if name and (worker_id == name or worker_id.startswith(name + "-")):
+            if best is None or len(name) > len(best):
+                best = name
+    if best is not None:
+        return deployment_to_model[best]
+    deployment = deployment_name_from_worker_id(worker_id)
+    return deployment_to_model.get(deployment or "", deployment)
 
 
 def _empty_model_counts() -> dict[str, int]:
@@ -760,8 +800,10 @@ def aggregate_generate_model_timeseries(
             direction = _diverging_direction(row.get("status"))
             if direction is None:
                 continue
-            deployment = deployment_name_from_worker_id(row.get("worker_id"))
-            model_id = deployment_to_model.get(deployment or "", deployment) or _UNKNOWN_MODEL
+            model_id = (
+                resolve_worker_model(row.get("worker_id"), deployment_to_model)
+                or _UNKNOWN_MODEL
+            )
             yield bucket, model_id, direction, int(row.get("n") or 0)
 
     return _fold_model_buckets(entries())
@@ -822,8 +864,7 @@ def build_task_generating_model_map(
         task_id = row.get("task_id")
         if not task_id:
             continue
-        deployment = deployment_name_from_worker_id(row.get("worker_id"))
-        model_id = deployment_to_model.get(deployment or "", deployment)
+        model_id = resolve_worker_model(row.get("worker_id"), deployment_to_model)
         if model_id:
             mapping[task_id] = model_id
     return mapping
@@ -837,6 +878,7 @@ def aggregate_pipeline_snapshot(
     *,
     now: datetime | None = None,
     activity_stale_after_seconds: float = ACTIVITY_STALE_AFTER_SECONDS,
+    timeseries_lookback_hours: int = 48,
     activity_count_rows: Iterable[dict[str, Any]] = (),
     time_bucket_rows: Iterable[dict[str, Any]] = (),
     generate_model_bucket_rows: Iterable[dict[str, Any]] = (),
@@ -1127,7 +1169,7 @@ def aggregate_pipeline_snapshot(
         },
         "stage_time_series": {
             "bucket_seconds": 900,
-            "lookback_hours": 48,
+            "lookback_hours": timeseries_lookback_hours,
             "stages": stage_time_series,
         },
         # Unified diverging per-model breakdown for ALL five stages. Every stage
@@ -1140,7 +1182,7 @@ def aggregate_pipeline_snapshot(
         # the failure total.
         "stage_model_timeseries": {
             "bucket_seconds": 900,
-            "lookback_hours": 48,
+            "lookback_hours": timeseries_lookback_hours,
             "stages": stage_model_timeseries,
         },
         "hourly_yield": {
@@ -1240,12 +1282,19 @@ def resolve_generate_models_from_deployments(
     """Map generate Deployment name -> model_id from deployment specs + secrets.
 
     ``deployment_items`` are Kubernetes Deployment objects (kubectl JSON items);
-    only those whose stage label is ``generate`` are considered. Each generate
-    worker's last ``envFrom`` entry is the ``swegen-model-credentials-*`` Secret
-    whose ``ANTHROPIC_MODEL`` value is the model_id; ``secret_models`` maps that
-    Secret name to its decoded ``ANTHROPIC_MODEL``. When the secret value is
-    unavailable, the deployment is left out of the map and the chart falls back
-    to labelling that series by its deployment name.
+    only those whose stage label is ``generate`` are considered. The static
+    generate workers deliver their model via the ``swegen-model-credentials-*``
+    Secret referenced in ``envFrom`` (whose ``ANTHROPIC_MODEL`` value is the
+    model_id); ``secret_models`` maps that Secret name to its decoded
+    ``ANTHROPIC_MODEL``. The dynamic endpoint deployments
+    (``swegen-generate-dyn-<slug>``) instead carry the model as an inline
+    container ``env`` entry ``{name: ANTHROPIC_MODEL, value: <model_id>}`` and
+    reference no such secret. Both sources are read here; when both are present
+    for one deployment the inline ``env`` value WINS (inline env overrides
+    ``envFrom`` at runtime in k8s, and it is the source of truth for the dynamic
+    pools). When NEITHER a secret model nor an inline value is available, the
+    deployment is left out of the map and the chart falls back to labelling that
+    series by its deployment name.
     """
 
     mapping: dict[str, str] = {}
@@ -1265,6 +1314,7 @@ def resolve_generate_models_from_deployments(
             continue
         pod_spec = spec.get("template", {}).get("spec", {})
         secret_name = None
+        inline_model: str | None = None
         for container in pod_spec.get("containers", []):
             for source in container.get("envFrom", []):
                 ref = source.get("secretRef") or {}
@@ -1275,9 +1325,16 @@ def resolve_generate_models_from_deployments(
                     # Last matching envFrom wins: envFrom later in the list
                     # overrides earlier sources, matching runtime precedence.
                     secret_name = ref_name
-        if secret_name is None:
-            continue
-        model_id = secret_models.get(secret_name)
+            for entry in container.get("env", []):
+                if entry.get("name") != "ANTHROPIC_MODEL":
+                    continue
+                value = entry.get("value")
+                if isinstance(value, str) and value:
+                    # Last inline entry wins, mirroring runtime env precedence.
+                    inline_model = value
+        secret_model = secret_models.get(secret_name) if secret_name else None
+        # Inline env overrides the secret-derived model when both exist.
+        model_id = inline_model or secret_model
         if model_id:
             mapping[name] = model_id
     return mapping
@@ -1384,7 +1441,21 @@ class PipelineStatusCollector:
             raise RuntimeError((completed.stderr or "kubectl failed")[:500])
         return json.loads(completed.stdout)
 
-    def collect(self) -> dict[str, Any]:
+    @staticmethod
+    def _sanitized_lookback(lookback_hours: object) -> int:
+        """Coerce the range-dropdown lookback to a positive int, else 48h.
+
+        The value flows into SQL only as a bound ``%s`` param, but validating
+        here keeps a bad or non-int argument from ever reaching the query.
+        """
+
+        if isinstance(lookback_hours, bool) or not isinstance(lookback_hours, int):
+            return 48
+        return lookback_hours if lookback_hours > 0 else 48
+
+    def collect(self, *, lookback_hours: int = 48) -> dict[str, Any]:
+        # The operator's range dropdown drives the stacked-bar timeseries window.
+        lookback_hours = self._sanitized_lookback(lookback_hours)
         with psycopg.connect(_database_dsn(), row_factory=dict_row) as connection:
             with connection.transaction():
                 connection.execute("SET LOCAL statement_timeout = '5s'")
@@ -1472,10 +1543,11 @@ class PipelineStatusCollector:
                             count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
                             count(*) FILTER (WHERE status <> 'succeeded') AS failed
                         FROM pipeline_stage_results
-                        WHERE finished_at >= now() - INTERVAL '48 hours'
+                        WHERE finished_at >= now() - make_interval(hours => %s)
                         GROUP BY stage, bucket
                         ORDER BY bucket, stage
-                        """
+                        """,
+                        (lookback_hours,),
                     ).fetchall()
                 )
                 # Per-worker generate buckets feed the diverging per-model chart.
@@ -1496,16 +1568,17 @@ class PipelineStatusCollector:
                             count(*) AS n
                         FROM pipeline_stage_results
                         WHERE stage = 'generate'
-                          AND finished_at >= now() - INTERVAL '48 hours'
+                          AND finished_at >= now() - make_interval(hours => %s)
                         GROUP BY bucket, worker_id, status
                         ORDER BY bucket, worker_id, status
-                        """
+                        """,
+                        (lookback_hours,),
                     ).fetchall()
                 )
                 # Downstream stages split by the GENERATING model of each task:
                 # task_id is carried so the fold can join to the generate-stage
-                # worker->model resolution below. Bucketed to 15 min over 48h to
-                # match the generate chart's window.
+                # worker->model resolution below. Bucketed to 15 min over the
+                # operator-selected lookback window to match the generate chart.
                 downstream_model_buckets = list(
                     connection.execute(
                         """
@@ -1521,15 +1594,16 @@ class PipelineStatusCollector:
                             count(*) AS n
                         FROM pipeline_stage_results
                         WHERE stage IN ('validate', 'repair', 'reward', 'push')
-                          AND finished_at >= now() - INTERVAL '48 hours'
+                          AND finished_at >= now() - make_interval(hours => %s)
                         GROUP BY bucket, task_id, stage, status
                         ORDER BY bucket, task_id, stage, status
-                        """
+                        """,
+                        (lookback_hours,),
                     ).fetchall()
                 )
                 # task_id -> generate worker_id, used to attribute each
                 # downstream result to its generating model. Bounded to the same
-                # 48h window; a task generated earlier resolves to "unknown".
+                # lookback window; a task generated earlier resolves to "unknown".
                 generate_task_models = list(
                     connection.execute(
                         """
@@ -1537,9 +1611,10 @@ class PipelineStatusCollector:
                         FROM pipeline_stage_results
                         WHERE stage = 'generate'
                           AND status = 'succeeded'
-                          AND finished_at >= now() - INTERVAL '48 hours'
+                          AND finished_at >= now() - make_interval(hours => %s)
                         ORDER BY task_id, finished_at DESC
-                        """
+                        """,
+                        (lookback_hours,),
                     ).fetchall()
                 )
                 hourly_yields = list(
@@ -1736,6 +1811,7 @@ class PipelineStatusCollector:
             results,
             activity,
             queues,
+            timeseries_lookback_hours=lookback_hours,
             activity_count_rows=activity_counts,
             time_bucket_rows=time_buckets,
             generate_model_bucket_rows=generate_model_buckets,

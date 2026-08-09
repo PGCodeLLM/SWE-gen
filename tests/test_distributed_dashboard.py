@@ -567,6 +567,44 @@ def test_deployment_name_from_worker_id_strips_replicaset_and_pod_hash() -> None
     assert deployment_name_from_worker_id("") is None
 
 
+def test_resolve_worker_model_handles_63_char_truncated_dynamic_pod_names() -> None:
+    from swegen.dashboard.distributed_status import resolve_worker_model
+
+    deployment_to_model = {
+        "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23": "deepseek-v4-flash",
+        "swegen-generate-dyn-glm-5-2-moedsa-7-244-3-251": "glm-5.2-moedsa",
+    }
+    # Real dynamic-pool pod names hit the 63-char cap: k8s truncates the tail so
+    # the "-<hash>-<rand>" suffix collapses into ONE dashless-in-the-middle blob
+    # (here "-54bfbb78785246"), which the regex strip leaves unchanged. The
+    # prefix match against the known deployment name still resolves the model.
+    truncated = "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23-54bfbb78785246"
+    assert len(truncated) == 63
+    assert resolve_worker_model(truncated, deployment_to_model) == "deepseek-v4-flash"
+    assert (
+        resolve_worker_model(
+            "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23-54bfbb7872dmwm",
+            deployment_to_model,
+        )
+        == "deepseek-v4-flash"
+    )
+    # A well-formed (short) pod name resolves too, via the same prefix match.
+    assert (
+        resolve_worker_model(
+            "swegen-generate-dyn-glm-5-2-moedsa-7-244-3-251-abc12",
+            deployment_to_model,
+        )
+        == "glm-5.2-moedsa"
+    )
+    # Longest-prefix wins so a deployment that is a prefix of another can't steal
+    # the other's pods.
+    d2m = {"swegen-gen": "short-model", "swegen-gen-big": "big-model"}
+    assert resolve_worker_model("swegen-gen-big-abc12-def34", d2m) == "big-model"
+    # Unknown worker still resolves to *something* (its derived name), not dropped.
+    assert resolve_worker_model("swegen-generate-9b75d9789-27tw2", {}) == "swegen-generate"
+    assert resolve_worker_model(None, deployment_to_model) is None
+
+
 def test_aggregate_generate_model_timeseries_folds_worker_to_model_up_and_down() -> None:
     from swegen.dashboard.distributed_status import aggregate_generate_model_timeseries
 
@@ -794,6 +832,113 @@ def test_resolve_generate_models_from_deployments_reads_last_model_secret() -> N
     # chart falls back to its deployment-name label.
     partial = resolve_generate_models_from_deployments(items, {})
     assert partial == {}
+
+
+def test_resolve_generate_models_from_deployments_reads_inline_env_for_dynamic() -> None:
+    from swegen.dashboard.distributed_status import (
+        resolve_generate_models_from_deployments,
+    )
+
+    # A dynamic endpoint deployment (swegen-generate-dyn-<slug>) delivers the
+    # model as INLINE container env, with NO swegen-model-credentials-* envFrom.
+    dyn = {
+        "kind": "Deployment",
+        "metadata": {
+            "name": "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23",
+            "labels": {"swegen.pgcode/stage": "generate"},
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "worker",
+                            "envFrom": [
+                                {"configMapRef": {"name": "swegen-pipeline-config"}},
+                                {"secretRef": {"name": "swegen-database"}},
+                            ],
+                            "env": [
+                                {"name": "ANTHROPIC_BASE_URL", "value": "http://1.95.77.23"},
+                                {"name": "ANTHROPIC_MODEL", "value": "deepseek-v4-flash"},
+                            ],
+                        }
+                    ]
+                }
+            }
+        },
+    }
+
+    # No secret_models are available for a dynamic deployment; the inline env is
+    # the source of truth and must still resolve.
+    mapping = resolve_generate_models_from_deployments([dyn], {})
+    assert mapping == {
+        "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23": "deepseek-v4-flash"
+    }
+
+
+def test_resolve_generate_models_from_deployments_inline_env_wins_over_secret() -> None:
+    from swegen.dashboard.distributed_status import (
+        resolve_generate_models_from_deployments,
+    )
+
+    # A single deployment carrying BOTH a model-credential secret and an inline
+    # ANTHROPIC_MODEL env. Inline env overrides envFrom at runtime, so the inline
+    # value must win.
+    item = {
+        "kind": "Deployment",
+        "metadata": {
+            "name": "swegen-generate-conflict",
+            "labels": {"swegen.pgcode/stage": "generate"},
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "worker",
+                            "envFrom": [
+                                {
+                                    "secretRef": {
+                                        "name": "swegen-model-credentials-secret-model-20260807"
+                                    }
+                                },
+                            ],
+                            "env": [
+                                {"name": "ANTHROPIC_MODEL", "value": "inline-model"},
+                            ],
+                        }
+                    ]
+                }
+            }
+        },
+    }
+
+    mapping = resolve_generate_models_from_deployments(
+        [item],
+        {"swegen-model-credentials-secret-model-20260807": "secret-model"},
+    )
+    assert mapping == {"swegen-generate-conflict": "inline-model"}
+
+
+def test_aggregate_generate_model_timeseries_keys_dynamic_series_by_model() -> None:
+    from swegen.dashboard.distributed_status import aggregate_generate_model_timeseries
+
+    bucket = datetime(2026, 8, 7, 10, 0, tzinfo=UTC)
+    # A dynamic-endpoint worker pod. Its worker_id strips the <replicaset-hash>-
+    # <pod-hash> suffix down to the dyn deployment name, which the map resolves
+    # to the model; the resulting by_model key must be the MODEL, not the
+    # deployment name.
+    worker_id = "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23-54bfbb7878-5246k"
+    deployment = "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23"
+    result = aggregate_generate_model_timeseries(
+        [{"bucket": bucket, "worker_id": worker_id, "status": "succeeded", "n": 4}],
+        {deployment: "deepseek-v4-flash"},
+    )
+    assert result["models"] == ["deepseek-v4-flash"]
+    by_model = result["buckets"][0]["by_model"]
+    assert set(by_model) == {"deepseek-v4-flash"}
+    assert deployment not in by_model
+    assert by_model["deepseek-v4-flash"] == {"succeeded": 4, "failed": 0, "rejected": 0}
 
 
 def test_summarize_swr_push_sync_computes_registry_counts_and_out_of_sync_ids() -> None:
@@ -1828,3 +1973,99 @@ def test_k3s_collector_counts_running_endpoint_pods_by_label() -> None:
 
     out = K3sStatusCollector(runner=runner).collect()
     assert out["generate_endpoint_pods"] == {"m1-alpha": 2, "m2-beta": 1}
+
+
+def test_aggregate_snapshot_reports_the_selected_timeseries_lookback() -> None:
+    from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
+
+    snapshot = aggregate_pipeline_snapshot(
+        [], [], [], [], now=NOW, timeseries_lookback_hours=72
+    )
+    assert snapshot["stage_time_series"]["lookback_hours"] == 72
+    assert snapshot["stage_model_timeseries"]["lookback_hours"] == 72
+    # The hourly-yield window is deliberately left at its own 12h scope; the
+    # range dropdown only governs the stacked-bar timeseries.
+    assert snapshot["hourly_yield"]["lookback_hours"] == 12
+
+
+class _RecordingResult:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self._rows
+
+    def fetchone(self) -> dict[str, object] | None:
+        return self._rows[0] if self._rows else None
+
+
+class _RecordingConnection:
+    """Minimal psycopg stand-in that records every (sql, params) pair."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, object]] = []
+
+    def __enter__(self) -> _RecordingConnection:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def transaction(self) -> _RecordingConnection:
+        return self
+
+    def execute(self, sql: str, params: object = None) -> _RecordingResult:
+        self.executed.append((sql, params))
+        # to_regclass() probes must report "table absent" so the optional
+        # sections degrade cleanly and the collect() path stays exercised.
+        if "to_regclass" in sql:
+            return _RecordingResult([{"relation": None}])
+        return _RecordingResult([])
+
+
+def test_collect_threads_lookback_hours_into_the_timeseries_sql_and_snapshot(
+    monkeypatch,
+) -> None:
+    from swegen.dashboard import distributed_status
+    from swegen.dashboard.distributed_status import PipelineStatusCollector
+
+    connection = _RecordingConnection()
+    monkeypatch.setattr(distributed_status, "_database_dsn", lambda: "dsn")
+    monkeypatch.setattr(
+        distributed_status.psycopg, "connect", lambda *a, **k: connection
+    )
+    monkeypatch.setattr(
+        distributed_status, "_fetch_instance_universe_total", lambda: None
+    )
+    monkeypatch.setattr(
+        PipelineStatusCollector, "_resolve_generate_models", lambda self: {}
+    )
+
+    snapshot = PipelineStatusCollector().collect(lookback_hours=72)
+
+    # Every timeseries query binds 72 as a positional %s param via make_interval,
+    # never string-interpolated, and the fixed 48h literal is gone.
+    timeseries = [
+        (sql, params)
+        for sql, params in connection.executed
+        if "make_interval(hours =>" in sql
+    ]
+    assert len(timeseries) == 4
+    for sql, params in timeseries:
+        assert params == (72,)
+        assert "INTERVAL '48 hours'" not in sql
+    # The snapshot reports the chosen lookback for both stacked-bar sections.
+    assert snapshot["stage_time_series"]["lookback_hours"] == 72
+    assert snapshot["stage_model_timeseries"]["lookback_hours"] == 72
+    # The hourly-yield window keeps its independent 12h scope.
+    assert snapshot["hourly_yield"]["lookback_hours"] == 12
+
+
+def test_collect_rejects_a_non_positive_or_non_int_lookback() -> None:
+    from swegen.dashboard.distributed_status import PipelineStatusCollector
+
+    # A bad lookback can only reach collect() through validated code, but defend
+    # in depth: non-int / non-positive values fall back to the 48h default.
+    for bad in (0, -5, True, "72", None):
+        assert PipelineStatusCollector._sanitized_lookback(bad) == 48
+    assert PipelineStatusCollector._sanitized_lookback(72) == 72
