@@ -63,7 +63,7 @@ spec:
         swegen.pgcode/node-ip: 7.244.3.200
       containers:
         - name: controller
-          image: swegen-worker:github-clone-auth-20260807
+          image: swegen-worker:endpoint-controller-20260807
           imagePullPolicy: Never
           command: ["python", "-m", "swegen.pipeline.generate_endpoint_controller"]
           envFrom:
@@ -71,11 +71,27 @@ spec:
                 name: swegen-pipeline-config
             - secretRef:
                 name: swegen-database
-            # Egress to the registered model endpoints for the health probe goes
-            # through the same corporate proxy the workers use.
+            # Egress to EXTERNAL registered model endpoints (public IPs) for the
+            # health probe goes through the same corporate proxy the workers use.
+            # INTERNAL endpoints (7.244.x) must bypass it -- see no_proxy below.
             - secretRef:
                 name: swegen-runtime-proxy
           env:
+            # The probe honours the no-proxy list per-host, exactly like the
+            # generate workers: internal cluster endpoints (7.244.x) go direct
+            # (the corporate proxy 504s them), external ones go through the proxy.
+            # urllib reads no_proxy/NO_PROXY, so map them from SWEGEN_NO_PROXY
+            # (the controller code also seeds these defensively at startup).
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
             - name: SWEGEN_ENDPOINT_NAMESPACE
               value: swegen-pipeline
             - name: SWEGEN_ENDPOINT_POLL_SECONDS
@@ -84,8 +100,10 @@ spec:
               value: "20"
             # Consecutive unhealthy probes (504/429/5xx/unreachable) before the
             # per-endpoint breaker latches and its Deployment is scaled to zero.
+            # 15 probes x 20s poll ~= 5 minutes of sustained failure, so a brief
+            # endpoint blip no longer trips the breaker -- only a real outage does.
             - name: SWEGEN_ENDPOINT_TRIP_THRESHOLD
-              value: "3"
+              value: "15"
           resources:
             requests:
               cpu: 20m

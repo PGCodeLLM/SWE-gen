@@ -184,6 +184,29 @@ class ProbeResult:
     ok: bool
     status: int | None
     detail: str
+    # Full, copyable, multi-line error text for a failed probe: the request line,
+    # the HTTP status, the probed URL, and (on an HTTPError) the response body.
+    # Empty on success. Kept separate from ``detail`` (the terse one-line summary
+    # used in DB trip reasons) and defaulted so existing callers/tests still work.
+    error_text: str = ""
+
+
+def _seed_no_proxy_from_swegen() -> None:
+    """Populate no_proxy/NO_PROXY from SWEGEN_NO_PROXY if the standard vars are unset.
+
+    The pod carries the no-proxy host list only under SWEGEN_NO_PROXY (a
+    configMap key); urllib's proxy-bypass logic reads no_proxy/NO_PROXY. Seeding
+    the standard vars lets a default opener route internal endpoints direct and
+    external ones through the proxy. A no-op when SWEGEN_NO_PROXY is empty or a
+    standard var is already set (the deploy manifest maps no_proxy explicitly).
+    """
+
+    swegen_no_proxy = os.environ.get("SWEGEN_NO_PROXY", "").strip()
+    if not swegen_no_proxy:
+        return
+    for name in ("no_proxy", "NO_PROXY"):
+        if not os.environ.get(name):
+            os.environ[name] = swegen_no_proxy
 
 
 class EndpointProber(Protocol):
@@ -195,6 +218,21 @@ class HttpEndpointProber:
 
     def __init__(self, *, timeout_seconds: float = 20.0) -> None:
         self._timeout = timeout_seconds
+        # Registered endpoints are a MIX of hosts: internal ones (e.g. 7.244.x on
+        # the cluster network) are reachable ONLY directly and 504 through the
+        # corporate proxy, while external ones (public IPs) are reachable ONLY
+        # through the proxy the controller pod inherits via swegen-runtime-proxy.
+        # So the probe must honour the no_proxy list per-host, exactly like the
+        # generate workers reaching the same endpoints -- an unconditional proxy
+        # (or unconditional bypass) falsely trips one side or the other.
+        #
+        # urllib's proxy bypass reads the standard no_proxy/NO_PROXY env, but the
+        # pod only carries SWEGEN_NO_PROXY (a configMap key); seed the standard
+        # var from it so a default build_opener() (which installs
+        # ProxyHandler(getproxies()) and checks proxy_bypass per request) routes
+        # internal->direct and external->proxy. The deploy manifest also maps
+        # no_proxy for the same reason; this is a defensive fallback.
+        _seed_no_proxy_from_swegen()
         self._opener = urllib.request.build_opener()
 
     def probe(self, base_url: str, model_id: str, token: str) -> ProbeResult:
@@ -225,11 +263,49 @@ class HttpEndpointProber:
             # A 4xx that is not 429 (e.g. 400/401) means the endpoint is
             # reachable and answering; only 429 + 5xx count as unhealthy.
             healthy = error.code not in DEFAULT_UNHEALTHY_STATUSES
-            return ProbeResult(ok=healthy, status=error.code, detail=f"http {error.code}")
+            try:
+                body = error.read().decode("utf-8", "replace")[:4000]
+            except Exception:
+                body = ""
+            error_text = self._redact(
+                f"POST {url} -> HTTP {error.code}\n{body}".rstrip(), token
+            )
+            return ProbeResult(
+                ok=healthy,
+                status=error.code,
+                detail=f"http {error.code}",
+                error_text="" if healthy else error_text,
+            )
         except urllib.error.URLError as error:
-            return ProbeResult(ok=False, status=None, detail=f"unreachable: {error.reason}")
+            error_text = self._redact(f"POST {url} -> unreachable: {error.reason}", token)
+            return ProbeResult(
+                ok=False,
+                status=None,
+                detail=f"unreachable: {error.reason}",
+                error_text=error_text,
+            )
         except TimeoutError:
-            return ProbeResult(ok=False, status=None, detail="timeout")
+            error_text = self._redact(
+                f"POST {url} -> timeout after {self._timeout:g}s", token
+            )
+            return ProbeResult(
+                ok=False, status=None, detail="timeout", error_text=error_text
+            )
+
+    @staticmethod
+    def _redact(text: str, token: str) -> str:
+        """Scrub the probe token and known secret patterns from captured text.
+
+        The URL and response body should not contain the bearer token, but this
+        defensively removes any literal occurrence of it (and applies the repo's
+        standard secret redaction) before the text is surfaced to an operator.
+        """
+
+        from swegen.create.claude_code_utils import redact_sensitive_text
+
+        if token:
+            text = text.replace(token, "<REDACTED>")
+        return redact_sensitive_text(text)
 
 
 # --------------------------------------------------------------------------- #

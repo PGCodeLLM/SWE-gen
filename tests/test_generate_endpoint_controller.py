@@ -6,6 +6,7 @@ contract, and the probe -> latch flow with fake k8s/DB/prober collaborators.
 """
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 
 from swegen.pipeline.generate_endpoint_controller import (
@@ -259,3 +260,167 @@ def test_reconcile_breaker_open_endpoint_is_scaled_to_zero_not_probed():
     reconcile_once(conn, manager, prober, _TEMPLATE, now=lambda: NOW)
     assert prober.probes == 0                       # open endpoints are not probed
     assert ("scale", "dead", 0) in manager.calls    # driven to zero
+
+
+# --------------------------------------------------------------------------- #
+# HttpEndpointProber: captured error_text is full, copyable, and token-redacted
+# --------------------------------------------------------------------------- #
+
+
+class _FakeHTTPError(Exception):
+    """Stand-in for urllib.error.HTTPError with a readable body."""
+
+    def __init__(self, code, body):
+        self.code = code
+        self._body = body.encode("utf-8")
+
+    def read(self):
+        return self._body
+
+
+def _prober_with_opener(opener):
+    from swegen.pipeline.generate_endpoint_controller import HttpEndpointProber
+
+    prober = HttpEndpointProber(timeout_seconds=5)
+    prober._opener = opener
+    return prober
+
+
+def test_prober_seeds_no_proxy_from_swegen_and_honours_it_per_host(monkeypatch):
+    """The prober must proxy external endpoints but bypass internal ones.
+
+    Registered endpoints are mixed: internal cluster hosts (7.244.x) are
+    reachable ONLY directly (the corporate proxy 504s them), while external
+    public IPs are reachable ONLY through the proxy. An unconditional proxy (or
+    unconditional bypass) falsely trips one side, so the probe must honour the
+    no-proxy list per-host -- exactly like the generate workers. The pod carries
+    the list only as SWEGEN_NO_PROXY, so the prober seeds no_proxy/NO_PROXY from
+    it and a default opener then routes internal->direct, external->proxy.
+    """
+
+    import urllib.request
+
+    from swegen.pipeline.generate_endpoint_controller import HttpEndpointProber
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    # Internal 7.244.3.251 is in the list; external 1.95.77.23 is NOT.
+    monkeypatch.setenv(
+        "SWEGEN_NO_PROXY", ".huawei.com,127.0.0.1,localhost,7.244.3.251,10.*"
+    )
+
+    prober = HttpEndpointProber(timeout_seconds=5)
+
+    # The prober seeded the standard vars from SWEGEN_NO_PROXY so urllib can see them.
+    assert os.environ["no_proxy"] == ".huawei.com,127.0.0.1,localhost,7.244.3.251,10.*"
+    assert os.environ["NO_PROXY"]
+
+    # The opener still carries the env proxy (external hosts must use it)...
+    proxy_maps = [
+        h.proxies
+        for h in prober._opener.handlers
+        if isinstance(h, urllib.request.ProxyHandler)
+    ]
+    assert proxy_maps and any(m.get("http") for m in proxy_maps), (
+        "prober must retain the env proxy for external endpoints"
+    )
+    # ...but the no-proxy list bypasses the proxy for the internal host and NOT
+    # for the external one (urllib's own per-host bypass decision).
+    proxies = {"http": "http://proxy.example:8080", "no": os.environ["no_proxy"]}
+    assert urllib.request.proxy_bypass_environment("7.244.3.251:8088", proxies)
+    assert not urllib.request.proxy_bypass_environment("1.95.77.23:3000", proxies)
+
+
+def test_prober_does_not_clobber_preset_no_proxy(monkeypatch):
+    """Seeding is a fallback: an already-set no_proxy (from the manifest) wins."""
+
+    from swegen.pipeline.generate_endpoint_controller import HttpEndpointProber
+
+    monkeypatch.setenv("SWEGEN_NO_PROXY", "7.244.3.251")
+    monkeypatch.setenv("no_proxy", "preset.example,10.*")
+    monkeypatch.setenv("NO_PROXY", "preset.example,10.*")
+
+    HttpEndpointProber(timeout_seconds=5)
+
+    assert os.environ["no_proxy"] == "preset.example,10.*"
+    assert os.environ["NO_PROXY"] == "preset.example,10.*"
+
+
+def test_prober_http_5xx_captures_status_body_and_url_in_error_text(monkeypatch):
+    import urllib.error
+
+    from swegen.pipeline import generate_endpoint_controller as ctrl
+
+    # Route our _FakeHTTPError through the real HTTPError except branch.
+    monkeypatch.setattr(urllib.error, "HTTPError", _FakeHTTPError)
+
+    class _Opener:
+        def open(self, request, timeout):
+            raise _FakeHTTPError(504, "<html>upstream gateway timeout</html>")
+
+    result = _prober_with_opener(_Opener()).probe(
+        "http://host:8088", "some-model", "SECRET-BEARER-TOKEN"
+    )
+    assert result.ok is False
+    assert result.status == 504
+    assert result.detail == "http 504"
+    # Full, multi-line, copyable text: request line + status + body + URL.
+    assert "POST http://host:8088/v1/messages -> HTTP 504" in result.error_text
+    assert "upstream gateway timeout" in result.error_text
+    assert "\n" in result.error_text
+    # The bearer token is never present in the captured error text.
+    assert "SECRET-BEARER-TOKEN" not in result.error_text
+    # Silence unused-import lint on ctrl (module referenced for clarity).
+    assert ctrl.DEFAULT_UNHEALTHY_STATUSES
+
+
+def test_prober_http_4xx_is_healthy_and_carries_no_error_text(monkeypatch):
+    import urllib.error
+
+    monkeypatch.setattr(urllib.error, "HTTPError", _FakeHTTPError)
+
+    class _Opener:
+        def open(self, request, timeout):
+            raise _FakeHTTPError(401, "unauthorized")
+
+    result = _prober_with_opener(_Opener()).probe(
+        "http://host:8088", "m", "SECRET-BEARER-TOKEN"
+    )
+    # A non-unhealthy 4xx means the endpoint is reachable -> healthy, no error box.
+    assert result.ok is True
+    assert result.status == 401
+    assert result.error_text == ""
+
+
+def test_prober_unreachable_captures_reason_and_url():
+    import urllib.error
+
+    class _Opener:
+        def open(self, request, timeout):
+            raise urllib.error.URLError("Connection refused")
+
+    result = _prober_with_opener(_Opener()).probe(
+        "http://host:8088", "m", "SECRET-BEARER-TOKEN"
+    )
+    assert result.ok is False
+    assert result.status is None
+    assert "unreachable" in result.detail
+    assert "http://host:8088/v1/messages" in result.error_text
+    assert "Connection refused" in result.error_text
+    assert "SECRET-BEARER-TOKEN" not in result.error_text
+
+
+def test_prober_timeout_captures_timeout_and_url():
+    class _Opener:
+        def open(self, request, timeout):
+            raise TimeoutError()
+
+    result = _prober_with_opener(_Opener()).probe(
+        "http://host:8088", "m", "SECRET-BEARER-TOKEN"
+    )
+    assert result.ok is False
+    assert result.detail == "timeout"
+    assert "timeout after 5s" in result.error_text
+    assert "http://host:8088/v1/messages" in result.error_text
