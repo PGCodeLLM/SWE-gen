@@ -325,7 +325,7 @@ spec:
               swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:repaired-priority-20260804
+          image: swegen-worker:openai-timeout-600-20260808
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
@@ -664,7 +664,7 @@ spec:
               swegen.pgcode/stage: repair
       containers:
         - name: worker
-          image: swegen-worker:buildkit-intermediates-20260802-1424
+          image: swegen-worker:openai-timeout-600-20260808
           imagePullPolicy: Never
           args: ["--stage", "repair"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
