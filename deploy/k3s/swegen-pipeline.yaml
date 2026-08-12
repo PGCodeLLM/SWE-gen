@@ -128,7 +128,7 @@ spec:
               swegen.pgcode/stage: generate
       containers:
         - name: worker
-          image: swegen-worker:openai-timeout-600-20260808
+          image: swegen-worker:e2e
           imagePullPolicy: Never
           args: ["--stage", "generate"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
@@ -325,7 +325,7 @@ spec:
               swegen.pgcode/stage: validate
       containers:
         - name: worker
-          image: swegen-worker:openai-timeout-600-20260808
+          image: swegen-worker:e2e
           imagePullPolicy: Never
           args: ["--stage", "validate"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
@@ -664,7 +664,7 @@ spec:
               swegen.pgcode/stage: repair
       containers:
         - name: worker
-          image: swegen-worker:openai-timeout-600-20260808
+          image: swegen-worker:e2e
           imagePullPolicy: Never
           args: ["--stage", "repair"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
@@ -840,7 +840,7 @@ spec:
               swegen.pgcode/stage: reward
       containers:
         - name: worker
-          image: swegen-worker:openai-timeout-600-20260808
+          image: swegen-worker:e2e
           imagePullPolicy: Never
           args: ["--stage", "reward"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
@@ -981,7 +981,7 @@ spec:
               swegen.pgcode/stage: push
       containers:
         - name: worker
-          image: swegen-worker:openai-timeout-600-20260808
+          image: swegen-worker:e2e
           imagePullPolicy: Never
           args: ["--stage", "push"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
