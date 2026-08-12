@@ -840,7 +840,7 @@ spec:
               swegen.pgcode/stage: reward
       containers:
         - name: worker
-          image: swegen-worker:proxy-noproxy-fix-20260801-0356
+          image: swegen-worker:openai-timeout-600-20260808
           imagePullPolicy: Never
           args: ["--stage", "reward"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
@@ -981,7 +981,7 @@ spec:
               swegen.pgcode/stage: push
       containers:
         - name: worker
-          image: swegen-worker:push-remote-digest-fix-20260802-1507
+          image: swegen-worker:openai-timeout-600-20260808
           imagePullPolicy: Never
           args: ["--stage", "push"]
           # Corruption can delete /app (the image WORKDIR); the OCI runtime
