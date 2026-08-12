@@ -57,7 +57,7 @@ WITH latest_push AS (
       AND task.state = 'failed'
       AND task.current_stage = 'push'
       -- Narrow to last 24h where we know these are transient
-      AND result.finished_at > now() - interval '24 hours'
+      AND result.finished_at > now() - interval '12 hours'
     ORDER BY result.task_id, result.task_version,
              result.attempt DESC, result.finished_at DESC
 )
