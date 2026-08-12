@@ -639,24 +639,21 @@ def _seconds(later: datetime, earlier: datetime) -> float:
     return max(0.0, round((later - earlier).total_seconds(), 3))
 
 
+# Only the five fields the dashboard's Timeline column actually renders. The
+# per-stage view used to carry 16 keys (attempt/deliveries/queued_at/started_at/
+# finished_at/heartbeat_at/queued_seconds/heartbeat_age_seconds/stale/node_name/
+# error); at 5 stages x 100 recent tasks that was ~245 KB of the ~590 KB status
+# payload and not one of those keys was ever read by the front-end. Anything
+# needed for deeper forensics is a direct query against pipeline_stage_results /
+# pipeline_stage_activity, which hold the same values without shipping them to
+# every browser on every 5s poll.
 def _empty_stage(stage: str) -> dict[str, Any]:
     return {
         "stage": stage,
         "state": "not_started",
-        "attempt": None,
-        "deliveries": None,
-        "queued_at": None,
-        "started_at": None,
-        "finished_at": None,
-        "heartbeat_at": None,
-        "queued_seconds": None,
         "wait_seconds": None,
         "run_seconds": None,
-        "heartbeat_age_seconds": None,
-        "stale": False,
         "worker_id": None,
-        "node_name": None,
-        "error": None,
     }
 
 
@@ -880,7 +877,6 @@ def aggregate_pipeline_snapshot(
     activity_stale_after_seconds: float = ACTIVITY_STALE_AFTER_SECONDS,
     timeseries_lookback_hours: int = 48,
     activity_count_rows: Iterable[dict[str, Any]] = (),
-    time_bucket_rows: Iterable[dict[str, Any]] = (),
     generate_model_bucket_rows: Iterable[dict[str, Any]] = (),
     generate_deployment_to_model: dict[str, str] | None = None,
     downstream_model_bucket_rows: Iterable[dict[str, Any]] = (),
@@ -932,45 +928,22 @@ def aggregate_pipeline_snapshot(
                 finished_at = result["finished_at"]
                 view.update(
                     state=result["status"],
-                    attempt=result["attempt"],
-                    deliveries=result["pgmq_read_count"],
-                    queued_at=_iso(queued_at),
-                    started_at=_iso(started_at),
-                    finished_at=_iso(finished_at),
-                    queued_seconds=0.0,
                     wait_seconds=_seconds(started_at, queued_at),
                     run_seconds=_seconds(finished_at, started_at),
                     worker_id=result["worker_id"],
-                    node_name=result["node_name"],
-                    error=result.get("error"),
                 )
                 if result["status"] == "succeeded":
                     predecessor_finished = finished_at
             elif activity is not None:
                 started_at = activity["started_at"]
-                heartbeat_at = activity["heartbeat_at"]
-                heartbeat_age = _seconds(now, heartbeat_at)
                 view.update(
                     state="running",
-                    attempt=activity["attempt"],
-                    deliveries=activity["pgmq_read_count"],
-                    queued_at=_iso(queued_at),
-                    started_at=_iso(started_at),
-                    heartbeat_at=_iso(heartbeat_at),
-                    queued_seconds=0.0,
                     wait_seconds=_seconds(started_at, queued_at),
                     run_seconds=_seconds(now, started_at),
-                    heartbeat_age_seconds=heartbeat_age,
-                    stale=heartbeat_age > activity_stale_after_seconds,
                     worker_id=activity["worker_id"],
-                    node_name=activity["node_name"],
                 )
             elif task["current_stage"] == stage and task["state"] in {"queued", "running"}:
-                view.update(
-                    state="queued",
-                    queued_at=_iso(queued_at),
-                    queued_seconds=_seconds(now, queued_at),
-                )
+                view.update(state="queued")
             stage_views.append(view)
 
         end = task.get("finished_at") or now
@@ -984,34 +957,29 @@ def aggregate_pipeline_snapshot(
             f"/data/swegen-k3s/workspaces/generate-{message_component}-*/tasks/{task['task_id']}"
         )
         generate_running = "generate" in stage_activity
+        # Only what the Recent tasks table renders. Dropped here because nothing
+        # reads them: repo, pr, trace_id, created_at, updated_at, finished_at,
+        # last_error, last_reason, and the constant storage.durable_source /
+        # runtime_path_is_exact / durability strings. last_error alone was ~48 KB
+        # per response (full tracebacks x 100 tasks) for a column the UI does not
+        # have. These are all still one query away in pipeline_tasks.
         task_views.append(
             {
                 "task_id": task["task_id"],
                 "task_version": task["task_version"],
-                "repo": task["repo"],
-                "pr": task["pr"],
-                "trace_id": str(task["trace_id"]),
                 "state": task["state"],
                 "current_stage": task["current_stage"],
-                "created_at": _iso(task["created_at"]),
-                "updated_at": _iso(task["updated_at"]),
-                "finished_at": _iso(task.get("finished_at")),
                 "total_elapsed_seconds": _seconds(end, task["created_at"]),
-                "last_error": task.get("last_error"),
-                "last_reason": task.get("last_reason"),
                 "storage": {
-                    "durable_source": ("PostgreSQL swegen_distributed.public.pipeline_task_files"),
                     "stored_file_count": int(task.get("stored_file_count") or 0),
                     "stored_bytes": int(task.get("stored_bytes") or 0),
                     "generated_on_node": generate_node,
                     "runtime_path_pattern": runtime_pattern,
-                    "runtime_path_is_exact": False,
                     "runtime_directory_state": (
                         "temporary directory may currently exist"
                         if generate_running
                         else "temporary directory is removed after stage completion"
                     ),
-                    "durability": "persistent hostPath backing (node-local, not replicated)",
                 },
                 "stages": stage_views,
             }
@@ -1065,20 +1033,6 @@ def aggregate_pipeline_snapshot(
 
     by_state = Counter(task["state"] for task in tasks)
     by_stage = Counter(task["current_stage"] for task in tasks)
-    stage_time_series = {stage: [] for stage in STAGES}
-    for row in time_bucket_rows:
-        stage = row.get("stage")
-        if stage not in stage_time_series:
-            continue
-        stage_time_series[stage].append(
-            {
-                "bucket": _iso(row["bucket"]),
-                "succeeded": int(row.get("succeeded") or 0),
-                "failed": int(row.get("failed") or 0),
-            }
-        )
-    for rows in stage_time_series.values():
-        rows.sort(key=lambda row: row["bucket"] or "")
     # Unified diverging per-model breakdown for every stage. Generate splits by
     # its own worker's model; the four downstream stages split by the model that
     # GENERATED each task (joined via task_id -> generate worker -> model).
@@ -1166,11 +1120,6 @@ def aggregate_pipeline_snapshot(
         "activity": {
             "stale_after_seconds": activity_stale_after_seconds,
             "stages": activity_counts,
-        },
-        "stage_time_series": {
-            "bucket_seconds": 900,
-            "lookback_hours": timeseries_lookback_hours,
-            "stages": stage_time_series,
         },
         # Unified diverging per-model breakdown for ALL five stages. Every stage
         # card stacks success upward and failure downward, coloured by model_id.
@@ -1463,9 +1412,12 @@ class PipelineStatusCollector:
                 tasks = list(
                     connection.execute(
                         """
-                        SELECT t.task_id, t.task_version, t.repo, t.pr, t.trace_id, t.state,
-                               t.current_stage, t.created_at, t.updated_at, t.finished_at,
-                               t.last_error, t.last_reason,
+                        -- Only the columns the snapshot emits. repo/pr/trace_id/
+                        -- last_error/last_reason are deliberately not selected:
+                        -- nothing renders them, and last_error carries full
+                        -- tracebacks that dominated the response body.
+                        SELECT t.task_id, t.task_version, t.state,
+                               t.current_stage, t.created_at, t.finished_at,
                                (
                                    SELECT count(*)
                                    FROM pipeline_task_files f
@@ -1530,26 +1482,6 @@ class PipelineStatusCollector:
                     ).fetchall()
                 )
                 queues = list(connection.execute("SELECT * FROM pgmq.metrics_all()").fetchall())
-                time_buckets = list(
-                    connection.execute(
-                        """
-                        SELECT
-                            stage,
-                            date_bin(
-                                INTERVAL '15 minutes',
-                                finished_at,
-                                TIMESTAMPTZ '2001-01-01 00:00:00+00'
-                            ) AS bucket,
-                            count(*) FILTER (WHERE status = 'succeeded') AS succeeded,
-                            count(*) FILTER (WHERE status <> 'succeeded') AS failed
-                        FROM pipeline_stage_results
-                        WHERE finished_at >= now() - make_interval(hours => %s)
-                        GROUP BY stage, bucket
-                        ORDER BY bucket, stage
-                        """,
-                        (lookback_hours,),
-                    ).fetchall()
-                )
                 # Per-worker generate buckets feed the diverging per-model chart.
                 # worker_id resolves to a deployment and then a model_id in
                 # Python; keeping the split here means the SQL stays a plain
@@ -1813,7 +1745,6 @@ class PipelineStatusCollector:
             queues,
             timeseries_lookback_hours=lookback_hours,
             activity_count_rows=activity_counts,
-            time_bucket_rows=time_buckets,
             generate_model_bucket_rows=generate_model_buckets,
             generate_deployment_to_model=generate_deployment_to_model,
             downstream_model_bucket_rows=downstream_model_buckets,

@@ -203,38 +203,29 @@ def test_aggregate_pipeline_snapshot_builds_queue_task_and_stage_timing() -> Non
     assert first["task_id"] == "owner__repo-1"
     assert first["total_elapsed_seconds"] == 480.0
     stages = {stage["stage"]: stage for stage in first["stages"]}
-    assert stages["generate"] | {} == {
+    # The stage view carries only the five fields the dashboard's Timeline column
+    # renders. attempt/deliveries/queued_at/started_at/finished_at/heartbeat_at/
+    # queued_seconds/heartbeat_age_seconds/stale/node_name/error were dropped: at
+    # 5 stages x 100 tasks they were ~245KB of a ~590KB payload and no front-end
+    # code read any of them.
+    assert stages["generate"] == {
         "stage": "generate",
         "state": "succeeded",
-        "attempt": 1,
-        "deliveries": 2,
-        "queued_at": (NOW - timedelta(minutes=8)).isoformat(),
-        "started_at": (NOW - timedelta(minutes=7)).isoformat(),
-        "finished_at": (NOW - timedelta(minutes=5)).isoformat(),
-        "heartbeat_at": None,
-        "queued_seconds": 0.0,
         "wait_seconds": 60.0,
         "run_seconds": 120.0,
-        "heartbeat_age_seconds": None,
-        "stale": False,
         "worker_id": "generate-pod",
-        "node_name": "node-generate",
-        "error": None,
     }
     assert stages["validate"]["wait_seconds"] == 60.0
     assert stages["validate"]["run_seconds"] == 60.0
     assert stages["reward"]["state"] == "running"
     assert stages["reward"]["wait_seconds"] == 60.0
     assert stages["reward"]["run_seconds"] == 120.0
-    assert stages["reward"]["heartbeat_age_seconds"] == 30.0
-    assert stages["reward"]["stale"] is False
     assert stages["push"]["state"] == "not_started"
 
     second = snapshot["tasks"][1]
     assert second["task_id"] == "owner__repo-2"
     generate = second["stages"][0]
     assert generate["state"] == "queued"
-    assert generate["queued_seconds"] == 60.0
     assert generate["wait_seconds"] is None
     assert generate["run_seconds"] is None
 
@@ -328,8 +319,84 @@ def test_aggregate_pipeline_snapshot_computes_completion_windows_and_stale_activ
         "instances_per_second": round(1 / 900, 6),
     }
     reward = next(stage for stage in snapshot["tasks"][0]["stages"] if stage["stage"] == "reward")
-    assert reward["heartbeat_age_seconds"] == 120.0
-    assert reward["stale"] is True
+    assert reward["state"] == "running"
+
+
+def test_task_views_carry_only_the_fields_the_dashboard_renders() -> None:
+    """The tasks section is the payload's biggest line item, so it stays minimal.
+
+    At a 100-task limit the old task view shipped ~345KB per response: full
+    tracebacks in ``last_error``, plus 11 unread per-stage timing fields across 5
+    stages. Nothing in the front-end read any of them. This pins the emitted key
+    sets so a new field is added deliberately rather than by accident.
+    """
+
+    from swegen.dashboard.distributed_status import aggregate_pipeline_snapshot
+
+    task_rows = [
+        {
+            "task_id": "owner__repo-1",
+            "task_version": 1,
+            "state": "queued",
+            "current_stage": "generate",
+            "created_at": NOW - timedelta(minutes=8),
+            "finished_at": None,
+            "stored_file_count": 3,
+            "stored_bytes": 4096,
+        }
+    ]
+    snapshot = aggregate_pipeline_snapshot(task_rows, [], [], [], now=NOW)
+    task = snapshot["tasks"][0]
+
+    # Exactly what the Recent tasks table renders: identity, state, elapsed, the
+    # storage cell, and the per-stage timeline.
+    assert set(task) == {
+        "task_id",
+        "task_version",
+        "state",
+        "current_stage",
+        "total_elapsed_seconds",
+        "storage",
+        "stages",
+    }
+    # Dropped because nothing read them; last_error carried whole tracebacks.
+    for dropped in ("repo", "pr", "trace_id", "created_at", "updated_at", "last_error"):
+        assert dropped not in task
+
+    assert set(task["storage"]) == {
+        "stored_file_count",
+        "stored_bytes",
+        "generated_on_node",
+        "runtime_path_pattern",
+        "runtime_directory_state",
+    }
+    # The constant strings the UI never showed are gone.
+    for dropped in ("durable_source", "runtime_path_is_exact", "durability"):
+        assert dropped not in task["storage"]
+
+    for stage_view in task["stages"]:
+        assert set(stage_view) == {
+            "stage",
+            "state",
+            "wait_seconds",
+            "run_seconds",
+            "worker_id",
+        }
+
+
+def test_task_query_selects_only_the_columns_the_snapshot_emits() -> None:
+    # The trim reaches the SQL too: the dropped columns are never fetched, so the
+    # saving lands on the database round-trip as well as the JSON body.
+    import inspect
+
+    from swegen.dashboard.distributed_status import PipelineStatusCollector
+
+    source = inspect.getsource(PipelineStatusCollector.collect)
+    task_query = source.split("FROM pipeline_tasks t", 1)[0]
+    for dropped in ("t.repo", "t.pr", "t.trace_id", "t.last_error", "t.last_reason"):
+        assert dropped not in task_query
+    for kept in ("t.task_id", "t.task_version", "t.state", "t.current_stage"):
+        assert kept in task_query
 
 
 def test_aggregate_pipeline_snapshot_separates_fresh_and_stale_global_activity() -> None:
@@ -411,14 +478,6 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
         [],
         [],
         now=NOW,
-        time_bucket_rows=[
-            {
-                "stage": "validate",
-                "bucket": NOW - timedelta(minutes=15),
-                "succeeded": 7,
-                "failed": 2,
-            }
-        ],
         hourly_yield_rows=[
             {
                 "stage": "validate",
@@ -455,16 +514,7 @@ def test_aggregate_pipeline_snapshot_exposes_15_minute_stage_outcomes() -> None:
         remote_build_tracking_available=True,
     )
 
-    assert snapshot["stage_time_series"]["bucket_seconds"] == 900
-    assert snapshot["stage_time_series"]["lookback_hours"] == 48
-    assert snapshot["stage_time_series"]["stages"]["validate"] == [
-        {
-            "bucket": (NOW - timedelta(minutes=15)).isoformat(),
-            "succeeded": 7,
-            "failed": 2,
-        }
-    ]
-    assert snapshot["stage_time_series"]["stages"]["generate"] == []
+    assert "stage_time_series" not in snapshot
     assert snapshot["hourly_yield"]["stages"]["validate"] == [
         {
             "bucket": (NOW - timedelta(hours=1)).isoformat(),
@@ -1981,7 +2031,6 @@ def test_aggregate_snapshot_reports_the_selected_timeseries_lookback() -> None:
     snapshot = aggregate_pipeline_snapshot(
         [], [], [], [], now=NOW, timeseries_lookback_hours=72
     )
-    assert snapshot["stage_time_series"]["lookback_hours"] == 72
     assert snapshot["stage_model_timeseries"]["lookback_hours"] == 72
     # The hourly-yield window is deliberately left at its own 12h scope; the
     # range dropdown only governs the stacked-bar timeseries.
@@ -2050,13 +2099,13 @@ def test_collect_threads_lookback_hours_into_the_timeseries_sql_and_snapshot(
         for sql, params in connection.executed
         if "make_interval(hours =>" in sql
     ]
-    assert len(timeseries) == 4
+    assert len(timeseries) == 3
     for sql, params in timeseries:
         assert params == (72,)
         assert "INTERVAL '48 hours'" not in sql
-    # The snapshot reports the chosen lookback for both stacked-bar sections.
-    assert snapshot["stage_time_series"]["lookback_hours"] == 72
+    # The snapshot reports the chosen lookback for the per-model stacked bars.
     assert snapshot["stage_model_timeseries"]["lookback_hours"] == 72
+    assert "stage_time_series" not in snapshot
     # The hourly-yield window keeps its independent 12h scope.
     assert snapshot["hourly_yield"]["lookback_hours"] == 12
 

@@ -218,7 +218,10 @@ def test_chart_refresh_preserves_a_user_selected_scroll_position() -> None:
     assert evaluate_chart_scroll_target({"left": 0, "followLatest": False}, 417) == 0
     assert evaluate_chart_scroll_target(saved, 100) == 100
     assert "hasOwnProperty.call(uiState.chartScroll,stage)" in HTML
-    assert "uiState.chartScroll[stage]=chartScrollSnapshot(chart)" in HTML
+    # The surviving diverging chart keys its scroll state by the per-stage
+    # scrollKey (`${stage}-model`), set on both the scroll listener and restore.
+    assert "uiState.chartScroll[scrollKey]=chartScrollSnapshot(chart)" in HTML
+    assert "restoreChartScroll(chart,scrollKey)" in HTML
     assert "chart.dataset.restoringScroll!=='true'" in HTML
 
 
@@ -263,8 +266,12 @@ def test_chart_tooltip_appears_immediately_and_hides_on_leave() -> None:
         "hiddenAfterLeave": True,
     }
     assert "bucket.title=" not in HTML
-    assert "bucket.addEventListener('mouseenter'" in HTML
-    assert "bucket.addEventListener('mousemove',positionChartTooltip)" in HTML
+    # The bucket element is named `cell` in the diverging renderer; the hover
+    # handlers read the tooltip off the bucket record so an in-place update can
+    # refresh the text without rebinding listeners.
+    assert "cell.addEventListener('mouseenter'" in HTML
+    assert "cell.addEventListener('mousemove',positionChartTooltip)" in HTML
+    assert "showChartTooltip(event,record.tooltip,record.tooltipNodes)" in HTML
     # Newlines must render as line breaks: the tooltip CSS uses pre, not nowrap.
     assert "white-space:pre}.chart-tooltip[hidden]" in HTML
     assert "white-space:nowrap}.chart-tooltip" not in HTML
@@ -279,10 +286,10 @@ def test_chart_axes_show_counts_and_compact_timestamp_ticks() -> None:
     assert tick_every == 6
     assert compact_count == "12.5k"
     assert re.fullmatch(r"\d{2}:\d{2}", timestamp)
-    assert "chart.className='chart'" in HTML
+    assert "chart.className='chart chart-diverging'" in HTML
     assert "yAxis.className='chart-y-axis'" in HTML
     assert "xTick.className='x-tick'" in HTML
-    assert "compactChartTimestamp(row.bucket)" in HTML
+    assert "compactChartTimestamp(bucket.t)" in HTML
     assert ".x-tick::before{" in HTML
 
 
@@ -295,7 +302,7 @@ def test_chart_timestamp_density_responds_to_available_width() -> None:
     assert narrow == 6
     assert wide == 2
     assert compact_count == "1.3m"
-    assert "new ResizeObserver(()=>updateChartTicks(chart))" in HTML
+    assert "new ResizeObserver(()=>{updateChartTicks(chart);rescaleVisible(chart)})" in HTML
     assert "index!==0&&index!==ticks.length-1" in HTML
 
 
@@ -413,7 +420,8 @@ def test_top_stage_cards_display_lifetime_processed_count() -> None:
     from swegen.dashboard.server import HTML
 
     assert "pg.throughput?.lifetime_processed?.[stage]" in HTML
-    assert "lifetime processed <b>${lifetime}</b>" in HTML
+    # The stat text is built by stageStatLines so a poll can rewrite it in place.
+    assert "lifetime:`lifetime processed ${lifetime}`" in HTML
 
 
 def evaluate_instance_coverage(count: object, total: object) -> str:
@@ -442,7 +450,7 @@ def test_top_stage_cards_render_unique_instance_coverage_fraction() -> None:
     # section and renders a "<count> / <total> (<pct>%)" fraction.
     assert "pg.instance_coverage||{}" in HTML
     assert "cov.unique_instances_processed?.[stage]||0" in HTML
-    assert "unique iids <b>${formatInstanceCoverage(unique,universe)}</b>" in HTML
+    assert "unique:`unique iids ${formatInstanceCoverage(unique,universe)}`" in HTML
 
 
 def test_instance_coverage_fraction_formats_count_total_and_percent() -> None:
@@ -497,7 +505,7 @@ def render_diverging_model_chart(stage_data: object, stage: str = "generate") ->
         )
     )
     renderer = re.search(
-        r"function rescaleVisible\(chart\)\{.*?\n(?=function stageTimeSeries)",
+        r"function rescaleVisible\(chart\)\{.*?\n(?=function validateQueueLine)",
         HTML,
         re.S,
     )
@@ -550,7 +558,7 @@ def capture_diverging_tooltip_nodes(stage_data: object) -> dict[str, object]:
         )
     )
     renderer = re.search(
-        r"function rescaleVisible\(chart\)\{.*?\n(?=function stageTimeSeries)",
+        r"function rescaleVisible\(chart\)\{.*?\n(?=function validateQueueLine)",
         HTML,
         re.S,
     )
@@ -753,7 +761,8 @@ def test_rescale_visible_scales_to_only_the_visible_bucket_subset() -> None:
     # Per-bucket totals + segments are stored on the chart so rescale never
     # re-reads DOM text.
     assert "chart._buckets=cellData" in HTML
-    assert "cellData.push({cell,up,down,upBar,downBar,upSegs,downSegs})" in HTML
+    assert "cellData.push(record)" in HTML
+    assert "const record={cell,up,down,upBar:null,downBar:null,upSegs:[],downSegs:[]" in HTML
 
 
 def test_rescale_visible_scales_the_up_and_down_halves_independently() -> None:
@@ -816,7 +825,7 @@ def _diverging_legend_colors_program(renders: list[dict[str, object]]) -> str:
         )
     )
     renderer = re.search(
-        r"function rescaleVisible\(chart\)\{.*?\n(?=function stageTimeSeries)",
+        r"function rescaleVisible\(chart\)\{.*?\n(?=function validateQueueLine)",
         HTML,
         re.S,
     )
@@ -1028,6 +1037,247 @@ def test_generate_model_chart_renders_empty_state_without_models() -> None:
     assert rendered["up"] == [] and rendered["down"] == []
 
 
+def _diverging_chart_program(body: str) -> str:
+    """The chart renderer + updater under the shared DOM stub, plus `body`."""
+
+    from swegen.dashboard.server import HTML
+
+    consts = "".join(
+        re.search(re.escape(prefix) + r".*?;\n", HTML).group(0)
+        for prefix in (
+            "const MODEL_PALETTE=",
+            "const modelColorIndex=",
+            "const modelColor=",
+            "const compactChartCount=",
+            "const compactChartTimestamp=",
+        )
+    )
+    renderer = re.search(
+        r"function rescaleVisible\(chart\)\{.*?\n(?=function validateQueueLine)",
+        HTML,
+        re.S,
+    )
+    assert renderer is not None
+    return _DOM_STUB + consts + renderer.group(0) + body
+
+
+def update_diverging_chart(
+    first: object,
+    second: object,
+    stage: str = "generate",
+) -> dict[str, object]:
+    """Render a chart, then refresh it with `second` via updateDivergingChart.
+
+    Returns whether the same wrap/cell/segment object identities survived the
+    refresh (the anti-flash invariant) alongside the updated values, so a test can
+    prove the DOM was mutated rather than rebuilt.
+    """
+
+    program = _diverging_chart_program(
+        f"const first={json.dumps(first)};const second={json.dumps(second)};"
+        + f"const stage={json.dumps(stage)};"
+        + r"""
+const wrap=divergingModelTimeSeries(first,stage,48);
+const chart=wrap._chart;
+const cellsBefore=chart._buckets.map(r=>r.cell);
+const upSegsBefore=chart._buckets.map(r=>r.upSegs.map(s=>s.seg));
+const next=updateDivergingChart(wrap,second,stage,48);
+const sameWrap=next===wrap;
+const sameChart=next._chart===chart;
+const sameCells=chart._buckets.every((r,i)=>r.cell===cellsBefore[i]);
+const sameSegs=chart._buckets.every((r,i)=>r.upSegs.every((s,j)=>s.seg===upSegsBefore[i][j]));
+/* Read the state off the RESULTING chart: identical to the original when updated
+in place, and the freshly built one when the shape changed. */
+const out=next._chart,recs=out._buckets;
+process.stdout.write(JSON.stringify({
+  sameWrap,sameChart,sameCells,sameSegs,
+  ups:recs.map(r=>r.up),
+  downs:recs.map(r=>r.down),
+  upSegValues:recs.map(r=>r.upSegs.map(s=>s.value)),
+  upSegColors:recs.map(r=>r.upSegs.map(s=>s.seg.style.background)),
+  tooltips:recs.map(r=>r.tooltip),
+  ariaLabels:recs.map(r=>r.cell.attrs['aria-label']),
+  rejectedHidden:recs.map(r=>r.rejectedMarker.hidden),
+  ticks:[...out._yAxis.children].map(t=>t.textContent),
+}));
+"""
+    )
+    completed = run(["node", "-e", program], check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
+def _bucket(timestamp: str, counts: dict[str, dict[str, int]]) -> dict[str, object]:
+    return {"t": timestamp, "by_model": counts}
+
+
+def test_chart_refresh_mutates_the_existing_dom_instead_of_rebuilding_it() -> None:
+    """The anti-flash invariant: a same-shape poll reuses every chart node.
+
+    Tearing the chart down and re-creating it on each 5s poll is what made the
+    stacked bars visibly flash and transiently paint other models' colours. With
+    the bucket count and model set unchanged, the refresh must mutate the existing
+    wrap/cells/segments in place and keep the same object identities.
+    """
+
+    models = ["glm-5.2-pretrain-v1", "deepseek-v4-flash"]
+    first = {
+        "models": models,
+        "buckets": [
+            _bucket(
+                "2026-08-07T10:00:00Z",
+                {
+                    "glm-5.2-pretrain-v1": {"succeeded": 10, "failed": 2, "rejected": 0},
+                    "deepseek-v4-flash": {"succeeded": 4, "failed": 6, "rejected": 0},
+                },
+            )
+        ],
+    }
+    # Same bucket count, same model set, new counts -> in-place update.
+    second = {
+        "models": models,
+        "buckets": [
+            _bucket(
+                "2026-08-07T10:00:00Z",
+                {
+                    "glm-5.2-pretrain-v1": {"succeeded": 30, "failed": 5, "rejected": 0},
+                    "deepseek-v4-flash": {"succeeded": 6, "failed": 9, "rejected": 0},
+                },
+            )
+        ],
+    }
+    result = update_diverging_chart(first, second)
+
+    # Not one node was replaced.
+    assert result["sameWrap"] is True
+    assert result["sameChart"] is True
+    assert result["sameCells"] is True
+    assert result["sameSegs"] is True
+    # The numbers did update, in place.
+    assert result["ups"] == [36]
+    assert result["downs"] == [14]
+    assert result["upSegValues"] == [[30, 6]]
+    # Model colours are unchanged by the refresh (two distinct palette entries).
+    palette = _model_palette()
+    colors = result["upSegColors"][0]
+    assert all(c in palette for c in colors)
+    assert len(set(colors)) == 2
+    # The y-axis ticks were rescaled from the new totals by rescaleVisible.
+    assert result["ticks"] == ["36", "0", "-14"]
+    # Tooltips (and their aria-labels) were refreshed in place too.
+    assert "glm-5.2-pretrain-v1: 30|5" in result["tooltips"][0]
+    assert result["ariaLabels"][0] == result["tooltips"][0]
+
+
+def test_chart_refresh_rebuilds_only_when_the_bucket_count_or_models_change() -> None:
+    """A shape change is the one case that still needs a fresh chart."""
+
+    models = ["glm-5.2-pretrain-v1"]
+    counts = {"glm-5.2-pretrain-v1": {"succeeded": 5, "failed": 1, "rejected": 0}}
+    one_bucket = {"models": models, "buckets": [_bucket("2026-08-07T10:00:00Z", counts)]}
+    # A new 15m bucket rolls in -> bucket count changed -> rebuild.
+    two_buckets = {
+        "models": models,
+        "buckets": [
+            _bucket("2026-08-07T10:00:00Z", counts),
+            _bucket("2026-08-07T10:15:00Z", counts),
+        ],
+    }
+    grew = update_diverging_chart(one_bucket, two_buckets)
+    assert grew["sameWrap"] is False
+    assert grew["ups"] == [5, 5]
+
+    # A new model appears -> model set changed -> rebuild.
+    more_models = {
+        "models": [*models, "deepseek-v4-flash"],
+        "buckets": [
+            _bucket(
+                "2026-08-07T10:00:00Z",
+                {**counts, "deepseek-v4-flash": {"succeeded": 3, "failed": 0, "rejected": 0}},
+            )
+        ],
+    }
+    remodelled = update_diverging_chart(one_bucket, more_models)
+    assert remodelled["sameWrap"] is False
+    assert remodelled["upSegValues"] == [[5, 3]]
+
+
+def test_chart_refresh_toggles_the_rejected_marker_without_rebuilding() -> None:
+    # The rejected marker is always present and toggled via `hidden`, so a bucket
+    # gaining or losing rejections never adds/removes a node mid-paint.
+    models = ["glm-5.2-pretrain-v1"]
+    without = {
+        "models": models,
+        "buckets": [
+            _bucket(
+                "2026-08-07T10:00:00Z",
+                {"glm-5.2-pretrain-v1": {"succeeded": 5, "failed": 1, "rejected": 0}},
+            )
+        ],
+    }
+    with_rejected = {
+        "models": models,
+        "buckets": [
+            _bucket(
+                "2026-08-07T10:00:00Z",
+                {"glm-5.2-pretrain-v1": {"succeeded": 5, "failed": 1, "rejected": 4}},
+            )
+        ],
+    }
+    appeared = update_diverging_chart(without, with_rejected)
+    assert appeared["sameWrap"] is True
+    assert appeared["rejectedHidden"] == [False]
+    assert appeared["tooltips"][0].endswith("glm-5.2-pretrain-v1: 5|1|4")
+
+    disappeared = update_diverging_chart(with_rejected, without)
+    assert disappeared["sameWrap"] is True
+    assert disappeared["rejectedHidden"] == [True]
+
+
+def test_stage_flow_updates_cards_in_place_without_wiping_the_container() -> None:
+    from swegen.dashboard.server import HTML
+
+    # The stages container is populated once and then left alone: renderStageFlow
+    # must not open with a bare replaceChildren() that destroys every card (and
+    # its charts) on every poll.
+    assert "const flow=el('stages');flow.replaceChildren();" not in HTML
+    # Cached cards live on uiState and are refreshed in place on later polls.
+    assert "const cards=uiState.stageCards" in HTML
+    assert "if(cards&&flow.firstChild)" in HTML
+    assert "stages.forEach(stage=>updateStageCard(cards[stage],stage,pg,k,maxReplicas))" in HTML
+    assert "function updateStageCard(card,stage,pg,k,maxReplicas)" in HTML
+    # The in-place path rewrites the stat text and delegates chart/yield refresh
+    # to their own updaters rather than re-creating the card.
+    assert "applyStageStatLines(card,stageStatLines(stage,pg,k))" in HTML
+    assert "function updateDivergingChart(wrap,stageData,stage,rangeHours)" in HTML
+    assert "function updateStageHourlyYield(wrap,rows,stage)" in HTML
+    # A chart/yield node is only swapped when its shape actually changed.
+    assert "if(nextChart!==card._chartWrap)" in HTML
+    assert "if(nextYield!==card._yieldWrap)" in HTML
+
+
+def test_poll_loop_is_self_scheduling_and_never_overlaps() -> None:
+    from swegen.dashboard.server import HTML
+
+    # setInterval fired every 5s regardless of whether the previous request had
+    # returned; with 4-7s responses that queued overlapping requests and
+    # compounded the latency. The loop now re-arms only after a response settles.
+    # No setInterval call survives (the only mention left is the comment
+    # explaining why it was replaced, so match the call form).
+    assert "setInterval(" not in HTML.replace("setInterval(poll,5000) fired", "")
+    assert "setTimeout(pollLoop,POLL_INTERVAL_MS)" in HTML
+    assert "async function pollLoop(){await poll();scheduleNextPoll()}" in HTML
+    # A guard flag makes a re-entrant poll a no-op, so a slow response can never
+    # stack a second in-flight fetch.
+    assert "if(uiState.polling)return;uiState.polling=true" in HTML
+    assert "finally{uiState.polling=false}" in HTML
+    # Boot goes through the loop, not a bare poll + interval pair.
+    assert "\npollLoop();\n" in HTML
+    # The cadence is measured from response completion, so the stamp no longer
+    # promises a fixed 5s refresh.
+    assert "refreshes every 5s" not in HTML
+    assert "refreshes ${POLL_INTERVAL_MS/1000}s after each response" in HTML
+
+
 def render_stage_hourly_yield(rows: object, stage: str = "generate") -> dict[str, object]:
     from swegen.dashboard.server import HTML
 
@@ -1104,7 +1354,7 @@ def test_top_stage_cards_separate_fresh_activity_from_queue_leases() -> None:
     from swegen.dashboard.server import HTML
 
     assert "pg.activity?.stages?.[stage]" in HTML
-    assert "active <b>${a.fresh||0}</b>" in HTML
+    assert "· active ${a.fresh||0}" in HTML
     assert "leased ${q.in_flight||0}" in HTML
     assert "stale ${stale}" in HTML
 
@@ -1125,9 +1375,9 @@ def test_validator_card_shows_repaired_and_brand_new_queue_totals_and_leases() -
 def test_top_stage_cards_show_pod_phases_instead_of_a_ready_fraction() -> None:
     from swegen.dashboard.server import HTML
 
-    assert '<div class="big">${w.pod_phases?.Running||0} Running</div>' in HTML
+    assert "running:`${w.pod_phases?.Running||0} Running`" in HTML
     assert "formatPodPhases(w.pod_phases,w.evicted||0)" in HTML
-    assert "desired <b>${w.desired||0}</b>" in HTML
+    assert "queueSummary:`desired ${w.desired||0}" in HTML
     assert "${w.ready||0}/${w.desired||0} ready" not in HTML
     assert "w.pods_ready" not in HTML
 
@@ -1161,9 +1411,10 @@ def test_validation_and_repair_share_a_visual_retry_group_without_arrows() -> No
 def test_top_stage_flow_keeps_reward_after_the_validation_group() -> None:
     from swegen.dashboard.server import HTML
 
-    assert "flow.append(stageCard('generate',pg,k,maxReplicas,true)" in HTML
-    assert "validationLoop,stageCard('reward',pg,k,maxReplicas,true)" in HTML
-    assert "stageCard('push',pg,k,maxReplicas,true))" in HTML
+    assert "stageCard('generate',pg,k,maxReplicas,true)" in HTML
+    assert "flow.replaceChildren(built.generate,validationLoop,built.reward,built.push)" in HTML
+    assert "validationLoop.append(groupTitle,built.validate,built.repair)" in HTML
+    assert "stageCard('push',pg,k,maxReplicas,true)" in HTML
 
 
 def test_all_five_stage_cards_use_the_three_column_horizontal_layout() -> None:
@@ -1197,9 +1448,9 @@ def test_nested_validation_stage_cards_preserve_metrics_and_controls() -> None:
     from swegen.dashboard.server import HTML
 
     assert "function stageCard(stage,pg,k,maxReplicas,horizontalChart=false)" in HTML
-    assert "stats.append(scaleControls(stage,w.desired||0,maxReplicas))" in HTML
-    assert "5m success <b>${t.succeeded||0}</b>" in HTML
-    assert "lifetime processed <b>${lifetime}</b>" in HTML
+    assert "stats.append(scaleControls(stage,lines.desired,maxReplicas))" in HTML
+    assert "throughput:`5m success ${t.succeeded||0}" in HTML
+    assert "lifetime:`lifetime processed ${lifetime}`" in HTML
 
 
 def test_stage_scaling_buttons_use_the_compact_apply_label() -> None:
@@ -1244,7 +1495,7 @@ def test_stage_charts_are_embedded_with_the_requested_placements() -> None:
     assert ".stage-card-horizontal .stage-chart-wrap{border-left:1px solid var(--line)" in HTML
     assert ".stage-card{display:flex;flex-direction:column;padding:11px}" in HTML
     assert ".validation-loop{" in HTML and "align-content:stretch" in HTML
-    assert "15m outcomes · last 48h" in HTML
+    assert "15m outcomes by model · last ${hours}h" in HTML
 
 
 def test_stage_charts_grow_without_centering_margins() -> None:
@@ -1255,7 +1506,7 @@ def test_stage_charts_grow_without_centering_margins() -> None:
     assert ".stage-card:not(.stage-card-horizontal) .stage-chart-row .stage-chart-wrap{flex:1}" in HTML
     assert ".chart-frame{min-width:0;min-height:112px;flex:1" in HTML
     assert ".chart{min-height:112px;min-width:0" in HTML
-    assert "bar.style.height=`${Math.max(2,total/max*100)}%`" in HTML
+    assert "upBar.style.height=`${Math.min(100,up/upMax*100)}%`" in HTML
     assert "justify-content:center;padding:11px" not in HTML
 
 
