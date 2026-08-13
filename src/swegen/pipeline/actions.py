@@ -59,6 +59,13 @@ DEFAULT_SWR_HOST = "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com"
 DEFAULT_SWR_REPOSITORY = "swesandbox/public/swe-gen/feature-implementation/generated"
 DEFAULT_SWR_REGISTRY = "platform"
 DEFAULT_SWR_SUFFIX = "_platform"
+# Trajectory registry for dual-push sync. The repository path differs from the
+# platform one: every trajectory image ever published lives under
+# aifm.coder.exp/swegen/generated (see push_all_verified.DEFAULT_REGISTRIES).
+TRAJECTORY_SWR_HOST = "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com"
+TRAJECTORY_SWR_REPOSITORY = "aifm.coder.exp/swegen/generated"
+TRAJECTORY_SWR_REGISTRY = "trajectory"
+TRAJECTORY_SWR_SUFFIX = ""
 _PROXY_ENVIRONMENT_NAMES = (
     "http_proxy",
     "https_proxy",
@@ -705,8 +712,9 @@ def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
 
 
 def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
-    """Build and publish a task image to the configured SWR target."""
+    """Build and publish a task image to both platform and trajectory SWR registries."""
 
+    # Primary registry (platform by default)
     host = _environment_value("SWEGEN_SWR_HOST", DEFAULT_SWR_HOST).strip("/")
     repository = _environment_value(
         "SWEGEN_SWR_REPOSITORY",
@@ -714,9 +722,17 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
     ).strip("/")
     registry = _environment_value("SWEGEN_SWR_REGISTRY", DEFAULT_SWR_REGISTRY)
     suffix = _environment_value("SWEGEN_SWR_SUFFIX", DEFAULT_SWR_SUFFIX)
+
+    # Secondary registry (trajectory) for sync
+    trajectory_host = TRAJECTORY_SWR_HOST.strip("/")
+    trajectory_repository = TRAJECTORY_SWR_REPOSITORY.strip("/")
+    trajectory_registry = TRAJECTORY_SWR_REGISTRY
+    trajectory_suffix = TRAJECTORY_SWR_SUFFIX
+
     remote_tag = f"{host}/{repository}:{task.task_id}"
+    trajectory_remote_tag = f"{trajectory_host}/{trajectory_repository}:{task.task_id}"
     expected_local_tag = local_image_tag(task.task_id)
-    cleanup_tags = [expected_local_tag, remote_tag]
+    cleanup_tags = [expected_local_tag, remote_tag, trajectory_remote_tag]
     try:
         task_dir = workspace / "tasks" / task.task_id
         if not task_dir.is_dir():
@@ -736,26 +752,64 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
         if remote_build_tag is not None:
             if remote_build_tag not in cleanup_tags:
                 cleanup_tags.insert(1, remote_build_tag)
+            # Remote buildkit pushed to primary; sync that image to trajectory too.
+            trajectory_success = False
+            if not image_exists_in_registry(trajectory_remote_tag):
+                try:
+                    trajectory_success = push_to_registry(
+                        remote_build_tag, trajectory_remote_tag, log=LOGGER.info
+                    )
+                    if trajectory_success:
+                        LOGGER.info(
+                            "Synced remote-built %s to trajectory registry", task.task_id
+                        )
+                    else:
+                        LOGGER.warning(
+                            "Failed to sync remote-built %s to trajectory (non-fatal)",
+                            task.task_id,
+                        )
+                except Exception as error:
+                    LOGGER.warning(
+                        "trajectory sync of remote-built %s failed (non-fatal): %s",
+                        task.task_id,
+                        _compact_safe_text(error),
+                    )
+            else:
+                trajectory_success = True
             return StageExecution.succeeded(
                 {
                     "remote_tag": remote_build_tag,
+                    "trajectory_remote_tag": trajectory_remote_tag,
                     "registry": registry,
                     "suffix": suffix,
+                    "trajectory_registry": trajectory_registry,
+                    "trajectory_suffix": trajectory_suffix,
                     "skipped": True,
                     "already_present": True,
                     "remote_buildkit": True,
+                    "synced_to_trajectory": trajectory_success,
                 }
             )
         if image_exists_in_registry(remote_tag):
-            return StageExecution.succeeded(
-                {
-                    "remote_tag": remote_tag,
-                    "registry": registry,
-                    "suffix": suffix,
-                    "skipped": True,
-                    "already_present": True,
-                }
-            )
+            # Primary exists, check if trajectory also exists
+            trajectory_exists = image_exists_in_registry(trajectory_remote_tag)
+            if trajectory_exists:
+                return StageExecution.succeeded(
+                    {
+                        "remote_tag": remote_tag,
+                        "trajectory_remote_tag": trajectory_remote_tag,
+                        "registry": registry,
+                        "suffix": suffix,
+                        "trajectory_registry": trajectory_registry,
+                        "trajectory_suffix": trajectory_suffix,
+                        "skipped": True,
+                        "already_present": True,
+                        "synced_to_trajectory": True,
+                    }
+                )
+            # Primary exists but trajectory missing - still need to build and push to trajectory
+            LOGGER.info("Primary registry has %s, but trajectory missing - will sync", remote_tag)
+
         proxy_environment = {
             name: value for name in _PROXY_ENVIRONMENT_NAMES if (value := os.environ.get(name, ""))
         }
@@ -769,15 +823,37 @@ def push_action(task: PipelineTask, workspace: Path) -> StageExecution:
             raise RuntimeError(f"image build failed for {task.task_id}")
         if built_tag not in cleanup_tags:
             cleanup_tags.insert(1, built_tag)
+
+        # Push to primary registry
         if not push_to_registry(built_tag, remote_tag, log=LOGGER.info):
-            raise RuntimeError(f"image push failed for {task.task_id}")
+            raise RuntimeError(f"image push to primary registry failed for {task.task_id}")
+
+        # Push to trajectory registry for sync
+        trajectory_success = False
+        try:
+            trajectory_success = push_to_registry(built_tag, trajectory_remote_tag, log=LOGGER.info)
+            if trajectory_success:
+                LOGGER.info("Successfully synced %s to trajectory registry", task.task_id)
+            else:
+                LOGGER.warning("Failed to sync %s to trajectory registry (non-fatal)", task.task_id)
+        except Exception as error:
+            LOGGER.warning(
+                "trajectory registry sync failed for %s (non-fatal): %s",
+                task.task_id,
+                _compact_safe_text(error),
+            )
+
         return StageExecution.succeeded(
             {
                 "remote_tag": remote_tag,
+                "trajectory_remote_tag": trajectory_remote_tag,
                 "registry": registry,
                 "suffix": suffix,
+                "trajectory_registry": trajectory_registry,
+                "trajectory_suffix": trajectory_suffix,
                 "skipped": False,
                 "already_present": False,
+                "synced_to_trajectory": trajectory_success,
             }
         )
     finally:

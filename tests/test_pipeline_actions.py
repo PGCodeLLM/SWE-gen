@@ -36,6 +36,18 @@ _ACTION_ENVIRONMENT_NAMES = (
     "ANTHROPIC_API_KEY",
 )
 
+# Push publishes every task image to two registries: the primary (platform by
+# default, overridable via SWEGEN_SWR_*) and the trajectory registry, whose
+# coordinates are fixed module constants and therefore unaffected by env.
+_PLATFORM_REMOTE_TAG = (
+    "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
+    "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
+)
+_TRAJECTORY_REMOTE_TAG = (
+    "swr-coder-data-trajectory-o84wch.swr-pro.myhuaweicloud.com/"
+    "aifm.coder.exp/swegen/generated:owner__repo-42"
+)
+
 
 @pytest.fixture(autouse=True)
 def clear_pipeline_action_environment(monkeypatch) -> None:
@@ -919,20 +931,26 @@ def test_push_action_skips_build_when_remote_manifest_exists(
 
     execution = actions.push_action(task, tmp_path)
 
-    remote_tag = (
-        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
-        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
-    )
-    assert checked == [remote_tag]
+    # Both registries already hold the image, so nothing is rebuilt and the
+    # trajectory copy is reported as already in sync.
+    assert checked == [_PLATFORM_REMOTE_TAG, _TRAJECTORY_REMOTE_TAG]
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json() == {
-        "remote_tag": remote_tag,
+        "remote_tag": _PLATFORM_REMOTE_TAG,
+        "trajectory_remote_tag": _TRAJECTORY_REMOTE_TAG,
         "registry": "platform",
         "suffix": "_platform",
+        "trajectory_registry": "trajectory",
+        "trajectory_suffix": "",
         "skipped": True,
         "already_present": True,
+        "synced_to_trajectory": True,
     }
-    assert removed == [actions.local_image_tag(task.task_id), remote_tag]
+    assert removed == [
+        actions.local_image_tag(task.task_id),
+        _PLATFORM_REMOTE_TAG,
+        _TRAJECTORY_REMOTE_TAG,
+    ]
 
 
 def test_push_action_builds_pushes_and_removes_local_image(
@@ -985,15 +1003,24 @@ def test_push_action_builds_pushes_and_removes_local_image(
     execution = actions.push_action(task, tmp_path)
 
     remote_tag = "registry.example/team/generated:owner__repo-42"
-    assert pushed == [("local-source:latest", remote_tag)]
-    assert removed == ["local-source:latest", remote_tag]
+    # The primary registry honours SWEGEN_SWR_*; the trajectory copy is pushed
+    # from the same local image to fixed coordinates, primary first.
+    assert pushed == [
+        ("local-source:latest", remote_tag),
+        ("local-source:latest", _TRAJECTORY_REMOTE_TAG),
+    ]
+    assert removed == ["local-source:latest", remote_tag, _TRAJECTORY_REMOTE_TAG]
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json() == {
         "remote_tag": remote_tag,
+        "trajectory_remote_tag": _TRAJECTORY_REMOTE_TAG,
         "registry": "custom",
         "suffix": "_custom",
+        "trajectory_registry": "trajectory",
+        "trajectory_suffix": "",
         "skipped": False,
         "already_present": False,
+        "synced_to_trajectory": True,
     }
 
 
@@ -1033,34 +1060,52 @@ def test_push_action_skips_when_exact_remote_buildkit_image_is_already_pushed(
         "_remote_buildkit_image_for_push",
         remote_image,
     )
-    monkeypatch.setattr(
-        actions,
-        "image_exists_in_registry",
-        lambda tag: pytest.fail("task-ID manifest lookup must be skipped"),
-    )
+    # Knowing the exact remote-built image must skip the PRIMARY task-ID manifest
+    # lookup. Probing the trajectory registry is a different question (does the
+    # sync copy exist?) and is allowed; here it already does, so nothing is pushed.
+    existence_checks: list[str] = []
+
+    def fake_image_exists(tag):
+        if tag == "registry.example/team/generated:owner__repo-42":
+            pytest.fail("primary task-ID manifest lookup must be skipped")
+        existence_checks.append(tag)
+        return True
+
+    monkeypatch.setattr(actions, "image_exists_in_registry", fake_image_exists)
     monkeypatch.setattr(
         actions,
         "build_image_direct",
         lambda *args, **kwargs: pytest.fail("local build must be skipped"),
+    )
+    monkeypatch.setattr(
+        actions,
+        "push_to_registry",
+        lambda *args, **kwargs: pytest.fail("nothing to push when both registries have it"),
     )
     removed: list[str] = []
     monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
     execution = actions.push_action(task, tmp_path)
 
+    assert existence_checks == [_TRAJECTORY_REMOTE_TAG]
     assert execution.status is StageResultStatus.SUCCEEDED
     assert execution.result_json() == {
         "remote_tag": remote_tag,
+        "trajectory_remote_tag": _TRAJECTORY_REMOTE_TAG,
         "registry": "platform",
         "suffix": "_platform",
+        "trajectory_registry": "trajectory",
+        "trajectory_suffix": "",
         "skipped": True,
         "already_present": True,
         "remote_buildkit": True,
+        "synced_to_trajectory": True,
     }
     assert removed == [
         actions.local_image_tag(task.task_id),
         remote_tag,
         "registry.example/team/generated:owner__repo-42",
+        _TRAJECTORY_REMOTE_TAG,
     ]
     assert normalization_calls == [
         ("mirrors", task_dir / "environment" / "Dockerfile"),
@@ -1118,14 +1163,16 @@ def test_push_action_removes_local_image_when_push_fails(
     monkeypatch.setattr(actions, "push_to_registry", lambda *args, **kwargs: False)
     monkeypatch.setattr(actions, "remove_local_image", removed.append)
 
-    with pytest.raises(RuntimeError, match="image push failed"):
+    # A failed PRIMARY push is fatal (unlike the trajectory sync, which is
+    # best-effort), and every local alias is still cleaned up.
+    with pytest.raises(RuntimeError, match="image push to primary registry failed"):
         actions.push_action(task, tmp_path)
 
-    remote_tag = (
-        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
-        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
-    )
-    assert removed == ["local-source:latest", remote_tag]
+    assert removed == [
+        "local-source:latest",
+        _PLATFORM_REMOTE_TAG,
+        _TRAJECTORY_REMOTE_TAG,
+    ]
 
 
 def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
@@ -1149,11 +1196,11 @@ def test_push_action_cleans_source_and_remote_aliases_when_build_raises(
     with pytest.raises(RuntimeError, match="build crashed"):
         actions.push_action(task, tmp_path)
 
-    remote_tag = (
-        "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com/"
-        "swesandbox/public/swe-gen/feature-implementation/generated:owner__repo-42"
-    )
-    assert removed == ["local-source:latest", remote_tag]
+    assert removed == [
+        "local-source:latest",
+        _PLATFORM_REMOTE_TAG,
+        _TRAJECTORY_REMOTE_TAG,
+    ]
 
 
 def test_repair_action_captures_agent_edits_and_returns_to_authoritative_validation(
@@ -1325,3 +1372,114 @@ def test_action_for_stage_maps_all_pipeline_stages_and_rejects_unknown() -> None
 
     with pytest.raises(ValueError, match="unsupported pipeline stage"):
         actions.action_for_stage("unknown")  # type: ignore[arg-type]
+
+
+def test_push_action_trajectory_sync_failure_is_non_fatal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A failed trajectory push must not fail the task.
+
+    The primary push already succeeded, so failing here would discard that work.
+    The gap is reported via synced_to_trajectory=False instead.
+    """
+
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
+    pushed: list[str] = []
+
+    def fake_push(local_tag, remote_tag, log):
+        pushed.append(remote_tag)
+        # Primary succeeds, trajectory fails.
+        return remote_tag != _TRAJECTORY_REMOTE_TAG
+
+    monkeypatch.setattr(actions, "image_exists_in_registry", lambda tag: False)
+    monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+    monkeypatch.setattr(
+        actions, "build_image_direct", lambda *args, **kwargs: "local-source:latest"
+    )
+    monkeypatch.setattr(actions, "push_to_registry", fake_push)
+    monkeypatch.setattr(actions, "remove_local_image", lambda tag: None)
+
+    execution = actions.push_action(task, tmp_path)
+
+    assert pushed == [_PLATFORM_REMOTE_TAG, _TRAJECTORY_REMOTE_TAG]
+    assert execution.status is StageResultStatus.SUCCEEDED
+    assert execution.result_json()["synced_to_trajectory"] is False
+
+
+def test_push_action_trajectory_sync_exception_is_non_fatal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A raising trajectory push is swallowed, same rationale as a False return."""
+
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
+
+    def fake_push(local_tag, remote_tag, log):
+        if remote_tag == _TRAJECTORY_REMOTE_TAG:
+            raise RuntimeError("trajectory registry unreachable")
+        return True
+
+    monkeypatch.setattr(actions, "image_exists_in_registry", lambda tag: False)
+    monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+    monkeypatch.setattr(
+        actions, "build_image_direct", lambda *args, **kwargs: "local-source:latest"
+    )
+    monkeypatch.setattr(actions, "push_to_registry", fake_push)
+    monkeypatch.setattr(actions, "remove_local_image", lambda tag: None)
+
+    execution = actions.push_action(task, tmp_path)
+
+    assert execution.status is StageResultStatus.SUCCEEDED
+    assert execution.result_json()["synced_to_trajectory"] is False
+
+
+def test_push_action_repairs_sync_when_primary_has_image_but_trajectory_does_not(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The sync-repair path: primary present, trajectory missing.
+
+    This is the 4996-instance backlog case. It must NOT early-return as
+    already_present; it rebuilds and pushes so the trajectory copy is created.
+    """
+
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id / "environment").mkdir(parents=True)
+    built: list[str] = []
+    pushed: list[str] = []
+
+    monkeypatch.setattr(
+        actions,
+        "image_exists_in_registry",
+        lambda tag: tag == _PLATFORM_REMOTE_TAG,
+    )
+    monkeypatch.setattr(actions, "local_image_tag", lambda task_id: "local-source:latest")
+
+    def fake_build(instance, directory, proxy_env, log):
+        built.append(instance)
+        return "local-source:latest"
+
+    def fake_push(local_tag, remote_tag, log):
+        pushed.append(remote_tag)
+        return True
+
+    monkeypatch.setattr(actions, "build_image_direct", fake_build)
+    monkeypatch.setattr(actions, "push_to_registry", fake_push)
+    monkeypatch.setattr(actions, "remove_local_image", lambda tag: None)
+
+    execution = actions.push_action(task, tmp_path)
+
+    assert built == [task.task_id], "must rebuild to create the missing trajectory copy"
+    assert _TRAJECTORY_REMOTE_TAG in pushed
+    assert execution.status is StageResultStatus.SUCCEEDED
+    assert execution.result_json()["already_present"] is False
+    assert execution.result_json()["synced_to_trajectory"] is True
