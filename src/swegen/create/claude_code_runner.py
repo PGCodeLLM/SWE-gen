@@ -699,6 +699,105 @@ Inspect `environment/Dockerfile`, `environment/bug.patch`, `solution/fix.patch`,
 dependency pins, CA/proxy setup, build steps, copied test fixtures, test command
 scope, and post-patch rebuilds. Preserve the task identity and Harbor layout.
 
+### Known failure signatures, and the repair each one wants
+
+Match the observed error against this catalogue first; these are the causes
+measured across a sample of real NOP/Oracle failures. Every entry keeps the
+project's own pinned dependencies intact and fixes the *packaging* instead --
+the pinned commit usually requires its era's dependency versions, so upgrading
+a project dependency to dodge an error is almost always the wrong repair.
+
+- `git clone`/`fetch` dying with `RPC failed`, `curl 56`, `GnuTLS recv error`,
+  `early EOF`, `fetch-pack: unexpected disconnect`, or `invalid index-pack
+  output`: transient infrastructure, NOT a task defect. Do not edit anything.
+  Rerun the same validation; if it reproduces identically twice, stop and
+  report rather than inventing a Dockerfile change.
+- `No reward file found at .../reward.txt`: the image built and the verifier
+  ran, but `tests/test.sh` exited before writing a verdict. Repair the script,
+  not the Dockerfile: `mkdir -p /logs/verifier` first, drop any `set -e` /
+  `set -o pipefail` that precedes the write, capture the status explicitly
+  (`set +e; <cmd>; status=$?`), and emit the reward from a `trap ... EXIT` so
+  it is written even on an early abort. The failure path must write `0`; never
+  write `1` unconditionally, and never weaken the test command to force a pass.
+- `cannot find main module` or `go.mod file not found`: the pinned commit
+  predates Go modules. Do NOT run `go mod init` -- it re-resolves dependencies
+  to modern versions the pinned code cannot compile against. Remove any
+  `ENV GO111MODULE=on`, set `ENV GO111MODULE=off GOPATH=/go`, symlink the
+  checkout into `/go/src/<canonical-import-path>` (read the path from the
+  Makefile or an existing import), and run every Go command with `WORKDIR` set
+  to that GOPATH location. If dependencies are fetched with `go get`, also pin
+  the toolchain to Go 1.21.x: Go 1.22 removed `go get` in GOPATH mode.
+- `-mod may only be set to readonly or vendor when in workspace mode`: the
+  repo root has a `go.work`. Drop `-mod=mod` from `GOFLAGS` and keep workspace
+  mode so sibling modules resolve locally. Use `ENV GOWORK=off` only as the
+  alternative -- never both.
+- A language feature or stdlib module missing for the pinned source
+  (`undefined: strings.Cut`, `No module named 'distutils'`, or a missing wheel
+  that forces a source build): the toolchain is the wrong era, not the code.
+  Move the *toolchain* to the version current at the pinned commit and allowed
+  by the manifest -- the `go` directive in `go.mod`, `python_requires`,
+  `engines`/`.nvmrc` -- e.g. `FROM golang:1.19-bullseye`, or
+  `uv python install 3.10 && uv venv --python 3.10 /opt/venv`. Never patch the
+  source to avoid the feature.
+- `fatal error: <lib>.h: No such file or directory` from cgo or a native
+  extension: the `-dev` headers were never installed. Add
+  `apt-get install -y --no-install-recommends <lib>-dev pkg-config` before the
+  build, taking the package name from the repo's own Dockerfile or CI config
+  (an Alpine `apk add foo-dev` maps to Debian `libfoo-dev`). Never disable the
+  feature with a build tag or stub the header -- that removes code under test.
+- A vendor bootstrap returning 404 or `your distribution ... is not supported`,
+  or a dependency host that no longer exists: keep the pinned version and
+  replace only that fetch. Install the runtime from its still-hosted release
+  tarball under `/usr/local/lib` with symlinks into `/usr/local/bin`, or
+  redirect a dead VCS host to its surviving mirror with
+  `git config --global url."<new>".insteadOf "<dead>"`.
+- `object not found - no match for id (<sha>); class=Odb` from `cargo fetch`:
+  deterministic, not flake -- libgit2 cannot fetch a commit unreachable from
+  any advertised ref. Add `ENV CARGO_NET_GIT_FETCH_WITH_CLI=true` before the
+  cargo step so it shells out to system git. Do not bump the pinned rev.
+- `InvalidVersion: Invalid version: 'None'`, or setuptools-scm / versioneer /
+  `param.version` producing no version: the checkout is a shallow graft with
+  no tags, so `git describe` cannot name it. Restore tag history before the
+  install step with
+  `RUN cd /app/src && (git fetch --unshallow --tags || git fetch --tags)`.
+  Do NOT try to fix this by pinning setuptools -- older setuptools rejects the
+  same invalid version from a different code path, so the pin does nothing.
+- `fatal: reference is not a tree: <sha>` after a `git clone`: a plain clone
+  only fetches branch heads, and the pinned SHA is not reachable from one.
+  Add `git fetch --depth 1 origin <sha>` before the checkout and use
+  `git checkout --detach FETCH_HEAD`.
+- `go install pkg@version` refusing a module whose `go.mod` `contains one or
+  more replace directives`: that form cannot honour `replace`. Build from a
+  checkout instead -- `git clone --depth 1 --branch <tag> <repo> /tmp/m &&
+  cd /tmp/m && go install ./<cmd-path>`.
+- A `curl` of a toolchain tarball returning HTTP 404 on every retry: the
+  artifact name is wrong, so retrying can never help. Correct the version
+  string to a real release -- Go requires `go1.21.0` but `go1.20` without the
+  trailing `.0` -- and derive the checksum from the `.sha256` sidecar URL
+  rather than hardcoding a stale digest.
+- An unpinned `go get` dragging in a dependency at master that needs a newer
+  stdlib than the pinned toolchain (`package cmp is not in GOROOT`): pin the
+  dependency to a tag contemporary with the task's commit
+  (`go get <pkg>@<old-tag>`). Pin the dependency down; never bump the
+  toolchain up to accommodate a floating dependency.
+- An install that fails under `--no-build-isolation` because a build-time
+  import is missing: add a preceding
+  `uv pip install --python /opt/venv/bin/python <named build deps> wheel` into
+  the same venv and leave the original line untouched. Keep
+  `--no-build-isolation` -- it is what makes the pinned build deps visible.
+- `npm install` failing to compile a native node-gyp addon: pin the Node base
+  image to the major current at the PR's date rather than upgrading the
+  package. If the addon is not imported by the extracted test files, add
+  `--ignore-scripts` so it is fetched but never compiled.
+- `COPY` failing with `"/solution/...": not found` (or `/tests/...`): the build
+  context is `environment/` only. Delete that `COPY` and anything applying it.
+  `solution/` is uploaded to `/solution` at Oracle runtime and applied by
+  `solve.sh`; baking the fix into the image would make the NOP run wrongly
+  pass, which is a validation failure, not a fix.
+
+When the observed error matches none of the above, repair it on its own merits.
+Do not force-fit a catalogue entry onto an unrelated failure.
+
 When iterating on `environment/Dockerfile` to check that it builds, build
 EPHEMERALLY — you only care whether it builds, not the resulting image. Use
 `docker buildx build --output type=cacheonly --progress=plain .` which validates

@@ -47,7 +47,7 @@ spec:
           # swegen-worker:e2e still hardcodes the platform repository path for
           # trajectory, so every tag it builds points at a path that does not
           # exist and every push silently fails.
-          image: swegen-worker:trajectory-path-fix-20260813
+          image: swegen-worker:trajectory-sync-20260813
           # The tag is present on all four nodes; never reach out to a registry
           # for it (the cluster cannot pull swegen-worker from anywhere).
           imagePullPolicy: Never

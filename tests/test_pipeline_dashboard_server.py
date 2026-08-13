@@ -325,6 +325,90 @@ def test_cpu_triple_handles_zero_or_missing_capacity_without_invalid_numbers() -
     assert "Infinity" not in unavailable
 
 
+def evaluate_metrics_banner_helpers(expressions: list[str]) -> list[str]:
+    from swegen.dashboard.server import HTML
+
+    definitions = []
+    for name in ("agoUnit", "relativeAge", "friendlyError"):
+        match = re.search(rf"const {name}=.*?;\n", HTML)
+        assert match is not None
+        definitions.append(match.group(0))
+    completed = run(
+        [
+            "node",
+            "-e",
+            "".join(definitions)
+            + "const now=Date.now();const ago=s=>new Date(now-s*1000).toISOString();"
+            + f"process.stdout.write(JSON.stringify([{','.join(expressions)}]));",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_stale_metrics_age_reads_in_human_units_not_iso_timestamps() -> None:
+    seconds, minutes, hours, days = evaluate_metrics_banner_helpers(
+        [
+            "relativeAge(ago(5))",
+            "relativeAge(ago(240))",
+            "relativeAge(ago(7200))",
+            "relativeAge(ago(172800))",
+        ]
+    )
+    assert seconds == "5 seconds ago"
+    assert minutes == "4 minutes ago"
+    assert hours == "2 hours ago"
+    assert days == "2 days ago"
+
+
+def test_relative_age_singularises_and_survives_unusable_timestamps() -> None:
+    one_second, one_minute, missing, garbage = evaluate_metrics_banner_helpers(
+        [
+            "relativeAge(ago(1))",
+            "relativeAge(ago(60))",
+            "relativeAge(null)",
+            "relativeAge('not-a-timestamp')",
+        ]
+    )
+    assert one_second == "1 second ago"
+    assert one_minute == "1 minute ago"
+    # A timestamp we cannot parse must not leak back into the banner verbatim.
+    assert missing == garbage == "an unknown time ago"
+
+
+def test_banner_errors_drop_python_exception_and_kubectl_prefixes() -> None:
+    runtime, kubectl, timeout, plain, empty = evaluate_metrics_banner_helpers(
+        [
+            "friendlyError('RuntimeError: error: Metrics API not available')",
+            "friendlyError('error: Metrics API not available')",
+            "friendlyError('TimeoutError: deadline exceeded')",
+            "friendlyError('metrics-server is starting')",
+            "friendlyError(null)",
+        ]
+    )
+    assert runtime == kubectl == "Metrics API not available"
+    assert timeout == "deadline exceeded"
+    assert plain == "metrics-server is starting"
+    assert empty == ""
+
+
+def test_resource_banner_reports_staleness_without_raw_python_errors() -> None:
+    from swegen.dashboard.server import HTML
+
+    body = HTML.split("function renderResourcesV2", 1)[1]
+    banner = next(line for line in body.splitlines() if "Resource metrics unavailable" in line)
+
+    assert "relativeAge(metrics.collected_at)" in banner
+    assert "friendlyError(metrics.error)" in banner
+    # The old banner interpolated the ISO timestamp and the bare exception text
+    # directly; only guarded reads of those fields may remain.
+    assert "${metrics.collected_at||'unknown time'}" not in banner
+    assert "${metrics.error||'refresh failed'}" not in banner
+    assert "${metrics.error}" not in banner
+
+
 def test_dashboard_places_resources_and_storage_immediately_before_recent_tasks() -> None:
     from swegen.dashboard.server import HTML
 

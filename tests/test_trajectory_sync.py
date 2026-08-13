@@ -466,7 +466,11 @@ def test_manifest_runs_one_docker_capable_pod_on_a_node_local_image() -> None:
     assert deployment["spec"]["strategy"]["type"] == "Recreate"
     assert pod_spec["automountServiceAccountToken"] is False
     # imagePullPolicy=Never means the tag must already resolve on every node.
-    assert container["image"] == "swegen-worker:e2e"
+    # It must NOT be swegen-worker:e2e: that image predates both this module
+    # and the TRAJECTORY_SWR_REPOSITORY fix, so it would fail to start and,
+    # once started, would push to a repository path that does not exist.
+    assert container["image"].startswith("swegen-worker:")
+    assert container["image"] != "swegen-worker:e2e"
     assert container["imagePullPolicy"] == "Never"
     assert container["command"] == ["python", "-m", "swegen.tools.trajectory_sync"]
     assert env["SWEGEN_TRAJECTORY_SYNC_THREADS"] == "8"

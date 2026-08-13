@@ -84,6 +84,9 @@ _PNPM_REGISTRY_MARKER = "# SWEGEN_PNPM_REGISTRY"
 _GO_PROXY_MARKER = "# SWEGEN_GO_PROXY"
 _CARGO_MIRROR_MARKER = "# SWEGEN_CARGO_MIRROR"
 _GO_COMMAND = re.compile(r"(?<![/A-Za-z0-9_.-])go[ \t]+(?:mod|get|build|install|test|run)\b")
+# A stage that asks for GOPATH mode is a pre-modules checkout with no go.mod;
+# forcing GO111MODULE=on there breaks the build, so the proxy rewrite honours it.
+_GO111MODULE_OFF = re.compile(r"GO111MODULE[ \t]*=[ \t]*[\"']?off\b", re.IGNORECASE)
 _CARGO_COMMAND = re.compile(
     r"(?<![/A-Za-z0-9_.-])cargo[ \t]+(?:fetch|build|test|install|run|check|update|vendor)\b"
 )
@@ -741,12 +744,20 @@ def _rewrite_go_proxy(content: str, proxy: str) -> str:
     path being routed around. A measured fetch took 61s and failed with
     "dial tcp ... i/o timeout" direct, 164s and failed with GOPRIVATE=*, and
     977ms through the proxy alone.
+
+    GO111MODULE=on is NOT forced onto a stage that already asks for GOPATH
+    mode. A repo pinned before Go modules has no go.mod, so module mode fails
+    the build outright with "cannot find main module"; a repair that sets
+    GO111MODULE=off would otherwise be silently overwritten by this rewrite on
+    the next pass. The proxy variables are still injected either way -- they
+    are inert in GOPATH mode and needed the moment anything resolves a module.
     """
 
     def rewrite_stage(stage_units: list[str]) -> list[str]:
         stage_content = "".join(stage_units)
         if _GO_PROXY_MARKER in stage_content or not _GO_COMMAND.search(stage_content):
             return stage_units
+        module_mode = "off" if _GO111MODULE_OFF.search(stage_content) else "on"
         for index, unit in enumerate(stage_units):
             if _instruction_name(unit) != "RUN" or not _GO_COMMAND.search(unit):
                 continue
@@ -754,7 +765,7 @@ def _rewrite_go_proxy(content: str, proxy: str) -> str:
             return [
                 *stage_units[:index],
                 f"{indent}{_GO_PROXY_MARKER}\n",
-                f"{indent}ENV GO111MODULE=on \\\n"
+                f"{indent}ENV GO111MODULE={module_mode} \\\n"
                 f"{indent}    GOPROXY={proxy} \\\n"
                 f"{indent}    GOSUMDB=off \\\n"
                 f"{indent}    GONOSUMDB=* \\\n"

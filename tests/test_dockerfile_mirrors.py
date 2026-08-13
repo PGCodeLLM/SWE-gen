@@ -662,6 +662,35 @@ def test_go_toolchain_gets_the_internal_module_proxy(tmp_path: Path) -> None:
     assert rendered.index("# SWEGEN_GO_PROXY") < rendered.index("RUN go mod download")
 
 
+def test_go_proxy_rewrite_preserves_an_explicit_gopath_mode_stage(tmp_path: Path) -> None:
+    """A pre-modules checkout keeps GOPATH mode, but still gets the proxy.
+
+    Repos pinned before Go modules have no go.mod, so forcing GO111MODULE=on
+    fails the build with "cannot find main module". Without this, a repair that
+    sets GO111MODULE=off is silently reverted the next time the Dockerfile is
+    normalized, and the task fails again for the very same reason.
+    """
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM golang:1.21\n"
+        "ENV GO111MODULE=off GOPATH=/go\n"
+        "WORKDIR /go/src/github.com/openSUSE/umoci\n"
+        "RUN go build ./cmd/umoci\n"
+    )
+
+    assert rewrite_ubuntu_mirrors(dockerfile) is True
+
+    rendered = dockerfile.read_text()
+    # The stage asked for GOPATH mode, so the injected ENV must not flip it on.
+    assert "GO111MODULE=on" not in rendered
+    assert "GO111MODULE=off" in rendered
+    # The proxy is still injected: inert in GOPATH mode, and needed the moment
+    # anything does resolve a module.
+    assert "GOPROXY=http://mirrors.tools.huawei.com/goproxy" in rendered
+    assert "GOSUMDB=off" in rendered
+
+
 def test_cargo_gets_the_internal_sparse_registry(tmp_path: Path) -> None:
     dockerfile = tmp_path / "Dockerfile"
     dockerfile.write_text("FROM rust:1.80\nRUN cargo fetch && cargo build\n")

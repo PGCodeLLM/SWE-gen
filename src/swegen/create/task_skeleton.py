@@ -101,8 +101,17 @@ def generate_dockerfile(
 
 WORKDIR /app
 
-# Clone repo at HEAD commit (with fix applied)
-RUN git clone {params.repo_url} src && \\
+# Clone repo at HEAD commit (with fix applied).
+# --filter=blob:none fetches the commit and tree graph but no file contents,
+# leaving the checkout to pull only the blobs it actually needs. A full clone
+# of a large repo transfers enough to outlast the proxy, and a truncated
+# transfer surfaces as "RPC failed"/"early EOF"/"fetch-pack: unexpected
+# disconnect" -- measured as the most common transient validate failure.
+# --tags keeps tag refs so setuptools-scm, versioneer and param.version can
+# `git describe` the checkout; without them it is an untagged graft and those
+# tools resolve the version to the literal string 'None', which setuptools
+# then rejects with "InvalidVersion: Invalid version: 'None'".
+RUN git clone --filter=blob:none --tags {params.repo_url} src && \\
     cd src && \\
     (git fetch --depth 1 origin {params.head_sha} || git fetch --depth 1 origin "+refs/pull/{params.pr_number}/head:refs/remotes/origin/pr/{params.pr_number}") && \\
     git checkout --detach FETCH_HEAD && \\
