@@ -739,15 +739,18 @@ def test_reward_action_raises_when_detector_returns_infrastructure_error(
     task = make_task()
     task_dir = tmp_path / "tasks" / task.task_id
     task_dir.mkdir(parents=True)
+    monkeypatch.setenv("SWEGEN_REWARD_ENDPOINT", "https://reward.example")
+    monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
+    monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
     monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "generic-secret")
     monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
 
     async def fake_check(test_bundle, primary, fallback, task_id, instance_dir):
         assert test_bundle == "test bundle"
-        assert primary.endpoint == "http://1.95.77.23:3000"
-        assert primary.model == "gpt-5.6-sol"
-        assert fallback.model == "gpt-5.6-sol"
+        assert primary.endpoint == "https://reward.example"
+        assert primary.model == "primary-model"
+        assert fallback.model == "fallback-model"
         assert primary.api_key == fallback.api_key == "dedicated-secret"
         assert task_id == task.task_id
         assert instance_dir == task_dir
@@ -803,6 +806,9 @@ def test_reward_action_allows_provider_key_only_with_explicit_opt_in(
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
     monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
     monkeypatch.setenv("SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK", "true")
+    monkeypatch.setenv("SWEGEN_REWARD_ENDPOINT", "https://reward.example")
+    monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
+    monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
     monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
 
     async def fake_check(test_bundle, primary, fallback, **kwargs):
@@ -813,6 +819,80 @@ def test_reward_action_allows_provider_key_only_with_explicit_opt_in(
     monkeypatch.setattr(actions, "check_instance_with_fallback", fake_check)
 
     assert actions.reward_action(task, tmp_path).status is StageResultStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["SWEGEN_REWARD_ENDPOINT", "SWEGEN_REWARD_PRIMARY_MODEL", "SWEGEN_REWARD_FALLBACK_MODEL"],
+)
+def test_reward_action_requires_each_endpoint_setting_by_name(
+    tmp_path: Path,
+    monkeypatch,
+    missing: str,
+) -> None:
+    """A dropped ConfigMap key must fail loudly instead of using a code default.
+
+    The reward stage used to carry hardcoded copies of the endpoint and both
+    model names, so an unmounted or stale Secret ran the wrong model silently
+    (the incident: a delisted model returning 400 for a full day).
+    """
+
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
+    supplied = {
+        "SWEGEN_REWARD_ENDPOINT": "https://reward.example",
+        "SWEGEN_REWARD_PRIMARY_MODEL": "primary-model",
+        "SWEGEN_REWARD_FALLBACK_MODEL": "fallback-model",
+    }
+    for name, value in supplied.items():
+        if name != missing:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")
+    monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
+    monkeypatch.setattr(
+        actions,
+        "check_instance_with_fallback",
+        lambda *args, **kwargs: pytest.fail("checker must not run with an unresolved setting"),
+    )
+
+    with pytest.raises(RuntimeError, match=missing) as raised:
+        actions.reward_action(task, tmp_path)
+
+    # The message has to be actionable: it names the variable and the manifest
+    # source that should have supplied it.
+    assert "swegen-pipeline-config" in str(raised.value)
+
+
+def test_reward_action_treats_a_blank_setting_as_unset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An empty ConfigMap value is a mistake, not a request to fall back."""
+
+    from swegen.pipeline import actions
+
+    task = make_task()
+    (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
+    monkeypatch.setenv("SWEGEN_REWARD_ENDPOINT", "   ")
+    monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
+    monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
+    monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")
+    monkeypatch.setattr(actions, "build_test_bundle", lambda path: "test bundle")
+
+    with pytest.raises(RuntimeError, match="SWEGEN_REWARD_ENDPOINT"):
+        actions.reward_action(task, tmp_path)
+
+
+def test_reward_endpoint_defaults_are_not_hardcoded_in_the_module() -> None:
+    """Guard the removal: no code-level copy of the live endpoint may return."""
+
+    from swegen.pipeline import actions
+
+    assert not hasattr(actions, "DEFAULT_REWARD_ENDPOINT")
+    assert not hasattr(actions, "DEFAULT_REWARD_PRIMARY_MODEL")
+    assert not hasattr(actions, "DEFAULT_REWARD_FALLBACK_MODEL")
 
 
 def test_reward_action_rejects_hacking_with_compact_evidence(
@@ -863,6 +943,7 @@ def test_reward_action_succeeds_with_clean_fallback_verdict(
 
     task = make_task()
     (tmp_path / "tasks" / task.task_id).mkdir(parents=True)
+    monkeypatch.setenv("SWEGEN_REWARD_ENDPOINT", "https://reward.example")
     monkeypatch.setenv("SWEGEN_REWARD_PRIMARY_MODEL", "primary-model")
     monkeypatch.setenv("SWEGEN_REWARD_FALLBACK_MODEL", "fallback-model")
     monkeypatch.setenv("SWEGEN_REWARD_API_KEY", "dedicated-secret")

@@ -9,15 +9,55 @@ from pathlib import Path
 
 logger = logging.getLogger("swegen")
 
-# Model used when nothing is configured via env var or swegen.toml. Kept here so
-# the out-of-the-box behavior matches what the runner previously hardcoded.
-DEFAULT_MODEL = "qwen3.5-397b-a17b-alex-swe-gen"
+# There is deliberately no default model. A hardcoded real-looking model name
+# made a missing or stale model-credential Secret indistinguishable from a
+# working one: every session kept starting, then died at the gateway with
+# "Invalid model name". The model must now be configured explicitly.
+MODEL_ENV = "ANTHROPIC_MODEL"
+MODEL_SUPPLIED_BY = (
+    "the stage's model-credential Secret (e.g. swegen-repair-model-credentials "
+    "or swegen-model-credentials-*, key ANTHROPIC_MODEL) in namespace "
+    "swegen-pipeline, or [model].model in swegen.toml"
+)
 
 # Claude Code uses its Haiku tier for internal lightweight work such as
 # built-in Explore subagents and Bash command-path extraction.  Our compatible
-# endpoint serves that role under this model name instead.
-DEFAULT_CLAUDE_FAST_MODEL = "gpt-5.3-codex-spark"
+# endpoint serves that role under this model name too, so the fast model
+# resolves to the primary model rather than to a separate literal: the previous
+# hardcoded value contradicted what deploy/k3s/create-secrets.sh actually
+# writes into SWEGEN_CLAUDE_FAST_MODEL.
 CLAUDE_FAST_MODEL_ENV = "SWEGEN_CLAUDE_FAST_MODEL"
+
+
+class MissingRequiredSetting(RuntimeError):
+    """A setting with no safe default was not supplied by the environment.
+
+    Raised instead of substituting a hardcoded value, so a deleted, renamed or
+    stale Secret/ConfigMap key fails at startup with the variable named rather
+    than silently running against the wrong model or endpoint.
+    """
+
+    def __init__(self, name: str, *, supplied_by: str) -> None:
+        self.name = name
+        self.supplied_by = supplied_by
+        super().__init__(
+            f"{name} is not set and has no default. It is supplied by "
+            f"{supplied_by}; verify that source still defines it and that the "
+            f"workload mounts it."
+        )
+
+
+def required_environment_value(name: str, *, supplied_by: str) -> str:
+    """Return a required environment value, or raise naming what supplies it.
+
+    Blank counts as unset: an empty ConfigMap/Secret value is a configuration
+    mistake, not an instruction to fall back.
+    """
+
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise MissingRequiredSetting(name, supplied_by=supplied_by)
+    return value
 
 # Env var pointing at an alternate config file location (otherwise swegen.toml in
 # the current working directory is used).
@@ -67,14 +107,20 @@ def _read_table(section: str) -> dict:
 
 
 def load_model_settings() -> ModelSettings:
-    """Resolve model + endpoint with precedence: env var > swegen.toml > default.
+    """Resolve model + endpoint with precedence: env var > swegen.toml.
 
-    - model:    ANTHROPIC_MODEL    > [model].model    > DEFAULT_MODEL
+    - model:    ANTHROPIC_MODEL    > [model].model    (required, no default)
     - base_url: ANTHROPIC_BASE_URL > [model].base_url > None
+
+    Raises:
+        MissingRequiredSetting: when neither ``ANTHROPIC_MODEL`` nor
+            ``[model].model`` names a model.
     """
     table = _read_table("model")
 
-    model = os.environ.get("ANTHROPIC_MODEL") or table.get("model") or DEFAULT_MODEL
+    model = (os.environ.get(MODEL_ENV, "").strip() or str(table.get("model") or "").strip()).strip()
+    if not model:
+        raise MissingRequiredSetting(MODEL_ENV, supplied_by=MODEL_SUPPLIED_BY)
     base_url = os.environ.get("ANTHROPIC_BASE_URL") or table.get("base_url") or None
 
     return ModelSettings(model=model, base_url=base_url)
@@ -110,13 +156,20 @@ def claude_session_env(instance_id: str, header: str = "X-Session-ID") -> dict[s
 
     ``SWEGEN_CLAUDE_FAST_MODEL`` is the preferred SWE-Gen override.  Existing
     Claude Code model variables remain valid fallbacks for direct invocations.
+    The last resort is the resolved primary model, not a separate literal: one
+    endpoint serves both tiers, and a distinct hardcoded fast model silently
+    pointed internal calls at a model the gateway may not list.
+
+    Raises:
+        MissingRequiredSetting: when no fast-model variable is set and no
+            primary model is configured either.
     """
     env = session_header_env(instance_id, header)
     fast_model = (
         os.environ.get(CLAUDE_FAST_MODEL_ENV)
         or os.environ.get("ANTHROPIC_SMALL_FAST_MODEL")
         or os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
-        or DEFAULT_CLAUDE_FAST_MODEL
+        or load_model_settings().model
     ).strip()
     if fast_model:
         env.update(

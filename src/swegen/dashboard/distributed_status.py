@@ -42,7 +42,20 @@ REMOTE_BUILD_PENDING_STATUSES = frozenset({"submitting", "queued", "running"})
 # rows nonterminal forever. Keep only records updated within the client build
 # deadline plus a small status-writeback grace window in the recent bucket.
 REMOTE_BUILD_TRACKING_RECENT_SECONDS = 70 * 60
-REMOTE_BUILDKIT_DEFAULT_URL = "http://7.156.122.134:32083"
+# No default farm URL: the literal that used to live here duplicated ConfigMap
+# SWEGEN_REMOTE_BUILDKIT_URL, so the panel kept polling a hardcoded address and
+# reporting it as the farm even when nothing configured one. Unlike the worker
+# stages, an unset value here is reported as unconfigured rather than raised:
+# this collector is built eagerly in SnapshotCache.__init__, outside the
+# per-collector error handling in SnapshotCache.refresh(), so raising would take
+# the entire status page down over one optional panel.
+REMOTE_BUILDKIT_URL_ENV = "SWEGEN_REMOTE_BUILDKIT_URL"
+REMOTE_BUILDKIT_URL_UNCONFIGURED = (
+    f"{REMOTE_BUILDKIT_URL_ENV} is not set, so the remote BuildKit farm is not "
+    "being polled. It is supplied by ConfigMap swegen-pipeline-config "
+    "(deploy/k3s/swegen-pipeline.yaml); export it for the dashboard process to "
+    "re-enable this panel."
+)
 REMOTE_BUILDKIT_MIN_POLL_SECONDS = 30.0
 REMOTE_BUILDKIT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 LOCAL_DISK_IO_POLL_SECONDS = 30.0
@@ -1785,12 +1798,16 @@ class RemoteBuildKitFarmCollector:
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        self.base_url = (
+        configured_url = (
             base_url
-            or os.environ.get("SWEGEN_REMOTE_BUILDKIT_URL")
-            or os.environ.get("SWEGEN_BUILDKIT_FARM_URL")
-            or REMOTE_BUILDKIT_DEFAULT_URL
-        ).rstrip("/")
+            or os.environ.get(REMOTE_BUILDKIT_URL_ENV, "")
+            or os.environ.get("SWEGEN_BUILDKIT_FARM_URL", "")
+        ).strip()
+        self.base_url = configured_url.rstrip("/")
+        # Unconfigured is a reportable state, not a crash: every endpoint stays
+        # in its initial "never sampled" shape and _refresh() is skipped, so the
+        # panel renders the farm as unavailable with the variable named.
+        self.configured = bool(self.base_url)
         configured_poll = (
             poll_seconds
             if poll_seconds is not None
@@ -1817,6 +1834,9 @@ class RemoteBuildKitFarmCollector:
             }
             for name, _path, _timeout in self.ENDPOINTS
         }
+        if not self.configured:
+            for endpoint in self._endpoints.values():
+                endpoint["error"] = REMOTE_BUILDKIT_URL_UNCONFIGURED
 
     @staticmethod
     def _read_json_response(response: Any) -> dict[str, Any]:
@@ -1947,6 +1967,11 @@ class RemoteBuildKitFarmCollector:
 
     def collect(self) -> dict[str, Any]:
         start_sample = False
+        if not self.configured:
+            # Nothing to poll: report the unconfigured state instead of
+            # fabricating requests against a guessed address.
+            with self._lock:
+                return self._snapshot_locked()
         with self._lock:
             current = self.monotonic()
             due = (

@@ -28,7 +28,7 @@ from reward_hacking_detector.hacking import (
 )
 from swegen.create.claude_code_runner import run_claude_code_session
 from swegen.create.claude_code_utils import redact_sensitive_text
-from swegen.model_settings import load_github_tokens
+from swegen.model_settings import load_github_tokens, required_environment_value
 from swegen.pipeline.models import PipelineTask, StageExecution
 from swegen.pipeline.task_store import capture_task_files
 from swegen.queueing.models import PipelineStage
@@ -52,9 +52,14 @@ DEFAULT_GENERATE_TIMEOUT_SECONDS = 14400.0
 DEFAULT_REPAIR_TIMEOUT_SECONDS = 14400
 DEFAULT_REWARD_REPAIR_TIMEOUT_SECONDS = 14400
 DEFAULT_HARBOR_TIMEOUT_SECONDS = 3600.0
-DEFAULT_REWARD_ENDPOINT = "http://1.95.77.23:3000"
-DEFAULT_REWARD_PRIMARY_MODEL = "gpt-5.6-sol"
-DEFAULT_REWARD_FALLBACK_MODEL = "gpt-5.6-sol"
+# The reward endpoint and its models have no defaults on purpose. Hardcoding
+# real values here duplicated the ConfigMap and made an unmounted or stale
+# reward Secret look identical to a healthy one, so the stage kept calling a
+# delisted model instead of failing. The ConfigMap is now the only source.
+_REWARD_SETTINGS_SUPPLIED_BY = (
+    "ConfigMap swegen-pipeline-config (deploy/k3s/swegen-pipeline.yaml), "
+    "optionally overridden by a swegen-reward-credentials-* Secret"
+)
 DEFAULT_SWR_HOST = "swr-coder-data-platform-wce1sr.swr-pro.myhuaweicloud.com"
 DEFAULT_SWR_REPOSITORY = "swesandbox/public/swe-gen/feature-implementation/generated"
 DEFAULT_SWR_REGISTRY = "platform"
@@ -115,7 +120,17 @@ def _environment_timeout(name: str, default: float) -> float:
     return timeout
 
 
-def _environment_value(name: str, default: str) -> str:
+def _environment_value(name: str, default: str | None = None, *, supplied_by: str = "") -> str:
+    """Read a string setting, falling back to ``default`` when one exists.
+
+    Pass ``default=None`` with ``supplied_by`` for a required setting: a missing
+    or blank value then raises :class:`MissingRequiredSetting` naming both the
+    variable and the Secret/ConfigMap that should have supplied it, instead of
+    substituting a literal that hides the misconfiguration.
+    """
+
+    if default is None:
+        return required_environment_value(name, supplied_by=supplied_by)
     return os.environ.get(name, "").strip() or default
 
 
@@ -665,23 +680,31 @@ def reward_action(task: PipelineTask, workspace: Path) -> StageExecution:
             "SWEGEN_REWARD_API_KEY is required; provider-key fallback requires "
             "SWEGEN_REWARD_ALLOW_PROVIDER_KEY_FALLBACK=true"
         )
-    endpoint = _environment_value("SWEGEN_REWARD_ENDPOINT", DEFAULT_REWARD_ENDPOINT)
+    endpoint = _environment_value(
+        "SWEGEN_REWARD_ENDPOINT",
+        supplied_by=_REWARD_SETTINGS_SUPPLIED_BY,
+    )
+    primary_model = _environment_value(
+        "SWEGEN_REWARD_PRIMARY_MODEL",
+        supplied_by=_REWARD_SETTINGS_SUPPLIED_BY,
+    )
+    # SWEGEN_REWARD_FALLBACK_MODEL is a separate required key rather than
+    # defaulting to the primary: the ConfigMap currently sets both to the same
+    # model, which makes the "fallback" attempt a retry of the primary.
+    fallback_model = _environment_value(
+        "SWEGEN_REWARD_FALLBACK_MODEL",
+        supplied_by=_REWARD_SETTINGS_SUPPLIED_BY,
+    )
     primary = LLMConfig(
         name="primary",
         endpoint=endpoint,
-        model=_environment_value(
-            "SWEGEN_REWARD_PRIMARY_MODEL",
-            DEFAULT_REWARD_PRIMARY_MODEL,
-        ),
+        model=primary_model,
         api_key=api_key,
     )
     fallback = LLMConfig(
         name="fallback",
         endpoint=endpoint,
-        model=_environment_value(
-            "SWEGEN_REWARD_FALLBACK_MODEL",
-            DEFAULT_REWARD_FALLBACK_MODEL,
-        ),
+        model=fallback_model,
         api_key=api_key,
     )
     selected, verdict, attempts = asyncio.run(

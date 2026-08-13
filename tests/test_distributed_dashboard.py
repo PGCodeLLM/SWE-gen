@@ -1261,6 +1261,65 @@ def test_remote_buildkit_collector_enforces_safe_polling_and_plain_resources_pat
     assert "include_cache_details" not in calls[0][0]
 
 
+def test_remote_buildkit_collector_reports_unconfigured_instead_of_guessing_a_url(
+    monkeypatch,
+) -> None:
+    """An unset farm URL degrades the panel; it must not poll a hardcoded address.
+
+    The module used to carry a copy of the live farm IP, so the dashboard kept
+    polling it and presenting it as "the farm" even when nothing configured one.
+    Raising is not an option here: SnapshotCache builds this collector in its
+    __init__, outside the per-collector error handling in refresh(), so a raise
+    would take the whole status page down over one optional panel.
+    """
+
+    from swegen.dashboard.distributed_status import (
+        REMOTE_BUILDKIT_URL_ENV,
+        RemoteBuildKitFarmCollector,
+    )
+
+    monkeypatch.delenv(REMOTE_BUILDKIT_URL_ENV, raising=False)
+    monkeypatch.delenv("SWEGEN_BUILDKIT_FARM_URL", raising=False)
+
+    def forbidden_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an unconfigured farm must never be polled")
+
+    collector = RemoteBuildKitFarmCollector(opener=type("O", (), {"open": forbidden_open})())
+
+    assert collector.configured is False
+    assert collector.base_url == ""
+
+    snapshot = collector.collect()
+
+    assert snapshot["gateway"]["ok"] is False
+    assert snapshot["ready"]["ok"] is False
+    assert snapshot["resources"]["available"] is False
+    # The rendered warning names the variable and the manifest that supplies it.
+    for message in (
+        snapshot["gateway"]["error"],
+        snapshot["ready"]["error"],
+        snapshot["resources"]["error"],
+    ):
+        assert REMOTE_BUILDKIT_URL_ENV in message
+        assert "swegen-pipeline-config" in message
+
+
+def test_remote_buildkit_collector_uses_a_configured_url_from_the_environment(
+    monkeypatch,
+) -> None:
+    from swegen.dashboard.distributed_status import (
+        REMOTE_BUILDKIT_URL_ENV,
+        RemoteBuildKitFarmCollector,
+    )
+
+    monkeypatch.setenv(REMOTE_BUILDKIT_URL_ENV, "http://farm.example:32083/")
+
+    collector = RemoteBuildKitFarmCollector()
+
+    assert collector.configured is True
+    assert collector.base_url == "http://farm.example:32083"
+
+
 def test_k3s_collector_sums_multiple_deployments_for_the_same_stage() -> None:
     from swegen.dashboard.distributed_status import K3sStatusCollector
 
