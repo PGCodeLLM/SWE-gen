@@ -1,0 +1,27 @@
+swegen-generate                                                220   swegen-worker:e2e
+swegen-generate-circuit-breaker                                0     swegen-worker:repo-cache-lock-20260806
+swegen-generate-deepseek-exp                                   0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-deepseek-v4-flash-1-95-77-23               0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-glm-5-2-moedsa-7-244-3-251                 0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-glm-5-2-pretrain-256k-v1-7-244-3-251       0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-glm-5-2-pretrain-v1-7-244-3-251            0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-qwen3-6-35b-a3b-fp8-gx10-1-kng-tail22da2   0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-qwen3-6-35b-a3b-fp8-gx10-2-kng-tail22da2   0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-qwen3-6-35b-a3b-fp8-gx10-3-kng-tail22da2   0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-dyn-qwen3-6-35b-a3b-fp8-gx10-4-kng-tail22da2   0     swegen-worker:openai-timeout-600-20260808
+swegen-generate-endpoint-controller                            1     swegen-worker:endpoint-controller-20260807
+swegen-push                                                    24    swegen-worker:trajectory-path-fix-20260813
+swegen-repair                                                  96    swegen-worker:repair-catalog-20260813
+swegen-reward                                                  12    swegen-worker:e2e
+swegen-reward-repair                                           0     swegen-worker:reward-repair-20260731
+swegen-trajectory-sync                                         1     swegen-worker:trajectory-sync-20260813
+swegen-validate                                                220   swegen-worker:e2e
+
+# node pod CIDRs / max-pods (post /19 widening)
+ecs-z00579134-20260707-bugfix-0002  10.42.32.0/19  maxpods=2048
+ecs-z00579134-20260707-bugfix-0003  10.42.96.0/19  maxpods=2048
+ecs-z00579134-20260707-bugfix-0005  10.42.64.0/19  maxpods=2048
+ecs-z00579134-20260707-bugfix-0006  10.42.0.0/19  maxpods=2048
+
+# build slots per node: 72 (288 total) -- oversubscription gate
+# repair model: claude-sonnet-5 @ http://7.244.3.251:8088
