@@ -9,6 +9,11 @@ Harbor or Docker.  Results are published to a separate append-only ledger so
 the sequential validator and dashboard can consume them without concurrent
 writes to the primary postcheck ledger.
 """
+# DEPRECATED: superseded by the k3s pipeline (swegen/pipeline/), but STILL LIVE.
+# As of 2026-08-13 two workers are running run `20260716-sol-max-full-16w` from
+# separate checkouts (/data/nfs_shared/swegen, /data/work/slurm-swegen) for which
+# this repo is the source of truth. Do not delete without confirming that run has
+# finished.
 
 from __future__ import annotations
 

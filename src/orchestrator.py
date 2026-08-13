@@ -44,6 +44,11 @@ Example:
     python src/orchestrator.py prs.jsonl --workers 4 \
         --github-token "$GITHUB_TOKEN" --anthropic-base-url "$ANTHROPIC_BASE_URL"
 """
+# DEPRECATED: superseded by the k3s pipeline (swegen/pipeline/), but STILL LIVE.
+# As of 2026-08-13 two workers are running run `20260716-sol-max-full-16w` from
+# separate checkouts (/data/nfs_shared/swegen, /data/work/slurm-swegen) for which
+# this repo is the source of truth. Do not delete without confirming that run has
+# finished.
 
 from __future__ import annotations
 

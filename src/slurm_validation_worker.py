@@ -9,6 +9,11 @@ reward-hacking check to its own bounded thread pool.  Append-only ledgers make
 every stage restart-safe and give the dashboard live evidence instead of
 inferring validation from the SWE-gen subprocess exit code.
 """
+# DEPRECATED: superseded by the k3s pipeline (swegen/pipeline/), but STILL LIVE.
+# As of 2026-08-13 two workers are running run `20260716-sol-max-full-16w` from
+# separate checkouts (/data/nfs_shared/swegen, /data/work/slurm-swegen) for which
+# this repo is the source of truth. Do not delete without confirming that run has
+# finished.
 
 from __future__ import annotations
 

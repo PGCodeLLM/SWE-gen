@@ -515,7 +515,9 @@ def test_generate_circuit_breaker_is_latched_and_rbac_scoped() -> None:
 
 
 def test_generate_transient_requeue_is_transactional_and_audited() -> None:
-    migration = (DEPLOY_DIR / "requeue-transient-generate-failures-20260802.sql").read_text()
+    migration = (
+        DEPLOY_DIR / "incidents" / "requeue-transient-generate-failures-20260802.sql"
+    ).read_text()
 
     assert migration.startswith("\\set ON_ERROR_STOP on\n\nBEGIN;")
     assert "LOCK TABLE pgmq.q_swegen_generate" in migration
@@ -531,7 +533,9 @@ def test_generate_transient_requeue_is_transactional_and_audited() -> None:
 
 
 def test_generate_all_failed_requeue_is_transactional_idempotent_and_audited() -> None:
-    migration = (DEPLOY_DIR / "requeue-all-failed-generate-20260802.sql").read_text()
+    migration = (
+        DEPLOY_DIR / "incidents" / "requeue-all-failed-generate-20260802.sql"
+    ).read_text()
 
     assert migration.startswith("\\set ON_ERROR_STOP on\n\nBEGIN;")
     assert "LOCK TABLE pgmq.q_swegen_generate" in migration

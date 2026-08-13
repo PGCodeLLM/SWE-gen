@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# DEPRECATED: superseded by the k3s pipeline (swegen/pipeline/), but STILL LIVE.
+# As of 2026-08-13 two workers are running run `20260716-sol-max-full-16w` from
+# separate checkouts (/data/nfs_shared/swegen, /data/work/slurm-swegen) for which
+# this repo is the source of truth. Do not delete without confirming that run has
+# finished.
+
 set -euo pipefail
 
 if [[ ! -f ".venv/bin/activate" ]]; then
