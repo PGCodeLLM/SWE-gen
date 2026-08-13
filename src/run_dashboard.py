@@ -9,6 +9,7 @@ import fcntl
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -27,9 +28,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import psycopg
 import yaml
 
 from swegen.ledger_repo import LedgerRepo
+
+LOGGER = logging.getLogger(__name__)
 
 CREATE_INSTANCE_RE = re.compile(r"--repo\x00([^\x00]+)\x00--pr\x00([^\x00]+)")
 STATUS_JOURNAL_GLOB = "orchestrator-instance-status*.jsonl"
@@ -1875,8 +1879,11 @@ def calculate_status(
                 ledger["backend"] = "postgres"
                 ledger["table"] = "postcheck_status"
                 ledger["rows"] = row["n"]
-        except Exception:
-            pass
+        except (psycopg.Error, ImportError, KeyError, OSError, RuntimeError) as exc:
+            # Non-fatal: the dashboard still renders, just without Postgres
+            # ledger provenance. Logged so a broken ledger is diagnosable
+            # instead of silently blank.
+            LOGGER.debug("postgres ledger provenance unavailable: %s", exc)
     stage_i_throughput = build_stage_i_throughput(throughput_latest)
 
     def percentage(numerator: int, denominator: int) -> float:
