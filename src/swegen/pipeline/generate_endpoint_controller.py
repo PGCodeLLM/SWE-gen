@@ -8,6 +8,10 @@ reconcile loop that converges the cluster to that desired state:
   static ``swegen-generate`` template but with the model endpoint/model/token
   injected as inline container env (no per-endpoint Secret);
 * replicas driven to the row's ``concurrency``;
+* a spec digest stamped as a Deployment annotation and compared each cycle, so
+  an operator changing ``base_url`` / ``model_id`` / ``auth_token`` (or a roll of
+  the static template) rolls the pool onto the new pod template instead of
+  silently leaving the running pods on the credentials they started with;
 * deleted / disabled / breaker-open rows scaled to zero (and their pods swept),
   removed rows' Deployments deleted;
 * an active health probe per endpoint that latches a durable per-endpoint
@@ -22,6 +26,7 @@ with ``swegen-generate-dyn-`` so it can never touch the static stage pipeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -42,6 +47,15 @@ _SERVICE_ACCOUNT_ROOT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 # Hard prefix guard: the controller must only ever manage its own dynamic
 # Deployments, never the static stage deployments (swegen-generate, etc.).
 DEPLOYMENT_PREFIX = "swegen-generate-dyn-"
+
+# Annotation carrying the digest of the pod-defining part of the desired spec.
+# The registry row owns real credentials, so "the Deployment already exists" is
+# NOT the same as "the Deployment is correct": an operator changing base_url /
+# model_id / auth_token used to leave the running pods on the old credentials
+# forever (the DB was authoritative only at creation time). Stamping a digest on
+# create and comparing it every cycle turns that silent divergence into a real
+# template patch.
+ENDPOINT_SPEC_DIGEST_ANNOTATION = "swegen.pgcode/endpoint-spec-digest"
 
 # HTTP statuses from an endpoint that count as "endpoint unhealthy".
 DEFAULT_UNHEALTHY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
@@ -313,9 +327,23 @@ class HttpEndpointProber:
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class DeploymentState:
+    """Live state of one dynamic Deployment: replica count + spec digest.
+
+    ``digest`` is ``None`` for a Deployment created before drift detection
+    existed (no annotation). That is treated as "unknown, therefore drifted" so
+    the very first reconcile adopts it and stamps a digest.
+    """
+
+    replicas: int
+    digest: str | None = None
+
+
 class DeploymentManager(Protocol):
-    def list_dynamic(self) -> dict[str, int]: ...
+    def list_dynamic(self) -> Mapping[str, DeploymentState | int]: ...
     def apply(self, slug: str, spec: Mapping[str, object], replicas: int) -> None: ...
+    def patch(self, slug: str, spec: Mapping[str, object], replicas: int) -> None: ...
     def scale(self, slug: str, replicas: int) -> None: ...
     def delete(self, slug: str) -> None: ...
     def sweep_pods(self, slug: str) -> int: ...
@@ -388,12 +416,12 @@ class KubernetesDeploymentManager:
 
         return self._request("GET", f"{self._deployments_url}/{source_deployment}")
 
-    def list_dynamic(self) -> dict[str, int]:
-        """Return {slug: desired_replicas} for existing dynamic Deployments."""
+    def list_dynamic(self) -> dict[str, DeploymentState]:
+        """Return {slug: DeploymentState} for existing dynamic Deployments."""
 
         listing = self._request("GET", self._deployments_url)
         items = listing.get("items")
-        out: dict[str, int] = {}
+        out: dict[str, DeploymentState] = {}
         if not isinstance(items, list):
             return out
         for item in items:
@@ -405,7 +433,18 @@ class KubernetesDeploymentManager:
                 continue
             spec = item.get("spec")
             replicas = spec.get("replicas") if isinstance(spec, Mapping) else 0
-            out[name[len(DEPLOYMENT_PREFIX):]] = int(replicas or 0)
+            annotations = (
+                metadata.get("annotations") if isinstance(metadata, Mapping) else None
+            )
+            digest = (
+                annotations.get(ENDPOINT_SPEC_DIGEST_ANNOTATION)
+                if isinstance(annotations, Mapping)
+                else None
+            )
+            out[name[len(DEPLOYMENT_PREFIX):]] = DeploymentState(
+                replicas=int(replicas or 0),
+                digest=digest if isinstance(digest, str) and digest else None,
+            )
         return out
 
     def apply(self, slug: str, spec: Mapping[str, object], replicas: int) -> None:
@@ -417,10 +456,46 @@ class KubernetesDeploymentManager:
         except RuntimeError:
             exists = False
         if exists:
-            self.scale(slug, replicas)
+            # Pre-existing Deployment: converge the template too, not just the
+            # replica count. Returning after scale() here is what let a changed
+            # base_url/model_id/auth_token never reach running pods.
+            self.patch(slug, spec, replicas)
             return
         manifest = dict(spec)
         self._request("POST", self._deployments_url, dict(manifest))
+
+    def patch(self, slug: str, spec: Mapping[str, object], replicas: int) -> None:
+        """Roll an existing dynamic Deployment onto a new pod template.
+
+        Sends the desired ``spec`` (pod template, selector labels, replicas) plus
+        the refreshed digest annotation as a merge patch, so the Deployment
+        controller performs a normal rolling update onto the new credentials.
+
+        ``spec.selector`` is deliberately NOT patched: it is immutable on an
+        existing Deployment and the API server rejects a change to it. The
+        selector only ever contains the endpoint slug, which cannot change for a
+        given Deployment name, so omitting it is safe.
+        """
+
+        name = self._guard(slug)
+        url = f"{self._deployments_url}/{name}"
+        desired = dict(spec)
+        desired_spec = desired.get("spec")
+        desired_spec = desired_spec if isinstance(desired_spec, Mapping) else {}
+        metadata = desired.get("metadata")
+        annotations = (
+            metadata.get("annotations") if isinstance(metadata, Mapping) else None
+        )
+        payload: dict[str, object] = {
+            "metadata": {"annotations": dict(annotations or {})},
+            "spec": {
+                "template": desired_spec.get("template"),
+                "replicas": max(0, int(replicas)),
+            },
+        }
+        self._request(
+            "PATCH", url, payload, content_type="application/merge-patch+json"
+        )
 
     def scale(self, slug: str, replicas: int) -> None:
         name = self._guard(slug)
@@ -471,10 +546,15 @@ class KubernetesDeploymentManager:
 # Deployment spec builder (clones the static generate template)
 # --------------------------------------------------------------------------- #
 
-# Env var names the endpoint's inline model config populates. Kept in sync with
-# the model-credential secret contract (deploy/k3s/create-secrets.sh) so a
-# Claude Code worker resolves (endpoint, model, token) exactly as it does from a
-# secret's envFrom (see swegen.model_settings.load_model_settings).
+# Env var names the endpoint row OWNS and overrides inline. This is the
+# credential subset of the model-credential secret contract
+# (deploy/k3s/create-secrets.sh) -- deliberately NOT the whole contract. That
+# secret also carries non-credential tuning keys (CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW) which the endpoint row has no opinion about;
+# those must keep flowing through the template's ``envFrom`` untouched. Inline
+# container ``env`` takes precedence over ``envFrom`` for a duplicate key, so
+# listing a key here is what makes the row authoritative for it, and leaving a
+# key out is what lets the secret's value survive.
 _MODEL_ENV_KEYS = (
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
@@ -488,6 +568,19 @@ _MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "SWEGEN_CLAUDE_FAST_MODEL",
+)
+
+# Non-credential keys that live in the same model-credential Secret but are pure
+# worker tuning, identical for every endpoint. Dropping that Secret from
+# ``envFrom`` (which we must, so one endpoint can never inherit another's token)
+# used to take these with it, silently running every dynamic pool without a
+# context cap while the static generate pool had one. They are re-attached by
+# name via ``secretKeyRef`` -- explicitly, rather than by keeping the whole
+# Secret mounted, so a future credential key added to that Secret is still not
+# inherited by a dynamic pool.
+_CARRIED_SECRET_ENV_KEYS = (
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
 )
 
 
@@ -512,15 +605,48 @@ def model_env(row: EndpointRow) -> list[dict[str, str]]:
     return [{"name": key, "value": values[key]} for key in _MODEL_ENV_KEYS]
 
 
+def carried_secret_env(secret_names: Sequence[str]) -> list[dict[str, object]]:
+    """Re-attach the non-credential tuning keys dropped with the credential Secret.
+
+    Returns ``valueFrom.secretKeyRef`` entries (marked ``optional``) for each key
+    in ``_CARRIED_SECRET_ENV_KEYS``, pointing at the model-credential Secret the
+    template had mounted. ``optional: true`` matters: an endpoint pool must not
+    become unschedulable just because a credential Secret was rotated to a new
+    name -- it falls back to the worker's own default, exactly as before.
+
+    The reference is resolved by the kubelet, not by this controller, so this
+    needs no ``secrets`` RBAC (the controller Role grants deployments + pods only).
+    """
+
+    entries: list[dict[str, object]] = []
+    for secret_name in secret_names:
+        for key in _CARRIED_SECRET_ENV_KEYS:
+            entries.append(
+                {
+                    "name": key,
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": secret_name,
+                            "key": key,
+                            "optional": True,
+                        }
+                    },
+                }
+            )
+    return entries
+
+
 def build_deployment_spec(row: EndpointRow, template: Mapping[str, object]) -> dict[str, object]:
     """Clone the static generate Deployment template for this endpoint.
 
-    ``template`` is the parsed ``swegen-generate`` Deployment (from the manifest,
-    loaded once at startup). The clone keeps the whole pod spec but: renames to
-    ``swegen-generate-dyn-<slug>``, adds a ``swegen.pgcode/endpoint`` label so the
-    pod sweep and dashboard can attribute pods to this endpoint, drops the
-    model-credential secret from ``envFrom``, appends the inline model env, and
-    sets replicas.
+    ``template`` is the parsed ``swegen-generate`` Deployment (re-read from the
+    live cluster every reconcile cycle, so an image/configmap/envFrom roll of the
+    static pool propagates here). The clone keeps the whole pod spec but: renames
+    to ``swegen-generate-dyn-<slug>``, adds a ``swegen.pgcode/endpoint`` label so
+    the pod sweep and dashboard can attribute pods to this endpoint, drops the
+    model-credential secret from ``envFrom`` while preserving its non-credential
+    tuning keys, appends the inline model env, sets replicas, and stamps the
+    spec digest annotation used for drift detection.
     """
 
     import copy
@@ -529,10 +655,16 @@ def build_deployment_spec(row: EndpointRow, template: Mapping[str, object]) -> d
     name = deployment_name_for(row.slug)
     metadata = manifest.setdefault("metadata", {})
     metadata["name"] = name
-    metadata.pop("resourceVersion", None)
-    metadata.pop("uid", None)
-    metadata.pop("creationTimestamp", None)
-    metadata.pop("annotations", None)
+    # Strip server-populated identity/bookkeeping: the template is read back from
+    # the live static Deployment, and carrying its resourceVersion/uid/generation
+    # into a POST is rejected, while its revision + last-applied annotations would
+    # make the digest churn on every unrelated roll of swegen-generate.
+    for volatile in ("resourceVersion", "uid", "creationTimestamp", "annotations",
+                     "generation", "managedFields", "ownerReferences", "selfLink"):
+        metadata.pop(volatile, None)
+    # ``status`` is read-only server state; it must never be sent back nor feed
+    # the digest (it changes on every pod restart of the static pool).
+    manifest.pop("status", None)
 
     spec = manifest.setdefault("spec", {})
     spec["replicas"] = max(0, int(row.concurrency))
@@ -552,6 +684,13 @@ def build_deployment_spec(row: EndpointRow, template: Mapping[str, object]) -> d
     for container in containers:
         if container.get("name") != "worker":
             continue
+        dropped_secrets = [
+            str(source.get("secretRef", {}).get("name", ""))
+            for source in container.get("envFrom", [])
+            if str(source.get("secretRef", {}).get("name", "")).startswith(
+                "swegen-model-credentials-"
+            )
+        ]
         env_from = [
             source
             for source in container.get("envFrom", [])
@@ -560,14 +699,45 @@ def build_deployment_spec(row: EndpointRow, template: Mapping[str, object]) -> d
             )
         ]
         container["envFrom"] = env_from
+        overridden = set(_MODEL_ENV_KEYS) | set(_CARRIED_SECRET_ENV_KEYS)
         env = [
             entry
             for entry in container.get("env", [])
-            if entry.get("name") not in set(_MODEL_ENV_KEYS)
+            if entry.get("name") not in overridden
         ]
+        env.extend(carried_secret_env(dropped_secrets))
         env.extend(model_env(row))
         container["env"] = env
+
+    # Stamp the drift digest LAST, over the finished spec, so it covers both the
+    # row's credentials and everything inherited from the template.
+    metadata["annotations"] = {
+        ENDPOINT_SPEC_DIGEST_ANNOTATION: spec_digest(manifest),
+    }
     return manifest
+
+
+def spec_digest(manifest: Mapping[str, object]) -> str:
+    """Stable sha256 over the pod-defining part of a desired Deployment spec.
+
+    Covers ``spec.template`` (image, envFrom, and the inline model env carrying
+    base_url/model_id/auth_token) and ``spec.selector``. Deliberately EXCLUDES
+    ``spec.replicas``: replica count is already reconciled by the scale path, and
+    folding it in would turn every ordinary scale-up into a full template patch
+    that rolls every pod in the pool.
+
+    ``sort_keys`` makes the digest independent of dict ordering, so re-reading
+    the same template from the API twice cannot produce a spurious patch.
+    """
+
+    spec = manifest.get("spec")
+    spec_map: Mapping[str, object] = spec if isinstance(spec, Mapping) else {}
+    material = {
+        "template": spec_map.get("template"),
+        "selector": spec_map.get("selector"),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -578,21 +748,47 @@ def build_deployment_spec(row: EndpointRow, template: Mapping[str, object]) -> d
 @dataclass
 class ReconcilePlan:
     apply: list[tuple[str, int]] = field(default_factory=list)   # (slug, replicas) create/ensure
+    patch: list[tuple[str, int]] = field(default_factory=list)   # (slug, replicas) template drift
     scale: list[tuple[str, int]] = field(default_factory=list)   # (slug, replicas)
     delete: list[str] = field(default_factory=list)              # slugs
 
 
+def _as_state(value: DeploymentState | int) -> DeploymentState:
+    """Accept a bare replica count as well as a DeploymentState.
+
+    ``list_dynamic`` used to return ``{slug: replicas}``. Keeping the planner
+    tolerant of the old shape means a fake/manager that has not been updated (or
+    a caller passing a plain int map) still plans correctly -- it simply has no
+    digest, and so is treated as drifted exactly once.
+    """
+
+    return value if isinstance(value, DeploymentState) else DeploymentState(int(value))
+
+
 def plan_reconcile(
-    endpoints: Sequence[EndpointRow], existing: Mapping[str, int]
+    endpoints: Sequence[EndpointRow],
+    existing: Mapping[str, DeploymentState | int],
+    desired_digests: Mapping[str, str] | None = None,
 ) -> ReconcilePlan:
-    """Pure planner: given registry rows and existing {slug: replicas}, decide actions.
+    """Pure planner: given registry rows and live state, decide actions.
 
     A row that is disabled or breaker-open targets 0 replicas (kept, scaled down);
     an enabled healthy row targets its concurrency. An existing dynamic
     Deployment whose slug is no longer in the registry is deleted.
+
+    ``desired_digests`` maps slug -> digest of the freshly rendered spec. When it
+    disagrees with the live Deployment's annotation the row is routed to
+    ``patch`` (a real template roll) instead of ``scale``, which is how a changed
+    base_url/model_id/auth_token reaches running pods. A slug missing from
+    ``desired_digests`` is not drift-checked, so callers that do not render specs
+    keep the old create/scale/delete behaviour exactly.
+
+    ``patch`` supersedes ``scale`` for a given slug: the patch carries the target
+    replica count itself, so emitting both would issue two writes for one change.
     """
 
     plan = ReconcilePlan()
+    digests = desired_digests or {}
     registry_slugs = {row.slug for row in endpoints}
     for row in endpoints:
         target = 0 if (not row.enabled or row.breaker_open) else max(0, row.concurrency)
@@ -600,7 +796,24 @@ def plan_reconcile(
             if target > 0:
                 plan.apply.append((row.slug, target))
             # target 0 and not existing: nothing to do.
-        elif existing[row.slug] != target:
+            continue
+        state = _as_state(existing[row.slug])
+        desired_digest = digests.get(row.slug)
+        # Only a KNOWN mismatch is drift. If we did not render a digest for this
+        # slug, or the live Deployment predates the annotation, fall through to
+        # the replica comparison rather than rolling the pool on every cycle.
+        drifted = (
+            desired_digest is not None
+            and state.digest is not None
+            and state.digest != desired_digest
+        )
+        # A Deployment with no digest annotation yet is adopted once: patch it so
+        # it gets stamped, but only when it is actually running pods or is meant
+        # to. Adopting a scaled-to-zero pool costs nothing and rolls no pods.
+        unstamped = desired_digest is not None and state.digest is None
+        if drifted or unstamped:
+            plan.patch.append((row.slug, target))
+        elif state.replicas != target:
             plan.scale.append((row.slug, target))
     for slug in existing:
         if slug not in registry_slugs:
@@ -654,11 +867,27 @@ def reconcile_once(
     # Re-read after probing so trips this cycle are reflected in the plan.
     endpoints = load_endpoints(connection)
     existing = manager.list_dynamic()
-    plan = plan_reconcile(endpoints, existing)
-    by_slug = {row.slug: row for row in endpoints}
+
+    # Render every desired spec up front: the digest of the rendered spec is what
+    # the planner compares against the live Deployment's annotation, so a changed
+    # credential becomes a template patch rather than a silent no-op.
+    desired_specs = {
+        row.slug: build_deployment_spec(row, template) for row in endpoints
+    }
+    desired_digests = {
+        slug: spec_digest(spec) for slug, spec in desired_specs.items()
+    }
+
+    plan = plan_reconcile(endpoints, existing, desired_digests)
 
     for slug, replicas in plan.apply:
-        manager.apply(slug, build_deployment_spec(by_slug[slug], template), replicas)
+        manager.apply(slug, desired_specs[slug], replicas)
+    for slug, replicas in plan.patch:
+        manager.patch(slug, desired_specs[slug], replicas)
+        # A patch to zero replicas still needs the sweep: scaling down only marks
+        # pods for deletion and generate carries an 18000s grace period.
+        if replicas == 0:
+            manager.sweep_pods(slug)
     for slug, replicas in plan.scale:
         manager.scale(slug, replicas)
         if replicas == 0:
@@ -707,12 +936,27 @@ def main() -> None:
 
     config = _config_from_environment()
     manager = KubernetesDeploymentManager(namespace=str(config["namespace"]))
-    # Prefer the live static Deployment as the clone template (no manifest mount);
-    # fall back to a mounted manifest path if the source Deployment is absent.
-    try:
-        template = manager.fetch_template()
-    except RuntimeError:
-        template = load_generate_template(Path(str(config["manifest"])))
+    manifest_path = Path(str(config["manifest"]))
+
+    def current_template() -> Mapping[str, object]:
+        """Re-read the clone template every cycle.
+
+        Loading this once at startup meant a roll of the static swegen-generate
+        Deployment (new image, new configmap key, new envFrom) never reached the
+        dynamic pools until the controller pod happened to restart. Reading it
+        per cycle makes the live static Deployment authoritative continuously;
+        the digest comparison then turns a real change into one rolling patch and
+        an unchanged template into no writes at all.
+
+        Prefers the live Deployment (no manifest mount); falls back to the
+        mounted manifest path if the source Deployment is absent.
+        """
+
+        try:
+            return manager.fetch_template()
+        except RuntimeError:
+            return load_generate_template(manifest_path)
+
     prober = HttpEndpointProber(timeout_seconds=float(config["probe_timeout"]))
     pool = db.get_pool()
     stop = False
@@ -726,6 +970,7 @@ def main() -> None:
     try:
         while not stop:
             try:
+                template = current_template()
                 with pool.connection() as connection:
                     plan = reconcile_once(
                         connection,
@@ -735,8 +980,8 @@ def main() -> None:
                         consecutive_trip_threshold=int(config["trip_threshold"]),
                     )
                 print(
-                    f"reconcile applied={len(plan.apply)} scaled={len(plan.scale)} "
-                    f"deleted={len(plan.delete)}",
+                    f"reconcile applied={len(plan.apply)} patched={len(plan.patch)} "
+                    f"scaled={len(plan.scale)} deleted={len(plan.delete)}",
                     flush=True,
                 )
             except Exception as error:

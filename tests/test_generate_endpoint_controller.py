@@ -7,10 +7,14 @@ contract, and the probe -> latch flow with fake k8s/DB/prober collaborators.
 from __future__ import annotations
 
 import os
+import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from swegen.pipeline.generate_endpoint_controller import (
     DEPLOYMENT_PREFIX,
+    ENDPOINT_SPEC_DIGEST_ANNOTATION,
+    DeploymentState,
     EndpointRow,
     ProbeResult,
     build_deployment_spec,
@@ -18,9 +22,16 @@ from swegen.pipeline.generate_endpoint_controller import (
     model_env,
     plan_reconcile,
     reconcile_once,
+    spec_digest,
 )
 
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+
+
+def _digest_of(spec):
+    """Digest a rendered spec the way the controller stamps it."""
+
+    return spec["metadata"]["annotations"][ENDPOINT_SPEC_DIGEST_ANNOTATION]
 
 
 def _row(slug, *, concurrency=2, enabled=True, breaker_open=False, consecutive_fail=0):
@@ -110,7 +121,9 @@ def test_build_spec_drops_credential_secret_and_injects_inline_model_env():
     container = spec["spec"]["template"]["spec"]["containers"][0]
     secret_names = [e.get("secretRef", {}).get("name") for e in container["envFrom"]]
     assert not any(str(n).startswith("swegen-model-credentials-") for n in secret_names)
-    env = {e["name"]: e["value"] for e in container["env"]}
+    # Literal env only: the container also carries valueFrom entries for the
+    # non-credential keys carried over from the dropped credential Secret.
+    env = {e["name"]: e["value"] for e in container["env"] if "value" in e}
     assert env["ANTHROPIC_BASE_URL"] == "http://1.95.77.23:3000"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"  # stale one replaced
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-secret"
@@ -172,24 +185,45 @@ class _FakeConn:
 
 
 class _FakeManager:
+    """Fake k8s manager tracking both replica count and spec digest per slug.
+
+    ``existing`` accepts either a bare replica count (digest unknown, i.e. a
+    Deployment predating drift detection) or a ``DeploymentState``.
+    """
+
     def __init__(self, existing):
-        self.existing = dict(existing)
+        self.existing = {
+            slug: state if isinstance(state, DeploymentState) else DeploymentState(state)
+            for slug, state in dict(existing).items()
+        }
         self.calls = []
+        self.specs = {}
 
     def list_dynamic(self):
         return dict(self.existing)
 
     def apply(self, slug, spec, replicas):
         self.calls.append(("apply", slug, replicas))
-        self.existing[slug] = replicas
+        self.specs[slug] = spec
+        self.existing[slug] = DeploymentState(replicas, _digest_of(spec))
+
+    def patch(self, slug, spec, replicas):
+        self.calls.append(("patch", slug, replicas))
+        self.specs[slug] = spec
+        self.existing[slug] = DeploymentState(replicas, _digest_of(spec))
 
     def scale(self, slug, replicas):
         self.calls.append(("scale", slug, replicas))
-        self.existing[slug] = replicas
+        self.existing[slug] = DeploymentState(replicas, self.existing[slug].digest)
 
     def delete(self, slug):
         self.calls.append(("delete", slug))
         self.existing.pop(slug, None)
+
+    def converged(self, slug):
+        """Digest the manager would hold once this slug's spec is applied."""
+
+        return self.existing[slug].digest
 
     def sweep_pods(self, slug):
         self.calls.append(("sweep", slug))
@@ -253,13 +287,327 @@ def test_reconcile_below_threshold_does_not_trip():
 
 
 def test_reconcile_breaker_open_endpoint_is_scaled_to_zero_not_probed():
-    rows = _tuple_rows([_row("dead", concurrency=4, breaker_open=True)])
-    conn = _FakeConn(rows)
-    manager = _FakeManager(existing={"dead": 4})
+    """A breaker-open pool that is otherwise converged is scaled down, not rolled."""
+
+    row = _row("dead", concurrency=4, breaker_open=True)
+    conn = _FakeConn(_tuple_rows([row]))
+    # Already carries the digest of its rendered spec => no template drift, so the
+    # only thing left to reconcile is the replica count.
+    converged = _digest_of(build_deployment_spec(row, _TEMPLATE))
+    manager = _FakeManager(existing={"dead": DeploymentState(4, converged)})
     prober = _FakeProber(ProbeResult(ok=True, status=200, detail="ok"))
     reconcile_once(conn, manager, prober, _TEMPLATE, now=lambda: NOW)
     assert prober.probes == 0                       # open endpoints are not probed
     assert ("scale", "dead", 0) in manager.calls    # driven to zero
+    assert not any(c[0] == "patch" for c in manager.calls)
+    assert ("sweep", "dead") in manager.calls       # pods force-deleted, not left to grace
+
+
+# --- credential drift: digest, patch, idempotence ----------------------------
+#
+# The bug these pin: apply() returned after scale() when the Deployment already
+# existed, and plan_reconcile only emitted apply for an ABSENT slug. So changing
+# base_url/model_id/auth_token in the registry never reached running pods, while
+# the reconcile probe validated the DB row's credentials -- a green breaker over
+# pods running dead credentials.
+
+
+def _converged_manager(rows, replicas_by_slug, template=_TEMPLATE):
+    """Manager whose live state already matches the rendered spec for each row."""
+
+    existing = {
+        row.slug: DeploymentState(
+            replicas_by_slug[row.slug],
+            _digest_of(build_deployment_spec(row, template)),
+        )
+        for row in rows
+    }
+    return _FakeManager(existing=existing)
+
+
+def test_digest_changes_when_any_credential_changes():
+    """model_id, auth_token and base_url each move the digest."""
+
+    base = _row("s")
+    baseline = _digest_of(build_deployment_spec(base, _TEMPLATE))
+
+    for field, value in (
+        ("model_id", "some-other-model"),
+        ("auth_token", "sk-rotated"),
+        ("base_url", "http://7.244.3.251:8088"),
+    ):
+        changed = replace(base, **{field: value})
+        digest = _digest_of(build_deployment_spec(changed, _TEMPLATE))
+        assert digest != baseline, f"{field} change must move the digest"
+
+
+def test_digest_is_stable_for_an_unchanged_row():
+    """Re-rendering the same row twice yields the same digest (no spurious roll)."""
+
+    row = _row("s")
+    first = _digest_of(build_deployment_spec(row, _TEMPLATE))
+    second = _digest_of(build_deployment_spec(row, _TEMPLATE))
+    assert first == second
+
+
+def test_digest_ignores_replica_count():
+    """Scaling must not be mistaken for template drift.
+
+    Folding replicas into the digest would turn every ordinary scale-up into a
+    full template patch, rolling every pod in the pool.
+    """
+
+    a = _digest_of(build_deployment_spec(_row("s", concurrency=2), _TEMPLATE))
+    b = _digest_of(build_deployment_spec(_row("s", concurrency=40), _TEMPLATE))
+    assert a == b
+
+
+def test_build_spec_stamps_digest_annotation_on_create():
+    spec = build_deployment_spec(_row("s"), _TEMPLATE)
+    annotation = spec["metadata"]["annotations"][ENDPOINT_SPEC_DIGEST_ANNOTATION]
+    assert annotation == spec_digest(spec)
+    assert len(annotation) == 64  # sha256 hex
+
+
+def test_changed_credential_produces_patch_not_scale():
+    """The core regression: a rotated token rolls the pool onto a new template."""
+
+    old = _row("a", concurrency=2)
+    manager = _converged_manager([old], {"a": 2})
+    # The registry now holds a different token at the SAME concurrency, so there
+    # is nothing for the replica-comparison path to notice.
+    new = replace(old, auth_token="sk-rotated")
+    conn = _FakeConn(_tuple_rows([new]))
+    prober = _FakeProber(ProbeResult(ok=True, status=200, detail="ok"))
+
+    plan = reconcile_once(conn, manager, prober, _TEMPLATE, now=lambda: NOW)
+
+    assert ("a", 2) in plan.patch
+    assert plan.scale == []
+    assert ("patch", "a", 2) in manager.calls
+    # The patched spec carries the NEW token, and the stored digest was updated.
+    env = {e["name"]: e["value"] for e in
+           manager.specs["a"]["spec"]["template"]["spec"]["containers"][0]["env"]
+           if "value" in e}
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-rotated"
+    assert manager.converged("a") == _digest_of(manager.specs["a"])
+
+
+def test_changed_model_id_patches_and_updates_annotation():
+    old = _row("a", concurrency=3)
+    manager = _converged_manager([old], {"a": 3})
+    before = manager.converged("a")
+    new = replace(old, model_id="glm-5.2-thinking-npu")
+    conn = _FakeConn(_tuple_rows([new]))
+
+    reconcile_once(conn, manager, _FakeProber(ProbeResult(ok=True, status=200,
+                                                          detail="ok")),
+                   _TEMPLATE, now=lambda: NOW)
+
+    assert ("patch", "a", 3) in manager.calls
+    assert manager.converged("a") != before          # annotation moved
+    spec = manager.specs["a"]
+    assert spec["metadata"]["annotations"][ENDPOINT_SPEC_DIGEST_ANNOTATION] == \
+        manager.converged("a")
+    env = {e["name"]: e["value"] for e in
+           spec["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
+    assert env["ANTHROPIC_MODEL"] == "glm-5.2-thinking-npu"
+
+
+def test_unchanged_row_produces_no_patch_and_no_scale():
+    """Idempotence. A spurious patch here rolls every generate pod in the pool."""
+
+    row = _row("a", concurrency=2)
+    manager = _converged_manager([row], {"a": 2})
+    conn = _FakeConn(_tuple_rows([row]))
+    prober = _FakeProber(ProbeResult(ok=True, status=200, detail="ok"))
+
+    plan = reconcile_once(conn, manager, prober, _TEMPLATE, now=lambda: NOW)
+
+    assert plan.patch == [] and plan.scale == [] and plan.apply == []
+    assert not any(c[0] in {"patch", "apply", "scale"} for c in manager.calls)
+
+
+def test_repeated_reconcile_is_stable():
+    """Three cycles over an unchanged registry issue no writes after convergence."""
+
+    row = _row("a", concurrency=2)
+    manager = _converged_manager([row], {"a": 2})
+    prober = _FakeProber(ProbeResult(ok=True, status=200, detail="ok"))
+    for _ in range(3):
+        reconcile_once(_FakeConn(_tuple_rows([row])), manager, prober,
+                       _TEMPLATE, now=lambda: NOW)
+    assert manager.calls == []
+
+
+def test_unchanged_row_at_wrong_replicas_scales_without_patching():
+    """Preserved behaviour: a pure concurrency change is still a cheap scale."""
+
+    row = _row("a", concurrency=6)
+    manager = _converged_manager([row], {"a": 2})   # live at 2, wants 6
+    conn = _FakeConn(_tuple_rows([row]))
+    plan = reconcile_once(conn, manager,
+                          _FakeProber(ProbeResult(ok=True, status=200, detail="ok")),
+                          _TEMPLATE, now=lambda: NOW)
+    assert ("a", 6) in plan.scale
+    assert plan.patch == []
+    assert ("scale", "a", 6) in manager.calls
+
+
+def test_deployment_without_digest_annotation_is_adopted_once():
+    """A pool created before drift detection gets stamped, then goes quiet."""
+
+    row = _row("a", concurrency=2)
+    manager = _FakeManager(existing={"a": DeploymentState(2, None)})
+    prober = _FakeProber(ProbeResult(ok=True, status=200, detail="ok"))
+
+    first = reconcile_once(_FakeConn(_tuple_rows([row])), manager, prober,
+                           _TEMPLATE, now=lambda: NOW)
+    assert ("a", 2) in first.patch                   # adopted + stamped
+
+    second = reconcile_once(_FakeConn(_tuple_rows([row])), manager, prober,
+                            _TEMPLATE, now=lambda: NOW)
+    assert second.patch == [] and second.scale == []  # and never again
+
+
+def test_plan_reconcile_without_digests_keeps_legacy_behaviour():
+    """Callers that pass no digests get exactly the old create/scale/delete plan."""
+
+    endpoints = [_row("a", concurrency=4), _row("b", concurrency=3),
+                 _row("c", concurrency=0)]
+    plan = plan_reconcile(endpoints, {"a": 2, "c": 5, "gone": 1})
+    assert ("b", 3) in plan.apply
+    assert ("a", 4) in plan.scale and ("c", 0) in plan.scale
+    assert plan.delete == ["gone"]
+    assert plan.patch == []
+
+
+# --- context-cap env keys survive into the dynamic pool ----------------------
+
+
+def test_context_cap_env_keys_survive_the_dropped_credential_secret():
+    """CLAUDE_CODE_MAX_CONTEXT_TOKENS / AUTO_COMPACT_WINDOW must reach dyn pods.
+
+    They live in the same model-credential Secret the clone drops from envFrom
+    (create-secrets.sh writes them there), so re-adding only the 12 credential
+    keys silently ran every dynamic pool without a context cap.
+    """
+
+    spec = build_deployment_spec(_row("s"), _TEMPLATE)
+    container = spec["spec"]["template"]["spec"]["containers"][0]
+    by_name = {e["name"]: e for e in container["env"]}
+
+    for key in ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
+        assert key in by_name, f"{key} was dropped with the credential secret"
+        ref = by_name[key]["valueFrom"]["secretKeyRef"]
+        # Sourced from the very Secret the template had mounted...
+        assert ref["name"] == "swegen-model-credentials-glm52-thinking-npu-20260804"
+        assert ref["key"] == key
+        # ...and optional, so a rotated/renamed Secret cannot wedge the pool.
+        assert ref["optional"] is True
+
+    # The credential keys themselves are still inline (row is authoritative).
+    assert by_name["ANTHROPIC_AUTH_TOKEN"]["value"] == "sk-secret"
+    # ...and the Secret is still NOT mounted wholesale, so one endpoint can never
+    # inherit another endpoint's token via envFrom.
+    secret_names = [e.get("secretRef", {}).get("name") for e in container["envFrom"]]
+    assert not any(str(n).startswith("swegen-model-credentials-") for n in secret_names)
+
+
+def test_no_carried_env_when_template_has_no_credential_secret():
+    """A template without a credential Secret gains no dangling secretKeyRefs."""
+
+    import copy
+
+    template = copy.deepcopy(_TEMPLATE)
+    container = template["spec"]["template"]["spec"]["containers"][0]
+    container["envFrom"] = [e for e in container["envFrom"]
+                            if not str(e.get("secretRef", {}).get("name", ""))
+                            .startswith("swegen-model-credentials-")]
+
+    spec = build_deployment_spec(_row("s"), template)
+    names = {e["name"] for e in
+             spec["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in names
+
+
+# --- the template is re-read every cycle -------------------------------------
+
+
+def test_template_roll_reaches_dynamic_pools_without_controller_restart():
+    """A new image on the static template rolls the dyn pool on the next cycle.
+
+    fetch_template() used to run once at startup, so an image/configmap/envFrom
+    roll of swegen-generate never reached dyn pools until the controller pod
+    happened to restart.
+    """
+
+    import copy
+
+    row = _row("a", concurrency=2)
+    manager = _converged_manager([row], {"a": 2})
+    prober = _FakeProber(ProbeResult(ok=True, status=200, detail="ok"))
+
+    # Same template => quiet.
+    assert reconcile_once(_FakeConn(_tuple_rows([row])), manager, prober,
+                          _TEMPLATE, now=lambda: NOW).patch == []
+
+    # Static pool rolls to a new image; the controller re-reads the template.
+    rolled = copy.deepcopy(_TEMPLATE)
+    rolled["spec"]["template"]["spec"]["containers"][0]["image"] = "swegen-worker:e2e"
+
+    plan = reconcile_once(_FakeConn(_tuple_rows([row])), manager, prober,
+                          rolled, now=lambda: NOW)
+    assert ("a", 2) in plan.patch
+    assert manager.specs["a"]["spec"]["template"]["spec"]["containers"][0]["image"] \
+        == "swegen-worker:e2e"
+
+
+def test_main_reads_template_every_cycle(monkeypatch):
+    """main() must call fetch_template() per cycle, not once at startup."""
+
+    from swegen.pipeline import generate_endpoint_controller as ctrl
+
+    calls = {"fetch": 0, "reconcile": 0}
+
+    class _Manager:
+        def fetch_template(self):
+            calls["fetch"] += 1
+            return _TEMPLATE
+
+    class _Pool:
+        def connection(self):
+            class _Ctx:
+                def __enter__(self_):
+                    return _FakeConn([])
+
+                def __exit__(self_, *a):
+                    return False
+
+            return _Ctx()
+
+    def _reconcile(*args, **kwargs):
+        calls["reconcile"] += 1
+        if calls["reconcile"] >= 3:
+            raise KeyboardInterrupt
+        return ctrl.ReconcilePlan()
+
+    monkeypatch.setattr(ctrl, "KubernetesDeploymentManager", lambda **kw: _Manager())
+    monkeypatch.setattr(ctrl, "HttpEndpointProber", lambda **kw: None)
+    monkeypatch.setattr(ctrl.db, "get_pool", lambda: _Pool())
+    monkeypatch.setattr(ctrl.db, "close_pool", lambda: None)
+    monkeypatch.setattr(ctrl, "reconcile_once", _reconcile)
+    monkeypatch.setattr(ctrl.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(ctrl.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(sys, "argv", ["controller"])
+
+    try:
+        ctrl.main()
+    except KeyboardInterrupt:
+        pass
+
+    # One template read per reconcile cycle, not one for the process lifetime.
+    assert calls["fetch"] == calls["reconcile"] >= 3
 
 
 # --------------------------------------------------------------------------- #
