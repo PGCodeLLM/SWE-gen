@@ -227,7 +227,7 @@ async def _validate_batch(
 ) -> list[ValidationResult]:
     """Run validations in parallel with progress bar."""
     semaphore = asyncio.Semaphore(max_parallel)
-    
+
     # Track completed count for docker pruning
     completed_count = 0
     prune_lock = asyncio.Lock()
@@ -325,7 +325,7 @@ async def _validate_batch(
             return
         if count % docker_prune_batch != 0:
             return
-        
+
         async with prune_lock:
             await asyncio.to_thread(_prune_docker, console)
 
@@ -344,7 +344,7 @@ async def _validate_batch(
             for coro in asyncio.as_completed([validate_one(d) for d in task_dirs]):
                 results.append(await coro)
                 progress.update(task_prog, advance=1)
-                
+
                 # Docker cleanup after batch (local docker only)
                 completed_count = len(results)
                 await maybe_prune_docker(completed_count)

@@ -1,0 +1,163 @@
+# Trajectory registry backfill.
+#
+# Task images are meant to land in BOTH SWR registries, but the ledger shows
+# thousands of instances with a verified registry='platform' row and no
+# registry='trajectory' row. This single pod scans hourly for that backlog and
+# copies each image platform -> trajectory (docker pull, retag, docker push),
+# deleting every local tag immediately after each instance.
+#
+# One replica only. The work is I/O bound on the SWR upload, and the copy loop
+# already runs 8 concurrent pushes internally
+# (SWEGEN_TRAJECTORY_SYNC_THREADS); a second pod would duplicate every pull
+# and double the node's disk churn for no extra throughput.
+#
+# Deliberately NOT a worker Deployment: it consumes no PGMQ queue, so it takes
+# no --stage argument and overrides the image ENTRYPOINT with its own module.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swegen-trajectory-sync
+  namespace: swegen-pipeline
+  labels:
+    app.kubernetes.io/name: swegen-trajectory-sync
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two overlapping pods would pull the same
+  # backlogged images onto (potentially) the same node at once, which is
+  # exactly the disk pressure this job is written to avoid.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swegen-trajectory-sync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swegen-trajectory-sync
+    spec:
+      automountServiceAccountToken: false
+      # One image copy (pull + push of a multi-GB task image over the corporate
+      # link) can legitimately run for tens of minutes. SIGTERM stops the pod
+      # from starting new instances; this window lets the in-flight ones finish
+      # so their finally-block cleanup runs and no local image is stranded.
+      terminationGracePeriodSeconds: 1800
+      containers:
+        - name: trajectory-sync
+          # Must be an image built AFTER the TRAJECTORY_SWR_REPOSITORY fix.
+          # swegen-worker:e2e still hardcodes the platform repository path for
+          # trajectory, so every tag it builds points at a path that does not
+          # exist and every push silently fails.
+          image: swegen-worker:trajectory-path-fix-20260813
+          # The tag is present on all four nodes; never reach out to a registry
+          # for it (the cluster cannot pull swegen-worker from anywhere).
+          imagePullPolicy: Never
+          command: ["python", "-m", "swegen.tools.trajectory_sync"]
+          # Corruption can delete /app (the image WORKDIR); the OCI runtime then
+          # cannot chdir into it to launch the liveness probe, so the probe
+          # ERRORS ("unknown state") and never restarts the pod. Run from / so
+          # the probe exec always launches and can fail properly.
+          workingDir: /
+          envFrom:
+            - configMapRef:
+                name: swegen-pipeline-config
+            - secretRef:
+                name: swegen-database
+            - secretRef:
+                name: swegen-runtime-proxy
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SWEGEN_TRAJECTORY_SYNC_THREADS
+              value: "8"
+            - name: SWEGEN_TRAJECTORY_SYNC_INTERVAL_SECONDS
+              value: "3600"
+            - name: SWEGEN_TRAJECTORY_SYNC_PULL_TIMEOUT_SECONDS
+              value: "1800"
+            # Each sync thread takes its own pooled connection for its ledger
+            # insert; the configmap's pool max of 3 would serialize 8 threads
+            # behind it. The inserts are sub-millisecond, so this is 8 mostly
+            # idle connections, not 8 busy ones.
+            - name: SWEGEN_PG_POOL_MAX
+              value: "8"
+            - name: DOCKER_BUILDKIT
+              value: "1"
+            - name: PATH
+              value: /app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+            # SWR only answers directly, never through the corporate proxy, so
+            # NO_PROXY must carry .myhuaweicloud.com or every pull/push fails.
+            # trajectory_sync forwards these into the docker CLI environment.
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+            - name: no_proxy
+              valueFrom:
+                configMapKeyRef:
+                  name: swegen-pipeline-config
+                  key: SWEGEN_NO_PROXY
+          # Rootfs-integrity probes, matching the worker stages: overlayfs
+          # corruption under pod churn can strip /app/.venv from a Running pod,
+          # which then does nothing while k8s still reports it Ready. Shell-
+          # wrapped so a missing python exits 127 (a real failure) rather than
+          # erroring into "unknown state", which kubelet never counts toward
+          # failureThreshold.
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "exec /app/.venv/bin/python -c 'import swegen.cli'"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 2
+          resources:
+            # I/O bound: the pod shells out to the node's docker daemon, which
+            # does the actual layer transfer, so the container itself needs
+            # almost nothing. Kept small so this never displaces a worker on a
+            # cluster whose binding constraint is the per-node pod cap.
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: private-files
+              mountPath: /etc/swegen/swegen.toml
+              subPath: swegen.toml
+              readOnly: true
+            - name: private-files
+              mountPath: /etc/swegen/combined-ca.crt
+              subPath: combined-ca.crt
+              readOnly: true
+            # SWR push credentials; without this the push is an anonymous 401.
+            - name: docker-config
+              mountPath: /root/.docker/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: private-files
+          secret:
+            secretName: swegen-private-files
+            defaultMode: 0400
+        - name: docker-config
+          secret:
+            secretName: swegen-docker-config
+            defaultMode: 0400
