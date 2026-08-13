@@ -2177,3 +2177,170 @@ def test_collect_rejects_a_non_positive_or_non_int_lookback() -> None:
     for bad in (0, -5, True, "72", None):
         assert PipelineStatusCollector._sanitized_lookback(bad) == 48
     assert PipelineStatusCollector._sanitized_lookback(72) == 72
+
+
+class _FakeExportCursor:
+    """Server-side-cursor stand-in that records itersize and yields fixed rows."""
+
+    def __init__(self, rows: list[dict[str, object]], raises: Exception | None) -> None:
+        self._rows = rows
+        self._raises = raises
+        self.itersize: int | None = None
+        self.executed: list[tuple[str, object]] = []
+
+    def __enter__(self) -> _FakeExportCursor:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self.executed.append((sql, params))
+        if self._raises is not None:
+            raise self._raises
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _FakeExportConnection:
+    """psycopg stand-in exposing just the named-cursor surface the export uses."""
+
+    def __init__(
+        self,
+        rows: list[dict[str, object]] | None = None,
+        raises: Exception | None = None,
+    ) -> None:
+        self.cursor_obj = _FakeExportCursor(rows or [], raises)
+        self.session_sql: list[str] = []
+        self.cursor_names: list[str] = []
+
+    def __enter__(self) -> _FakeExportConnection:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def transaction(self) -> _FakeExportConnection:
+        return self
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self.session_sql.append(sql)
+
+    def cursor(self, name: str = "") -> _FakeExportCursor:
+        self.cursor_names.append(name)
+        return self.cursor_obj
+
+
+_EXPORT_ROW = {
+    "instance": "01mf02__jaq-100",
+    "registry": "platform",
+    "swr_url": "swr-coder-data-platform.example.com/swesandbox/generated:01mf02__jaq-100",
+    "written_at": datetime(2026, 8, 2, 9, 35, 42, tzinfo=UTC),
+    "repo": "01mf02/jaq",
+    "pr": 100,
+    "created_at": datetime(2026, 7, 31, 20, 29, 27, tzinfo=UTC),
+}
+
+
+def test_pushed_image_export_record_carries_repo_instance_path_and_both_stamps() -> None:
+    from swegen.dashboard.distributed_status import pushed_image_export_record
+
+    record = pushed_image_export_record(_EXPORT_ROW)
+
+    # Every field the manifest promises, with ISO-8601 stamps for both dates.
+    assert record == {
+        "instance_id": "01mf02__jaq-100",
+        "repo": "01mf02/jaq",
+        "pr": 100,
+        "registry": "platform",
+        "registry_path": (
+            "swr-coder-data-platform.example.com/swesandbox/generated:01mf02__jaq-100"
+        ),
+        "created_at": "2026-07-31T20:29:27+00:00",
+        "pushed_at": "2026-08-02T09:35:42+00:00",
+    }
+    # Serializable as one JSONL line.
+    assert json.loads(json.dumps(record))["instance_id"] == "01mf02__jaq-100"
+
+
+def test_iter_pushed_image_export_streams_rows_off_a_batched_named_cursor() -> None:
+    from swegen.dashboard.distributed_status import (
+        PUSHED_IMAGE_EXPORT_BATCH,
+        iter_pushed_image_export,
+    )
+
+    connection = _FakeExportConnection([_EXPORT_ROW, {**_EXPORT_ROW, "pr": 101}])
+    records = list(iter_pushed_image_export("platform", connect=lambda: connection))
+
+    assert [r["pr"] for r in records] == [100, 101]
+    # The URL marker is bound as a param, never interpolated into the SQL text.
+    sql, params = connection.cursor_obj.executed[0]
+    assert params == ("%data-platform%",)
+    assert "platform" not in sql
+    # The clicked registry labels every record, because the legacy rows this
+    # export deliberately includes carry an empty registry column.
+    assert {r["registry"] for r in records} == {"platform"}
+    # A *named* cursor keeps the result set server-side, fetched in batches.
+    assert connection.cursor_names == ["pushed_image_export"]
+    assert connection.cursor_obj.itersize == PUSHED_IMAGE_EXPORT_BATCH
+    # Read-only with a statement timeout, like the other collectors.
+    assert any("READ ONLY" in sql for sql in connection.session_sql)
+    assert any("statement_timeout" in sql for sql in connection.session_sql)
+
+
+def test_iter_pushed_image_export_yields_nothing_when_there_are_no_rows() -> None:
+    from swegen.dashboard.distributed_status import iter_pushed_image_export
+
+    connection = _FakeExportConnection([])
+    assert list(iter_pushed_image_export("trajectory", connect=lambda: connection)) == []
+
+
+def test_iter_pushed_image_export_degrades_to_empty_when_tables_are_absent() -> None:
+    import psycopg
+
+    from swegen.dashboard.distributed_status import iter_pushed_image_export
+
+    # An unmigrated database must yield an empty manifest, not raise.
+    connection = _FakeExportConnection(
+        [_EXPORT_ROW], raises=psycopg.errors.UndefinedTable("no pushed_images")
+    )
+    assert list(iter_pushed_image_export("platform", connect=lambda: connection)) == []
+
+
+def test_iter_pushed_image_export_rejects_an_unknown_registry() -> None:
+    import pytest
+
+    from swegen.dashboard.distributed_status import iter_pushed_image_export
+
+    # Only the two known registries can ever reach the SQL.
+    for bad in ("", "PLATFORM", "public", "platform; DROP TABLE pushed_images"):
+        with pytest.raises(ValueError):
+            list(iter_pushed_image_export(bad, connect=_FakeExportConnection))
+
+
+def test_pushed_image_export_sql_filters_on_the_registry_url() -> None:
+    from swegen.dashboard.distributed_status import (
+        _PUSHED_IMAGE_EXPORT_SQL,
+        PUSHED_IMAGE_REGISTRY_URL_MARKERS,
+    )
+
+    sql = _PUSHED_IMAGE_EXPORT_SQL
+    # swr_url is the only complete discriminator. ~12.9k rows written on
+    # 2026-07-28 predate the `registry` column and carry an empty value while
+    # still holding a real URL and a matching task, and the summary card counts
+    # them -- filtering on `registry` returned 11.6k lines under a card reading
+    # 17.8k. `suffix` is no better: it defaults to '' so trajectory is
+    # indistinguishable from unset.
+    assert "p.swr_url LIKE %s" in sql
+    assert "p.registry = %s" not in sql
+    assert "suffix" not in sql
+    assert "p.pushed" in sql
+    assert PUSHED_IMAGE_REGISTRY_URL_MARKERS == {
+        "platform": "%data-platform%",
+        "trajectory": "%data-trajectory%",
+    }
+    # Joined to pipeline_tasks for owner/repo + pr + created_at, one row per
+    # instance even when a task was retried into a second task_version.
+    assert "JOIN public.pipeline_tasks t ON t.task_id = p.instance" in sql
+    assert "DISTINCT ON (p.instance)" in sql

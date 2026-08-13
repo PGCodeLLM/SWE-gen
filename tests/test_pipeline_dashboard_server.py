@@ -2320,3 +2320,281 @@ def test_dashboard_stage_cards_stack_vertically() -> None:
     # The diverging chart internals are untouched.
     assert "chart.className='chart chart-diverging'" in HTML
     assert "chartRow.append(chart,yieldView);card.append(stats,chartRow)" in HTML
+
+
+def _export_handler(monkeypatch, records_by_registry: dict[str, list[dict[str, object]]]):
+    """A handler instance whose wfile/headers are captured instead of socketed."""
+
+    from swegen.dashboard import server as server_module
+    from swegen.dashboard.server import (
+        GenerateEndpointRegistry,
+        K3sBuildSlotController,
+        K3sScaler,
+        make_handler,
+    )
+
+    def fake_export(registry: str):
+        yield from records_by_registry.get(registry, [])
+
+    monkeypatch.setattr(server_module, "iter_pushed_image_export", fake_export)
+
+    class FakeCache:
+        def snapshot(self, *, range_hours: int | None = None) -> dict[str, object]:
+            return {}
+
+    handler_cls = make_handler(
+        FakeCache(),
+        K3sScaler(),
+        K3sBuildSlotController(),
+        "csrf",
+        GenerateEndpointRegistry(),
+    )
+    handler = handler_cls.__new__(handler_cls)
+    captured: dict[str, object] = {"status": None, "headers": [], "body": bytearray()}
+
+    class _Wfile:
+        def write(self, chunk: bytes) -> None:
+            captured["body"].extend(chunk)
+
+    handler.send_response = lambda status: captured.__setitem__("status", status)
+    handler.send_header = lambda key, value: captured["headers"].append((key, value))
+    handler.end_headers = lambda: None
+    handler.wfile = _Wfile()
+    handler._send = lambda status, ctype, body: captured.update(
+        {"status": status, "headers": [("Content-Type", ctype)], "body": bytearray(body)}
+    )
+    return handler, captured
+
+
+_EXPORT_RECORDS = [
+    {
+        "instance_id": "01mf02__jaq-100",
+        "repo": "01mf02/jaq",
+        "pr": 100,
+        "registry": "platform",
+        "registry_path": "swr-data-platform.example.com/swegen/generated:01mf02__jaq-100",
+        "created_at": "2026-07-31T20:29:27+00:00",
+        "pushed_at": "2026-08-02T09:35:42+00:00",
+    },
+    {
+        "instance_id": "zed__zed-42",
+        "repo": "zed/zed",
+        "pr": 42,
+        "registry": "platform",
+        "registry_path": "swr-data-platform.example.com/swegen/generated:zed__zed-42",
+        "created_at": "2026-08-01T01:02:03+00:00",
+        "pushed_at": "2026-08-03T04:05:06+00:00",
+    },
+]
+
+
+def test_pushed_image_export_emits_one_json_object_per_line(monkeypatch) -> None:
+    handler, captured = _export_handler(monkeypatch, {"platform": _EXPORT_RECORDS})
+    handler.path = "/api/pushed-images/platform.jsonl"
+    handler.do_GET()
+
+    assert captured["status"] == 200
+    body = bytes(captured["body"]).decode()
+    # Newline-delimited: one parseable object per line, no trailing blank object.
+    lines = body.splitlines()
+    assert len(lines) == 2
+    assert body.endswith("\n")
+    parsed = [json.loads(line) for line in lines]
+    assert [row["instance_id"] for row in parsed] == ["01mf02__jaq-100", "zed__zed-42"]
+    # Every promised field rides each line.
+    for row in parsed:
+        assert set(row) >= {
+            "instance_id",
+            "repo",
+            "pr",
+            "registry",
+            "registry_path",
+            "created_at",
+            "pushed_at",
+        }
+        assert "/" in row["repo"]
+        assert row["registry"] == "platform"
+
+
+def test_pushed_image_export_sets_ndjson_and_a_dated_attachment_filename(
+    monkeypatch,
+) -> None:
+    handler, captured = _export_handler(monkeypatch, {"trajectory": _EXPORT_RECORDS})
+    handler.path = "/api/pushed-images/trajectory.jsonl"
+    handler.do_GET()
+
+    headers = dict(captured["headers"])
+    assert headers["Content-Type"] == "application/x-ndjson; charset=utf-8"
+    disposition = headers["Content-Disposition"]
+    assert disposition.startswith('attachment; filename="pushed-images-trajectory-')
+    assert re.search(r"-\d{8}\.jsonl\"$", disposition)
+    assert headers["Cache-Control"] == "no-store"
+    # No Content-Length: the body is streamed, so its size is unknown up front.
+    assert "Content-Length" not in headers
+
+
+def test_pushed_image_export_of_an_empty_set_is_an_empty_body_not_an_error(
+    monkeypatch,
+) -> None:
+    handler, captured = _export_handler(monkeypatch, {})
+    handler.path = "/api/pushed-images/platform.jsonl"
+    handler.do_GET()
+
+    assert captured["status"] == 200
+    assert bytes(captured["body"]) == b""
+
+
+def test_pushed_image_export_streams_instead_of_buffering_the_whole_manifest(
+    monkeypatch,
+) -> None:
+    # The 11k-row platform manifest must never be joined into one string: assert
+    # the body reaches the socket incrementally, one write per record.
+    handler, captured = _export_handler(
+        monkeypatch, {"platform": [dict(_EXPORT_RECORDS[0]) for _ in range(5)]}
+    )
+    writes: list[bytes] = []
+    handler.wfile.write = writes.append
+    handler.path = "/api/pushed-images/platform.jsonl"
+    handler.do_GET()
+
+    assert len(writes) == 5
+    assert all(chunk.endswith(b"\n") for chunk in writes)
+
+
+def test_pushed_image_export_reports_a_db_failure_before_sending_a_200(
+    monkeypatch,
+) -> None:
+    from swegen.dashboard import server as server_module
+
+    def exploding_export(registry: str):
+        raise RuntimeError("connection refused")
+        yield  # pragma: no cover - generator marker
+
+    handler, captured = _export_handler(monkeypatch, {})
+    monkeypatch.setattr(server_module, "iter_pushed_image_export", exploding_export)
+    handler.path = "/api/pushed-images/platform.jsonl"
+    handler.do_GET()
+
+    # A truncated 200 would be indistinguishable from a short manifest, so the
+    # failure has to surface as a status code instead.
+    assert captured["status"] == 502
+    assert "connection refused" in json.loads(bytes(captured["body"]).decode())["error"]
+
+
+def test_unknown_pushed_image_registry_route_is_a_404(monkeypatch) -> None:
+    handler, captured = _export_handler(monkeypatch, {"platform": _EXPORT_RECORDS})
+    handler.path = "/api/pushed-images/secrets.jsonl"
+    handler.do_GET()
+
+    assert captured["status"] == 404
+
+
+def test_pushed_image_export_routes_are_an_exact_match_table() -> None:
+    from swegen.dashboard.server import PUSHED_IMAGE_EXPORT_ROUTES
+
+    assert PUSHED_IMAGE_EXPORT_ROUTES == {
+        "/api/pushed-images/platform.jsonl": "platform",
+        "/api/pushed-images/trajectory.jsonl": "trajectory",
+    }
+
+
+def test_swr_push_cards_carry_jsonl_download_buttons() -> None:
+    from swegen.dashboard.server import HTML
+
+    # farmCard takes an OPTIONAL action element, so the cards that do not pass
+    # one keep their previous markup.
+    assert "function farmCard(summary,label,value,detail,action)" in HTML
+    assert "if(action)card.append(action)" in HTML
+    assert "function downloadButton(label,href)" in HTML
+    # Both push-registry cards get a download button pointing at their endpoint;
+    # the two neighbouring cards in the same grid do not.
+    assert (
+        "farmCard(summary,'Pushed to -platform',compactChartCount(sync.platform_count||0),"
+        "`${sync.platform_count||0} distinct images on data-platform`,"
+        "downloadButton('Download JSONL','/api/pushed-images/platform.jsonl'))" in HTML
+    )
+    assert (
+        "farmCard(summary,'Pushed to -trajectory',"
+        "compactChartCount(sync.trajectory_count||0),"
+        "`${sync.trajectory_count||0} distinct images on data-trajectory`,"
+        "downloadButton('Download JSONL','/api/pushed-images/trajectory.jsonl'))" in HTML
+    )
+    assert "farmCard(summary,'Platform only (missing -trajectory)'" in HTML
+    assert HTML.count("downloadButton('Download JSONL'") == 2
+    # Styled with the dashboard's existing button palette.
+    assert ".card-download{" in HTML
+    assert "background:#174b78" in HTML
+
+
+def evaluate_push_card_render() -> dict[str, object]:
+    """Run renderSwrPushSync's card loop under node against a DOM stub."""
+
+    from swegen.dashboard.server import HTML
+
+    farm_card = re.search(r"function farmCard\(summary.*?\n", HTML).group(0)
+    download = re.search(r"function downloadButton\(label,href\).*?\n", HTML).group(0)
+    program = (
+        """
+class El{constructor(tag){this.tag=tag;this.children=[];this.className='';
+  this.textContent='';this.attrs={};this.href='';}
+ append(...kids){this.children.push(...kids)}
+ setAttribute(k,v){this.attrs[k]=v}}
+globalThis.document={createElement:t=>new El(t)};
+globalThis.setText=(n,v)=>{n.textContent=String(v)};
+const compactChartCount=v=>String(v);
+"""
+        + farm_card
+        + download
+        + """
+const summary=new El('div');const sync={platform_count:11615,trajectory_count:6443,
+  platform_only:5172,trajectory_only:0};
+"""
+        + re.search(
+            r"farmCard\(summary,'Pushed to -platform'.*?"
+            r"farmCard\(summary,'Trajectory only \(missing -platform\)'[^;]*;",
+            HTML,
+            re.S,
+        ).group(0)
+        + """
+const cards=summary.children.map(card=>{
+  const link=[];(function walk(n){if(n.tag==='a')link.push({text:n.textContent,
+    href:n.href,download:n.attrs.download!==undefined});
+    (n.children||[]).forEach(walk)})(card);
+  return {label:card.children[0].textContent,value:card.children[1].textContent,
+    links:link}});
+console.log(JSON.stringify(cards));
+"""
+    )
+    result = run(["node", "-e", program], check=True, capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+
+def test_push_cards_render_download_links_without_disturbing_the_other_cards() -> None:
+    cards = evaluate_push_card_render()
+
+    # All four cards still render, in order, with their counts intact.
+    assert [card["label"] for card in cards] == [
+        "Pushed to -platform",
+        "Pushed to -trajectory",
+        "Platform only (missing -trajectory)",
+        "Trajectory only (missing -platform)",
+    ]
+    assert [card["value"] for card in cards] == ["11615", "6443", "5172", "0"]
+    # Only the two registry cards gain a download link, each to its own endpoint
+    # and marked `download` so the browser saves rather than navigates.
+    assert cards[0]["links"] == [
+        {
+            "text": "Download JSONL",
+            "href": "/api/pushed-images/platform.jsonl",
+            "download": True,
+        }
+    ]
+    assert cards[1]["links"] == [
+        {
+            "text": "Download JSONL",
+            "href": "/api/pushed-images/trajectory.jsonl",
+            "download": True,
+        }
+    ]
+    assert cards[2]["links"] == []
+    assert cards[3]["links"] == []

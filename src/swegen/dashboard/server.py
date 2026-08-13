@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import itertools
 import json
 import re
 import secrets
@@ -14,10 +15,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from swegen.dashboard.distributed_status import (
+    PUSHED_IMAGE_REGISTRIES,
     K3sStatusCollector,
     PipelineStatusCollector,
     RemoteBuildKitFarmCollector,
     _database_dsn,
+    iter_pushed_image_export,
 )
 from swegen.pipeline.generate_endpoint_controller import (
     EndpointProber,
@@ -48,6 +51,14 @@ PRIMARY_DEPLOYMENTS = {
 # crafted query param can never widen the DB scan or reach the SQL unvalidated.
 RANGE_HOURS_ALLOWED = (24, 72, 168)
 RANGE_HOURS_DEFAULT = 24
+
+# Static route -> registry map for the pushed-image JSONL exports. Keeping this
+# an exact-match table (rather than parsing a path segment) means the registry
+# reaching the SQL can only ever be one of the two literals below.
+PUSHED_IMAGE_EXPORT_ROUTES = {
+    f"/api/pushed-images/{registry}.jsonl": registry
+    for registry in PUSHED_IMAGE_REGISTRIES
+}
 
 
 def _parse_range_hours(query: str) -> int:
@@ -670,6 +681,7 @@ th,td{text-align:left;padding:5px;border-bottom:1px solid var(--line);vertical-a
 .endpoint-form{display:flex;flex-wrap:wrap;gap:6px;align-items:end;margin:6px 0}.endpoint-form label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--muted)}.endpoint-form input{border:1px solid var(--line);border-radius:6px;padding:5px 6px;background:#09182b;color:#edf4ff;min-width:0}.endpoint-form .url-field{flex:2 1 240px}.endpoint-form .model-field{flex:2 1 200px}.endpoint-form .token-field{flex:1 1 160px}.endpoint-form .conc-field{flex:0 0 90px}.endpoint-form button{border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:#174b78;color:#edf4ff;cursor:pointer}.endpoint-form button:disabled{cursor:wait;opacity:.55}#endpoint-feedback{min-height:18px;margin:4px 0}.endpoint-actions{display:flex;flex-wrap:wrap;gap:4px}.endpoint-actions button{border:1px solid var(--line);border-radius:6px;padding:3px 8px;background:#09182b;color:#edf4ff;cursor:pointer;font-size:12px}.endpoint-actions button.danger{background:#3a1220;border-color:#7a2740}.endpoint-actions button:disabled{cursor:wait;opacity:.5}.endpoint-breaker-ok{color:var(--ok)}.endpoint-breaker-latched{color:var(--bad)}#endpoint-reset-error{margin:4px 0}#endpoint-reset-error:empty{display:none}.reset-error-box{border:1px solid #7a2740;border-radius:8px;background:#1a0d13;padding:8px;margin:4px 0}.reset-error-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px}.reset-error-head .bad{font-size:12px}.reset-error-copy{border:1px solid var(--line);border-radius:6px;padding:3px 8px;background:#174b78;color:#edf4ff;cursor:pointer;font-size:12px}.reset-error-text{width:100%;min-height:96px;resize:vertical;border:1px solid var(--line);border-radius:6px;background:#06101d;color:#ffd79a;padding:6px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre;overflow:auto}
 .warning{padding:8px;border:2px solid #f79009;background:#3b2605;color:#ffd79a;border-radius:8px;margin:6px 0}.path{display:block;max-width:520px;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#b8d8ff}.storage-note{margin-top:3px;color:var(--muted);font-size:12px}
 .farm-status{margin:3px 0 6px}.farm-detail{color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}
+.card-actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.card-download{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:3px 8px;background:#174b78;color:#edf4ff;cursor:pointer;font-size:12px;text-decoration:none}.card-download:hover{background:#1d5c92}
 .node-details>summary{list-style-position:inside;cursor:pointer}.node-summary{display:grid;grid-template-columns:minmax(250px,1fr) minmax(190px,.75fr) minmax(190px,.75fr) minmax(280px,1.05fr) minmax(190px,.75fr);gap:12px;align-items:center}.pod-list{margin:12px 0 2px 22px;display:grid;gap:5px}.pod-row{display:grid;grid-template-columns:minmax(300px,2fr) 110px 100px 80px;gap:10px;padding:5px 8px;border-left:2px solid var(--line);font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.stage-counts{color:var(--muted);font-size:11px;margin-left:22px}@media(max-width:800px){.node-summary{grid-template-columns:1fr}.pod-row{grid-template-columns:1fr 1fr}.node-table-head{display:none}}
 </style></head><body><div id="chart-tooltip" class="chart-tooltip" role="tooltip" hidden></div><main><h1>SWE-gen k3s + PGMQ</h1><div id="stamp" class="muted"></div><div id="errors"></div>
 <h2>Generate model endpoints</h2><div class="muted">Register a model endpoint to spin up a dedicated generate worker pool. A controller reconciles pods and latches a breaker on repeated endpoint 5xx/429; the token is stored server-side and never shown.</div>
@@ -803,14 +815,20 @@ function renderResourcesV2(metrics,clusterNodes){
  const resourceScroll=el('resource-scroll');resourceScroll.scrollLeft=uiState.resourceScroll.left;resourceScroll.scrollTop=uiState.resourceScroll.top;
 }
 function renderStorage(storage){const warning=el('storage-warning'),summary=el('storage-summary'),mounts=el('storage-mounts');warning.replaceChildren();summary.replaceChildren();mounts.replaceChildren();if(storage?.warning){warning.className='warning';setText(warning,`⚠ ${storage.warning}`)}else{warning.className='';setText(warning,'')}[["Runtime workspace root",storage?.workspace_root||'unknown'],["Durable source of truth",storage?.source_of_truth||'unknown']].forEach(([label,value])=>{const card=document.createElement('div');card.className='card';const title=document.createElement('b');setText(title,label);const path=document.createElement('code');path.className='path';setText(path,value);card.append(title,path);summary.append(card)});(storage?.mounts||[]).forEach(mount=>{const tr=document.createElement('tr');[`${mount.deployment||'—'} / ${stageNames[mount.stage]||mount.stage||'—'}`,mount.node_ip||'unspecified',mount.mount_path||'—',mount.source_path||mount.kind||'—',mount.durability||'unknown'].forEach(value=>{const td=document.createElement('td');const code=document.createElement('code');code.className='path';setText(code,value);td.append(code);tr.append(td)});mounts.append(tr)})}
-function farmCard(summary,label,value,detail){const card=document.createElement('div');card.className='card';const title=document.createElement('b');setText(title,label);const main=document.createElement('div');main.className='big';setText(main,value);const note=document.createElement('div');note.className='farm-detail';setText(note,detail);card.append(title,main,note);summary.append(card)}
+/* `action` is optional: pass an element (e.g. a download button) to hang it off
+the bottom of the card. Cards built without one are byte-identical to before, so
+the other cards sharing the grid are unaffected. */
+function farmCard(summary,label,value,detail,action){const card=document.createElement('div');card.className='card';const title=document.createElement('b');setText(title,label);const main=document.createElement('div');main.className='big';setText(main,value);const note=document.createElement('div');note.className='farm-detail';setText(note,detail);card.append(title,main,note);if(action)card.append(action);summary.append(card)}
+/* A card-footer download button. The href is a plain same-origin GET, so the
+browser streams the attachment itself instead of buffering it through fetch(). */
+function downloadButton(label,href){const row=document.createElement('div');row.className='card-actions';const link=document.createElement('a');link.className='card-download';link.href=href;link.setAttribute('download','');setText(link,label);row.append(link);return row}
 function renderRemoteBuildKit(farm,tracking){const status=el('buildkit-farm-status'),warning=el('buildkit-farm-warning'),summary=el('buildkit-farm-summary'),diskBody=el('buildkit-farm-disk-io');warning.replaceChildren();summary.replaceChildren();diskBody.replaceChildren();const gateway=farm?.gateway||{},ready=farm?.ready||{},resources=farm?.resources||{};const resourceSampledAt=resources.last_success_at;const statusSampledAt=resourceSampledAt||ready.last_success_at||gateway.last_success_at;const sampleState=resources.error?'last successful sample':resources.available?'live sample':'resource sample unavailable';status.className=gateway.ok&&ready.ok&&!resources.error?'farm-status muted':'farm-status bad';setText(status,`${farm?.sampling?'Sampling farm; ':''}gateway ${gateway.status||'unknown'} · readiness ${ready.status||'unknown'} · ${statusSampledAt?`sampled ${statusSampledAt}`:'awaiting first sample'} · ${farm?.poll_interval_seconds||30}s minimum poll`);if(resources.schema_warning||resources.error){warning.className='warning';setText(warning,resources.error||resources.schema_warning)}else{warning.className='';setText(warning,'')}farmCard(summary,'Gateway / ready',`${gateway.ok?'up':'down'} / ${ready.ok?'ready':'not ready'}`,`HTTP ${gateway.http_status??'—'} / ${ready.http_status??'—'}`);const available=resources.available_backend_count==null?'—':resources.available_backend_count;const sampled=resources.backend_count??resources.sampled_worker_count??0;const scope=resources.is_global?'global aggregate':`${resources.scope||'worker-local sample'}${resources.sampled_worker?` · ${resources.sampled_worker}`:''}`;const sampleDetail=`${scope} · ${resourceSampledAt?`${sampleState} ${resourceSampledAt}`:sampleState}`;farmCard(summary,'Backend workers',`${sampled} sampled / ${available} available`,sampleDetail);const queueLabel=resources.is_global?'Farm live queue':'Sampled live queue';farmCard(summary,queueLabel,resources.queue_length==null?'unavailable':`${resources.queue_length} / ${resources.queue_capacity??'—'}`,sampleDetail);const activeLabel=resources.is_global?'Farm live active':'Sampled live active';farmCard(summary,activeLabel,resources.running_builds==null?'unavailable':`${resources.running_builds} running`,`${resources.inflight_builds??'—'} inflight · ${sampleDetail}`);const recentCounts=tracking?.recent_status_counts||{};const recentBreakdown=Object.entries(recentCounts).filter(([,count])=>count>0).map(([name,count])=>`${name} ${count}`).join(' · ');const recentWindow=secs(tracking?.recent_window_seconds);const ledgerDetail=tracking?.available?`${recentBreakdown||'no recent nonterminal records'} · ${tracking?.stale??0} stale excluded · database submission ledger only, not live farm state · updated within ${recentWindow}${tracking?.latest_updated_at?` · latest ${tracking.latest_updated_at}`:''}`:'submission tracking unavailable';farmCard(summary,'SWEgen submission ledger',tracking?.available?`${tracking?.recent??0} recent records`:'unavailable',ledgerDetail);const diskRows=resources.node_disk_io||[];if(!diskRows.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=4;setText(td,'Remote per-node disk I/O telemetry is not exposed by the current worker-local API sample.');tr.append(td);diskBody.append(tr)}else{diskRows.forEach(row=>{const tr=document.createElement('tr');const busy=row.busy_percent==null?'—':`${row.busy_percent.toFixed(1)}%`;[[row.node||'unknown'],[`${rateBytes(row.read_bytes_per_second)} / ${rateBytes(row.write_bytes_per_second)}`],[`${rateOps(row.read_iops)} / ${rateOps(row.write_iops)}`],[`${busy} / ${row.io_current??'—'} inflight`]].forEach(([value])=>{const td=document.createElement('td');setText(td,value);tr.append(td)});diskBody.append(tr)})}}
 function stageHourlyYield(rows,stage){const wrap=document.createElement('div');wrap.className='stage-yield';const title=document.createElement('div');title.className='stage-yield-title';const label=document.createElement('span');setText(label,'Hourly yield · last 12h');const note=document.createElement('span');setText(note,'success / terminal');title.append(label,note);wrap.append(title);const list=document.createElement('div');list.className='yield-list';if(!(rows||[]).length){const empty=document.createElement('div');empty.className='yield-empty';setText(empty,'No terminal outcomes in the last 12 hours');wrap.append(empty);wrap._yieldCells=[];wrap._yieldRowCount=0;return wrap}const yieldCells=[];rows.forEach(row=>{const line=document.createElement('div');line.className='yield-row';const stamp=document.createElement('span');setText(stamp,new Date(row.bucket).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));const value=document.createElement('span');value.className='yield-value';setText(value,`${row.succeeded} / ${row.processed}`);const percent=document.createElement('span');percent.className='yield-percent';setText(percent,row.yield_percent==null?'—':`${row.yield_percent.toFixed(1)}%`);line.append(stamp,value,percent);list.append(line);yieldCells.push({stamp,value,percent})});wrap._yieldCells=yieldCells;wrap._yieldRowCount=rows.length;wrap.append(list);return wrap}
 /* The hourly-yield panel has one row per hour, so its row COUNT only changes when
 an hour rolls over. Same count -> rewrite the three spans per row in place; a
 changed count rebuilds (the caller swaps the returned node in). */
 function updateStageHourlyYield(wrap,rows,stage){const list=rows||[];if(!wrap||wrap._yieldRowCount!==list.length||!wrap._yieldCells)return stageHourlyYield(list,stage);wrap._yieldCells.forEach((cells,index)=>{const row=list[index];if(!row)return;setText(cells.stamp,new Date(row.bucket).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));setText(cells.value,`${row.succeeded} / ${row.processed}`);setText(cells.percent,row.yield_percent==null?'—':`${row.yield_percent.toFixed(1)}%`)});return wrap}
-function renderSwrPushSync(sync){const status=el('swr-sync-status'),summary=el('swr-sync-summary'),body=el('swr-sync-instances');summary.replaceChildren();body.replaceChildren();if(!sync?.available){status.className='bad';setText(status,'SWR push-registry sync unavailable: public.pushed_images is absent or unreadable.');const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=3;setText(td,'No push-registry sync data.');tr.append(td);body.append(tr);return}const outOfSync=sync.out_of_sync_total||0;status.className=outOfSync?'bad':'muted';setText(status,`${outOfSync} images out of sync${sync.out_of_sync_list_truncated?` · showing first ${sync.out_of_sync_list_limit}`:''} · in sync ${sync.in_sync||0}`);farmCard(summary,'Pushed to -platform',compactChartCount(sync.platform_count||0),`${sync.platform_count||0} distinct images on data-platform`);farmCard(summary,'Pushed to -trajectory',compactChartCount(sync.trajectory_count||0),`${sync.trajectory_count||0} distinct images on data-trajectory`);farmCard(summary,'Platform only (missing -trajectory)',compactChartCount(sync.platform_only||0),'pushed to platform but not trajectory');farmCard(summary,'Trajectory only (missing -platform)',compactChartCount(sync.trajectory_only||0),'pushed to trajectory but not platform');const rows=sync.out_of_sync_instances||[];if(!rows.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=3;setText(td,'All images are in sync across both registries.');tr.append(td);body.append(tr)}else{rows.forEach(row=>{const tr=document.createElement('tr');const pushedTo=row.registry==='platform'?'data-platform':'data-trajectory';const missingFrom=row.registry==='platform'?'data-trajectory':'data-platform';[[row.instance],[pushedTo],[missingFrom]].forEach(([value])=>{const td=document.createElement('td');const code=document.createElement('code');code.className='path';setText(code,value);td.append(code);tr.append(td)});body.append(tr)})}}
+function renderSwrPushSync(sync){const status=el('swr-sync-status'),summary=el('swr-sync-summary'),body=el('swr-sync-instances');summary.replaceChildren();body.replaceChildren();if(!sync?.available){status.className='bad';setText(status,'SWR push-registry sync unavailable: public.pushed_images is absent or unreadable.');const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=3;setText(td,'No push-registry sync data.');tr.append(td);body.append(tr);return}const outOfSync=sync.out_of_sync_total||0;status.className=outOfSync?'bad':'muted';setText(status,`${outOfSync} images out of sync${sync.out_of_sync_list_truncated?` · showing first ${sync.out_of_sync_list_limit}`:''} · in sync ${sync.in_sync||0}`);farmCard(summary,'Pushed to -platform',compactChartCount(sync.platform_count||0),`${sync.platform_count||0} distinct images on data-platform`,downloadButton('Download JSONL','/api/pushed-images/platform.jsonl'));farmCard(summary,'Pushed to -trajectory',compactChartCount(sync.trajectory_count||0),`${sync.trajectory_count||0} distinct images on data-trajectory`,downloadButton('Download JSONL','/api/pushed-images/trajectory.jsonl'));farmCard(summary,'Platform only (missing -trajectory)',compactChartCount(sync.platform_only||0),'pushed to platform but not trajectory');farmCard(summary,'Trajectory only (missing -platform)',compactChartCount(sync.trajectory_only||0),'pushed to trajectory but not platform');const rows=sync.out_of_sync_instances||[];if(!rows.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=3;setText(td,'All images are in sync across both registries.');tr.append(td);body.append(tr)}else{rows.forEach(row=>{const tr=document.createElement('tr');const pushedTo=row.registry==='platform'?'data-platform':'data-trajectory';const missingFrom=row.registry==='platform'?'data-trajectory':'data-platform';[[row.instance],[pushedTo],[missingFrom]].forEach(([value])=>{const td=document.createElement('td');const code=document.createElement('code');code.className='path';setText(code,value);td.append(code);tr.append(td)});body.append(tr)})}}
 async function postEndpoint(path,body,pendingMessage,successMessage){if(uiState.endpointBusy)return;const feedback=el('endpoint-feedback');uiState.endpointBusy=true;feedback.className='muted';setText(feedback,pendingMessage);renderEndpointButtonsDisabled();try{const response=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify(body)});const payload=await response.json();if(!response.ok)throw new Error(payload.error||`HTTP ${response.status}`);feedback.className='ok';setText(feedback,successMessage(payload));await poll();return payload}catch(error){feedback.className='bad';setText(feedback,`Endpoint action failed: ${error.message}`)}finally{uiState.endpointBusy=false;renderEndpointButtonsDisabled()}}
 function renderEndpointButtonsDisabled(){document.querySelectorAll('#endpoint-form button,.endpoint-actions button').forEach(button=>{button.disabled=uiState.endpointBusy})}
 async function submitEndpointRegister(){const url=el('endpoint-url').value.trim(),model=el('endpoint-model').value.trim(),token=el('endpoint-token').value,concurrency=Number(el('endpoint-concurrency').value||'0');const feedback=el('endpoint-feedback');if(!url||!model||!token){feedback.className='bad';setText(feedback,'Endpoint URL, model ID and bearer token are all required.');return}const payload=await postEndpoint('/api/generate/endpoints',{base_url:url,model_id:model,auth_token:token,concurrency},`Registering ${model}…`,body=>`Registered ${model} as ${body.slug}.`);if(payload){el('endpoint-token').value='';el('endpoint-url').value='';el('endpoint-model').value=''}}
@@ -867,10 +885,44 @@ def make_handler(
                 range_hours = _parse_range_hours(parsed.query)
                 body = json.dumps(cache.snapshot(range_hours=range_hours)).encode()
                 self._send(200, "application/json", body)
+            elif route in PUSHED_IMAGE_EXPORT_ROUTES:
+                self._send_pushed_image_export(PUSHED_IMAGE_EXPORT_ROUTES[route])
             elif route == "/healthz":
                 self._send(200, "application/json", b'{"ok":true}')
             else:
                 self._send(404, "application/json", b'{"error":"not found"}')
+
+        def _send_pushed_image_export(self, registry: str) -> None:
+            """Stream the pushed-image manifest for ``registry`` as JSONL.
+
+            The body is written line by line off a server-side cursor rather
+            than joined into one string: the platform manifest is >11k rows.
+            Because the response length is unknown up front it is framed by
+            connection close (the server speaks HTTP/1.0), which is also why the
+            first failure has to be caught BEFORE the status line is sent —
+            after that a truncated body is indistinguishable from a short one.
+            """
+
+            try:
+                records = iter_pushed_image_export(registry)
+                first = next(iter(records), None)
+            except Exception as error:
+                self._send_json(502, {"error": f"export failed: {str(error)[:500]}"})
+                return
+            stamp = datetime.now(UTC).strftime("%Y%m%d")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="pushed-images-{registry}-{stamp}.jsonl"',
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                for record in itertools.chain([] if first is None else [first], records):
+                    self.wfile.write(json.dumps(record).encode() + b"\n")
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def do_POST(self) -> None:
             if self.path not in {

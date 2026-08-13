@@ -452,6 +452,95 @@ def summarize_swr_push_sync(
     }
 
 
+# The two SWR push registries the dashboard exports, mapped to the substring
+# that identifies each one inside `pushed_images.swr_url`.
+#
+# The URL is the discriminator, not the `registry` column, because ~12.9k rows
+# written on 2026-07-28 predate that column and carry an empty registry while
+# still holding a real swr_url and a matching pipeline_tasks row. Filtering on
+# `registry` would silently drop 6,136 platform and 6,436 trajectory images --
+# and the summary card counts them, so the button would have handed back 11.6k
+# lines while the number directly above it read 17.8k. `suffix` is no use
+# either: it defaults to '' so trajectory is indistinguishable from unset.
+PUSHED_IMAGE_REGISTRY_URL_MARKERS = {
+    "platform": "%data-platform%",
+    "trajectory": "%data-trajectory%",
+}
+PUSHED_IMAGE_REGISTRIES = tuple(PUSHED_IMAGE_REGISTRY_URL_MARKERS)
+# Rows pulled per server-side FETCH while streaming an export. The export is
+# ~12k rows; batching keeps both the DB round-trips and the resident row set
+# bounded instead of materialising the whole result in the dashboard process.
+PUSHED_IMAGE_EXPORT_BATCH = 500
+
+# One row per pushed instance. DISTINCT ON collapses the rare instance that has
+# more than one pipeline_tasks version (retries bump task_version), keeping the
+# newest, so an export line count matches the card's distinct-image count.
+_PUSHED_IMAGE_EXPORT_SQL = """
+SELECT DISTINCT ON (p.instance)
+       p.instance, p.swr_url, p.written_at,
+       t.repo, t.pr, t.created_at
+FROM public.pushed_images p
+JOIN public.pipeline_tasks t ON t.task_id = p.instance
+WHERE p.pushed AND p.swr_url LIKE %s
+ORDER BY p.instance, t.task_version DESC
+"""
+
+
+def pushed_image_export_record(row: Mapping[str, Any], registry: str = "") -> dict[str, Any]:
+    """Fold one export row into the JSON-safe object written as a JSONL line.
+
+    ``registry`` is supplied by the caller rather than read from the row: the
+    legacy rows this export deliberately includes have an empty registry column,
+    and the value the operator asked for is the one they clicked.
+    """
+
+    return {
+        "instance_id": str(row["instance"]),
+        "repo": row.get("repo"),
+        "pr": row.get("pr"),
+        "registry": registry or row.get("registry") or "",
+        "registry_path": row.get("swr_url"),
+        "created_at": _iso(row.get("created_at")),
+        "pushed_at": _iso(row.get("written_at")),
+    }
+
+
+def iter_pushed_image_export(
+    registry: str,
+    *,
+    connect: Callable[[], Any] | None = None,
+) -> Iterable[dict[str, Any]]:
+    """Stream every instance pushed to ``registry`` as JSON-safe export records.
+
+    Rows are pulled through a named (server-side) cursor in batches so a ~12k
+    row export never materialises in the dashboard process at once. A missing
+    ``pushed_images``/``pipeline_tasks`` relation degrades to an empty stream:
+    an operator clicking Download on a database that has not been migrated gets
+    an empty file, not a 500.
+    """
+
+    if registry not in PUSHED_IMAGE_REGISTRIES:
+        raise ValueError(f"unknown push registry: {registry!r}")
+    opener = connect or (lambda: psycopg.connect(_database_dsn(), row_factory=dict_row))
+    with opener() as connection:
+        try:
+            with connection.transaction():
+                connection.execute("SET LOCAL statement_timeout = '30s'")
+                connection.execute("SET TRANSACTION READ ONLY")
+                # Named cursor => the result set stays on the server and is
+                # fetched in itersize batches as the response is written out.
+                with connection.cursor(name="pushed_image_export") as cursor:
+                    cursor.itersize = PUSHED_IMAGE_EXPORT_BATCH
+                    cursor.execute(
+                        _PUSHED_IMAGE_EXPORT_SQL,
+                        (PUSHED_IMAGE_REGISTRY_URL_MARKERS[registry],),
+                    )
+                    for row in cursor:
+                        yield pushed_image_export_record(row, registry)
+        except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
+            return
+
+
 GENERATE_ENDPOINT_DEPLOYMENT_PREFIX = "swegen-generate-dyn-"
 
 
