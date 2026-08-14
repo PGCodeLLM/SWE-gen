@@ -1532,6 +1532,9 @@ def test_nested_validation_stage_cards_preserve_metrics_and_controls() -> None:
     from swegen.dashboard.server import HTML
 
     assert "function stageCard(stage,pg,k,maxReplicas,horizontalChart=false)" in HTML
+    # validate/repair are single-pool stages, so they still get the stage-wide
+    # spinner (it now lives in the non-generate branch; see
+    # test_stage_card_branches_on_generate_for_the_endpoints_panel).
     assert "stats.append(scaleControls(stage,lines.desired,maxReplicas))" in HTML
     assert "throughput:`5m success ${t.succeeded||0}" in HTML
     assert "lifetime:`lifetime processed ${lifetime}`" in HTML
@@ -2250,7 +2253,13 @@ def test_dashboard_html_has_the_range_dropdown_and_poll_wires_it() -> None:
 def test_dashboard_html_has_generate_endpoints_panel_and_actions() -> None:
     from swegen.dashboard.server import HTML
 
-    assert "<h2>Generate model endpoints</h2>" in HTML
+    # The panel is no longer a top-level <h2> section; it is a titled block that
+    # stageCard re-parents into the generate card.
+    assert "<h2>Generate model endpoints</h2>" not in HTML
+    assert '<div id="endpoints-panel" class="endpoints-panel">' in HTML
+    assert (
+        '<div class="endpoints-panel-title">Generate model endpoints</div>' in HTML
+    )
     # Registration form: url, model, password token, concurrency, register.
     assert 'id="endpoint-form"' in HTML
     assert 'id="endpoint-url"' in HTML
@@ -2287,6 +2296,174 @@ def test_dashboard_html_has_generate_endpoints_panel_and_actions() -> None:
     assert "confirm(`Delete endpoint" in HTML
     # The Reset button keeps its label (it now fires a live probe under the hood).
     assert "setText(resetBtn,'Reset')" in HTML
+
+
+def render_stage_card_dom(stage: str) -> dict[str, object]:
+    """Run the real stageCard() under node against a DOM stub.
+
+    The chart and hourly-yield builders are stubbed (they are covered by their
+    own tests); everything stageCard itself does -- the stats block, the
+    validate-only queue branch, the generate-only endpoints branch and
+    scaleControls -- runs for real, so this observes the actual card structure.
+    """
+
+    from swegen.dashboard.server import HTML
+
+    def extract(pattern: str) -> str:
+        match = re.search(pattern, HTML, re.S)
+        assert match is not None, pattern
+        return match.group(0)
+
+    stage_card = extract(
+        r"function stageCard\(stage,pg,k,maxReplicas,horizontalChart=false\)\{.*?\n(?=function )"
+    )
+    stage_stat_lines = extract(r"function stageStatLines\(stage,pg,k\)\{.*?\n(?=function )")
+    apply_lines = extract(r"function applyStageStatLines\(card,lines\)\{.*?\n(?=/\*)")
+    scale_controls = extract(r"function scaleControls\(stage,desired,maxReplicas\)\{.*?\n(?=function )")
+    validate_queue_line = extract(r"function validateQueueLine\(label,queue\)\{.*?\n(?=function )")
+    format_pod_phases = extract(r"const formatPodPhases=.*?\n")
+    format_coverage = extract(r"function formatInstanceCoverage\(count,total\)\{.*?\n(?=function )")
+    set_text = extract(r"function setText\(node,value\)\{.*?\n")
+
+    program = (
+        """
+const TAG_RE=/<(\\w+)(?:[^>]*class="([^"]*)")?[^>]*>/g;
+class El{
+  constructor(tag){this.tag=tag;this.children=[];this.className='';this.textContent='';
+    this.dataset={};this.attrs={};this.parent=null;this.type='';this.value='';
+    this.min='';this.max='';this.step='';this.disabled=false;}
+  append(...kids){kids.forEach(kid=>{if(kid.parent){const siblings=kid.parent.children;
+    const at=siblings.indexOf(kid);if(at>=0)siblings.splice(at,1)}
+    kid.parent=this;this.children.push(kid)})}
+  after(node){const siblings=this.parent.children;
+    siblings.splice(siblings.indexOf(this)+1,0,node);node.parent=this.parent}
+  setAttribute(key,value){this.attrs[key]=value}
+  addEventListener(){}
+  set innerHTML(html){this.children=[];TAG_RE.lastIndex=0;let match;
+    while((match=TAG_RE.exec(html))!==null){const node=new El(match[1]);
+      node.className=match[2]||'';node.parent=this;this.children.push(node)}}
+  matches(sel){return sel.startsWith('.')?this.className.split(' ').includes(sel.slice(1))
+    :this.tag===sel}
+  querySelectorAll(sel){const found=[];(function walk(node){node.children.forEach(kid=>{
+    if(kid.matches(sel))found.push(kid);walk(kid)})})(this);return found}
+  querySelector(sel){return this.querySelectorAll(sel)[0]||null}}
+globalThis.document={createElement:tag=>new El(tag)};
+const endpointsPanel=new El('div');endpointsPanel.className='endpoints-panel';
+endpointsPanel.dataset.sentinel='the-one-and-only';
+const el=id=>id==='endpoints-panel'?endpointsPanel:null;
+const stageNames={generate:'SWEgen',validate:'NOP / Oracle',repair:'Repair',
+  reward:'Reward hack',push:'SWR push'};
+const uiState={scaleDrafts:{},scaling:false};
+const divergingModelTimeSeries=()=>{const n=new El('div');n.className='stage-chart-wrap';return n};
+const stageHourlyYield=()=>{const n=new El('div');n.className='stage-yield';return n};
+"""
+        + set_text
+        + format_pod_phases
+        + format_coverage
+        + validate_queue_line
+        + scale_controls
+        + stage_stat_lines
+        + apply_lines
+        + stage_card
+        + """
+const pg={queues:{stages:{},validate_repaired:{},validate_new:{}},activity:{stages:{}},
+  throughput:{windows:{'300':{}},lifetime_processed:{}},instance_coverage:{},
+  stage_model_timeseries:{stages:{}},hourly_yield:{stages:{}}};
+const k={stages:{"""
+        + f"{stage}:{{desired:12,pod_phases:{{Running:12}}}}"
+        + """}};
+const card=stageCard('"""
+        + stage
+        + """',pg,k,64,true);
+const describe=node=>({tag:node.tag,className:node.className,
+  sentinel:node.dataset.sentinel||null,children:node.children.map(describe)});
+console.log(JSON.stringify({card:describe(card),
+  panelReparented:endpointsPanel.parent===card,
+  panelStillDetached:endpointsPanel.parent===null,
+  directChildClasses:card.children.map(child=>child.className)}));
+"""
+    )
+    completed = run(["node", "-e", program], check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
+def _class_names(tree: dict) -> list[str]:
+    names = [tree["className"]]
+    for child in tree["children"]:
+        names.extend(_class_names(child))
+    return names
+
+
+def test_endpoints_panel_is_reparented_into_the_generate_stage_card() -> None:
+    rendered = render_stage_card_dom("generate")
+
+    # The panel node from the document (not a copy) becomes a child of the card,
+    # so every id, listener and the live #endpoints tbody keep working.
+    assert rendered["panelReparented"] is True
+    assert "endpoints-panel" in _class_names(rendered["card"])
+    sentinels = [
+        node
+        for node in _flatten(rendered["card"])
+        if node["sentinel"] == "the-one-and-only"
+    ]
+    assert len(sentinels) == 1, "panel must be moved, never duplicated"
+    # It is a DIRECT child of the card (so the grid-column:1/-1 full-width rule
+    # applies) and sits last, after stats/chart/yield.
+    assert rendered["directChildClasses"] == [
+        "stage-stats",
+        "stage-chart-wrap",
+        "stage-yield",
+        "endpoints-panel",
+    ]
+
+
+def _flatten(tree: dict) -> list[dict]:
+    nodes = [tree]
+    for child in tree["children"]:
+        nodes.extend(_flatten(child))
+    return nodes
+
+
+def test_generate_card_drops_the_stage_wide_scale_spinner() -> None:
+    rendered = render_stage_card_dom("generate")
+
+    # Generate is no longer one pool at one concurrency: it fans out into one
+    # deployment per registered endpoint, each scaled from the endpoints table
+    # in this same card. A single stage-wide replica spinner would lie about it.
+    assert "scale-controls" not in _class_names(rendered["card"])
+    assert "scale-limit" not in _class_names(rendered["card"])
+
+
+@pytest.mark.parametrize("stage", ["validate", "repair", "reward", "push"])
+def test_single_pool_stage_cards_keep_their_scale_spinner(stage: str) -> None:
+    rendered = render_stage_card_dom(stage)
+
+    # These stages are still one Deployment each, and this spinner is the only
+    # way to scale them from the UI, so it must survive.
+    classes = _class_names(rendered["card"])
+    assert "scale-controls" in classes
+    assert "scale-limit" in classes
+    # And they never receive the generate-only endpoints panel.
+    assert "endpoints-panel" not in classes
+    assert rendered["panelStillDetached"] is True
+
+
+def test_stage_card_branches_on_generate_for_the_endpoints_panel() -> None:
+    from swegen.dashboard.server import HTML
+
+    # Generate takes the endpoints branch INSTEAD of the scale spinner; every
+    # other stage still appends scaleControls.
+    assert (
+        "if(stage==='generate'){card._endpointsPanel=el('endpoints-panel')}"
+        "else{stats.append(scaleControls(stage,lines.desired,maxReplicas))}" in HTML
+    )
+    # The panel is appended to the card itself, not into the stats column.
+    assert "if(card._endpointsPanel)card.append(card._endpointsPanel)" in HTML
+    # scaleControls itself, and the stage-wide scale route it posts to, survive.
+    assert "function scaleControls(stage,desired,maxReplicas)" in HTML
+    assert "fetch('/api/pipeline/scale'" in HTML
+    # The panel is full-width inside the 3-column horizontal card.
+    assert ".endpoints-panel{grid-column:1/-1" in HTML
 
 
 def test_reset_probe_ui_reports_both_unlatched_outcomes() -> None:
