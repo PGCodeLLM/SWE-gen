@@ -117,6 +117,29 @@ _INSERT_PUSHED_IMAGE_SQL = """
         instance, registry, suffix, swr_url, pushed, event, payload
     ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
 """
+# The push stage dual-pushes to platform and trajectory, so a success that
+# reports ``synced_to_trajectory`` gets a second ledger row in the same
+# transaction as the first. Without it the trajectory copy exists in the
+# registry but not in the ledger, and swegen-trajectory-sync re-verifies it
+# forever as phantom backlog.
+#
+# pushed_images has no unique key to target with ON CONFLICT (its only unique
+# index is uq_pushed_images_backfill, scoped to backfilled rows with a
+# source_file), so idempotency is a guarded INSERT here exactly as in
+# swegen.tools.trajectory_sync._RECORD_TRAJECTORY_PUSH_SQL: a retried push, a
+# concurrent worker, or a replayed claim adds at most one trajectory row per
+# instance.
+_INSERT_TRAJECTORY_PUSHED_IMAGE_SQL = """
+    INSERT INTO pushed_images (
+        instance, registry, suffix, swr_url, pushed, event, payload
+    )
+    SELECT %s, %s, %s, %s, TRUE, 'pushed_images', %s::jsonb
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM pushed_images
+        WHERE instance = %s AND registry = %s AND suffix = %s AND pushed
+    )
+"""
 _UPSERT_STAGE_ACTIVITY_SQL = """
     INSERT INTO pipeline_stage_activity (
         task_id, task_version, stage, attempt, pgmq_msg_id, pgmq_read_count,
@@ -983,6 +1006,38 @@ def _push_inventory_fields(result: Mapping[str, object]) -> tuple[str, str | Non
     return remote_tag.strip(), registry.strip() if isinstance(registry, str) else None, suffix
 
 
+def _trajectory_inventory_fields(result: Mapping[str, object]) -> tuple[str, str, str] | None:
+    """Return the trajectory ledger row for a push, or None when it was not synced.
+
+    The trajectory push is deliberately non-fatal, so ``synced_to_trajectory``
+    being false or absent is a normal state and yields no second row. When it is
+    true the coordinates are validated as strictly as ``remote_tag``: the push
+    stage always emits the tag/registry/suffix triple alongside the flag, so a
+    flag without its coordinates is a producer bug, not a missing sync, and must
+    not silently write a half-identified row.
+    """
+
+    synced = result.get("synced_to_trajectory")
+    if synced is None or synced is False:
+        return None
+    if synced is not True:
+        raise TaskStoreError("push result synced_to_trajectory must be a boolean when supplied")
+    trajectory_tag = result.get("trajectory_remote_tag")
+    if not isinstance(trajectory_tag, str) or not trajectory_tag.strip():
+        raise TaskStoreError(
+            "push result synced to trajectory requires a nonblank trajectory_remote_tag"
+        )
+    trajectory_registry = result.get("trajectory_registry")
+    if not isinstance(trajectory_registry, str) or not trajectory_registry.strip():
+        raise TaskStoreError(
+            "push result synced to trajectory requires a nonblank trajectory_registry"
+        )
+    trajectory_suffix = result.get("trajectory_suffix", "")
+    if not isinstance(trajectory_suffix, str):
+        raise TaskStoreError("push result trajectory_suffix must be a string when supplied")
+    return trajectory_tag.strip(), trajectory_registry.strip(), trajectory_suffix
+
+
 class TaskStore:
     """Store pipeline tasks using a connection and transaction owned by the caller."""
 
@@ -1283,8 +1338,10 @@ class TaskStore:
 
         result = _redact_json_object(execution.result_json())
         push_fields: tuple[str, str | None, str] | None = None
+        trajectory_fields: tuple[str, str, str] | None = None
         if message.stage is PipelineStage.PUSH and execution.status is StageResultStatus.SUCCEEDED:
             push_fields = _push_inventory_fields(result)
+            trajectory_fields = _trajectory_inventory_fields(result)
 
         error: str | None = None
         if execution.status is StageResultStatus.REJECTED:
@@ -1383,6 +1440,23 @@ class TaskStore:
                     True,
                     "pushed_images",
                     payload,
+                ),
+            )
+        # Same transaction as the platform row above: a crash between the two
+        # must not be able to record one copy without the other.
+        if trajectory_fields is not None:
+            trajectory_tag, trajectory_registry, trajectory_suffix = trajectory_fields
+            connection.execute(
+                _INSERT_TRAJECTORY_PUSHED_IMAGE_SQL,
+                (
+                    message.task_id,
+                    trajectory_registry,
+                    trajectory_suffix,
+                    trajectory_tag,
+                    payload,
+                    message.task_id,
+                    trajectory_registry,
+                    trajectory_suffix,
                 ),
             )
         return True

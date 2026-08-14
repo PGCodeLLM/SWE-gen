@@ -87,6 +87,22 @@ INSERT_PUSHED_IMAGE_SQL = normalize_sql(
     ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
     """
 )
+# pushed_images has no unique key for ON CONFLICT to target, so the trajectory
+# row is a guarded INSERT. Asserting the literal keeps the guard from silently
+# degrading into an unconditional insert that duplicates rows on every retry.
+INSERT_TRAJECTORY_PUSHED_IMAGE_SQL = normalize_sql(
+    """
+    INSERT INTO pushed_images (
+        instance, registry, suffix, swr_url, pushed, event, payload
+    )
+    SELECT %s, %s, %s, %s, TRUE, 'pushed_images', %s::jsonb
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM pushed_images
+        WHERE instance = %s AND registry = %s AND suffix = %s AND pushed
+    )
+    """
+)
 UPSERT_STAGE_ACTIVITY_SQL = normalize_sql(
     """
     INSERT INTO pipeline_stage_activity (
@@ -1270,6 +1286,277 @@ def test_successful_push_completes_the_task_and_appends_inventory() -> None:
             ),
         ),
     ]
+
+
+def dual_push_result(**overrides: object) -> dict[str, object]:
+    """Build a push result shaped like the real dual-push stage output."""
+
+    from swegen.pipeline.actions import TRAJECTORY_SWR_REGISTRY, TRAJECTORY_SWR_SUFFIX
+
+    result: dict[str, object] = {
+        "remote_tag": "swr.example/swegen/owner__repo-123:v1",
+        "trajectory_remote_tag": "trajectory.example/swegen/generated:owner__repo-123",
+        "registry": "platform",
+        "suffix": "_platform",
+        "trajectory_registry": TRAJECTORY_SWR_REGISTRY,
+        "trajectory_suffix": TRAJECTORY_SWR_SUFFIX,
+        "skipped": False,
+        "already_present": False,
+        "synced_to_trajectory": True,
+    }
+    result.update(overrides)
+    return result
+
+
+def record_push(
+    result: dict[str, object],
+    *,
+    claim: ClaimedMessage | None = None,
+) -> RecordingConnection:
+    """Record one successful push and return the connection that captured it."""
+
+    from swegen.pipeline.task_store import TaskStore
+
+    claim = claim or make_claim(PipelineStage.PUSH)
+    connection = RecordingConnection(
+        inserted_stage_result(claim),
+        CursorResult(rowcount=1),
+        CursorResult(),
+        CursorResult(),
+    )
+    assert TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+        connection,
+        claim,
+        StageExecution.succeeded(result),
+        started_at=STARTED_AT,
+        worker_id="worker-1",
+        node_name="node-a",
+    )
+    return connection
+
+
+def push_inventory_calls(connection: RecordingConnection) -> list[tuple[str, tuple[object, ...]]]:
+    return [
+        call
+        for call in connection.calls
+        if call[0] in {INSERT_PUSHED_IMAGE_SQL, INSERT_TRAJECTORY_PUSHED_IMAGE_SQL}
+    ]
+
+
+def test_push_synced_to_trajectory_appends_both_registry_rows() -> None:
+    """The dual push writes both ledger copies, so no phantom backlog accrues."""
+
+    result = dual_push_result()
+    connection = record_push(result)
+    payload = json_payload(StageExecution.succeeded(result).result_json())
+
+    assert push_inventory_calls(connection) == [
+        (
+            INSERT_PUSHED_IMAGE_SQL,
+            (
+                "owner__repo-123",
+                "platform",
+                "_platform",
+                result["remote_tag"],
+                True,
+                "pushed_images",
+                payload,
+            ),
+        ),
+        (
+            INSERT_TRAJECTORY_PUSHED_IMAGE_SQL,
+            (
+                "owner__repo-123",
+                "trajectory",
+                "",
+                result["trajectory_remote_tag"],
+                payload,
+                "owner__repo-123",
+                "trajectory",
+                "",
+            ),
+        ),
+    ]
+
+
+def test_trajectory_push_row_carries_the_trajectory_registry_url_and_suffix() -> None:
+    connection = record_push(dual_push_result())
+    query, params = push_inventory_calls(connection)[1]
+
+    assert query == INSERT_TRAJECTORY_PUSHED_IMAGE_SQL
+    # instance, registry, suffix, swr_url are the row's identifying columns.
+    assert params[:4] == (
+        "owner__repo-123",
+        "trajectory",
+        "",
+        "trajectory.example/swegen/generated:owner__repo-123",
+    )
+    # The guard reuses the same instance/registry/suffix, so a duplicate row
+    # can never be written for a push that is already recorded.
+    assert params[5:] == params[:3]
+
+
+def test_trajectory_row_uses_the_push_action_registry_constants() -> None:
+    from swegen.pipeline.actions import TRAJECTORY_SWR_REGISTRY, TRAJECTORY_SWR_SUFFIX
+
+    connection = record_push(dual_push_result())
+    _, params = push_inventory_calls(connection)[1]
+
+    assert params[1] == TRAJECTORY_SWR_REGISTRY == "trajectory"
+    assert params[2] == TRAJECTORY_SWR_SUFFIX == ""
+
+
+@pytest.mark.parametrize("synced", [False, None])
+def test_push_without_a_trajectory_sync_appends_only_the_platform_row(synced: object) -> None:
+    """A failed trajectory push is non-fatal, so its row is simply absent."""
+
+    result = dual_push_result()
+    if synced is None:
+        result.pop("synced_to_trajectory")
+        result.pop("trajectory_remote_tag")
+    else:
+        result["synced_to_trajectory"] = False
+    connection = record_push(result)
+
+    inventory_calls = push_inventory_calls(connection)
+    assert [query for query, _ in inventory_calls] == [INSERT_PUSHED_IMAGE_SQL]
+    assert inventory_calls[0][1][:4] == (
+        "owner__repo-123",
+        "platform",
+        "_platform",
+        result["remote_tag"],
+    )
+
+
+def test_both_push_rows_are_written_inside_the_caller_transaction() -> None:
+    """A crash between the two rows must not be able to record only one.
+
+    RecordingConnection raises on commit()/transaction(), so a successful call
+    proves the store neither committed between the inserts nor opened a nested
+    transaction: both rows ride the caller's single transaction.
+    """
+
+    connection = record_push(dual_push_result())
+
+    assert [query for query, _ in connection.calls] == [
+        INSERT_STAGE_RESULT_SQL,
+        UPDATE_TASK_SQL,
+        INSERT_PUSHED_IMAGE_SQL,
+        INSERT_TRAJECTORY_PUSHED_IMAGE_SQL,
+    ]
+
+
+class PushedImagesConnection(RecordingConnection):
+    """A RecordingConnection that emulates the pushed_images ledger.
+
+    Rows are stored under the INSERT's own (instance, registry, suffix) but
+    deduplicated on the guard's WHERE NOT EXISTS key, exactly as Postgres would.
+    A guard keyed differently from the row it protects therefore shows up as a
+    duplicate here instead of only in production.
+    """
+
+    def __init__(self, *results: CursorResult | Sequence[object]) -> None:
+        super().__init__(*results)
+        self.rows: list[tuple[object, ...]] = []
+
+    def execute(self, query: str, params: Sequence[object] | None = None) -> FakeCursor:
+        cursor = super().execute(query, params)
+        values = tuple(params or ())
+        normalized_query = normalize_sql(query)
+        if normalized_query == INSERT_PUSHED_IMAGE_SQL:
+            self.rows.append(values[:4])
+        elif normalized_query == INSERT_TRAJECTORY_PUSHED_IMAGE_SQL:
+            guard_key = tuple(values[5:8])
+            if not any(row[:3] == guard_key for row in self.rows):
+                self.rows.append(values[:4])
+        return cursor
+
+
+def test_re_recording_the_same_push_does_not_duplicate_the_trajectory_row() -> None:
+    """The guarded INSERT is a no-op once the instance already has a row."""
+
+    from swegen.pipeline.task_store import TaskStore
+
+    result = dual_push_result()
+    claim = make_claim(PipelineStage.PUSH)
+    connection = PushedImagesConnection()
+    store = TaskStore(clock=lambda: FINISHED_AT)
+
+    # Replay the identical push, as a retried claim or a concurrent worker would.
+    for _ in range(3):
+        connection.results.extend(
+            (
+                inserted_stage_result(claim),
+                CursorResult(rowcount=1),
+                CursorResult(),
+                CursorResult(),
+            )
+        )
+        assert store.record_stage_result(
+            connection,
+            claim,
+            StageExecution.succeeded(result),
+            started_at=STARTED_AT,
+            worker_id="worker-1",
+            node_name="node-a",
+        )
+
+    trajectory_rows = [row for row in connection.rows if row[1] == "trajectory"]
+    assert trajectory_rows == [
+        ("owner__repo-123", "trajectory", "", result["trajectory_remote_tag"])
+    ]
+    assert "WHERE NOT EXISTS" in INSERT_TRAJECTORY_PUSHED_IMAGE_SQL
+
+
+@pytest.mark.parametrize("trajectory_tag", ["", "   ", 17, None])
+def test_a_synced_push_requires_a_nonblank_trajectory_remote_tag(trajectory_tag: object) -> None:
+    """A blank trajectory tag is rejected exactly like a blank remote_tag."""
+
+    from swegen.pipeline.task_store import TaskStore, TaskStoreError
+
+    connection = RecordingConnection()
+
+    with pytest.raises(TaskStoreError, match="trajectory_remote_tag"):
+        TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+            connection,
+            make_claim(PipelineStage.PUSH),
+            StageExecution.succeeded(dual_push_result(trajectory_remote_tag=trajectory_tag)),
+            started_at=STARTED_AT,
+            worker_id="worker-1",
+            node_name="node-a",
+        )
+
+    assert connection.calls == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"trajectory_registry": ""}, "trajectory_registry"),
+        ({"trajectory_registry": None}, "trajectory_registry"),
+        ({"trajectory_suffix": 3}, "trajectory_suffix"),
+        ({"synced_to_trajectory": "true"}, "synced_to_trajectory"),
+    ],
+)
+def test_a_malformed_trajectory_push_result_is_rejected(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    from swegen.pipeline.task_store import TaskStore, TaskStoreError
+
+    connection = RecordingConnection()
+
+    with pytest.raises(TaskStoreError, match=message):
+        TaskStore(clock=lambda: FINISHED_AT).record_stage_result(
+            connection,
+            make_claim(PipelineStage.PUSH),
+            StageExecution.succeeded(dual_push_result(**overrides)),
+            started_at=STARTED_AT,
+            worker_id="worker-1",
+            node_name="node-a",
+        )
+
+    assert connection.calls == []
 
 
 def test_expected_rejection_marks_the_task_rejected_without_files() -> None:
