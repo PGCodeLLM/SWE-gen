@@ -60,6 +60,24 @@ ENDPOINT_SPEC_DIGEST_ANNOTATION = "swegen.pgcode/endpoint-spec-digest"
 # HTTP statuses from an endpoint that count as "endpoint unhealthy".
 DEFAULT_UNHEALTHY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
 
+# Router bodies that mean "this model has no backend", regardless of status code.
+#
+# The endpoints sit behind a LiteLLM router, which answers HTTP 400 -- not 5xx --
+# when a model group has lost every healthy deployment:
+#
+#   400 litellm.BadRequestError: You passed in model=GLM-52_pre-train_256K.
+#   There are no healthy deployments for this model.
+#
+# Treating that as "reachable and answering" cleared the breaker onto a model
+# with no backend at all on 2026-08-14: each request 400s in ~1.2s, so 96 workers
+# drained the queue at full speed with a 100% failure rate and nothing stopped
+# them -- 1,616 failures and zero successes in ten minutes. The status code alone
+# cannot distinguish that from a genuine client error, so the body is inspected.
+_NO_BACKEND_BODY_MARKERS = (
+    "no healthy deployments",
+    "no deployments available",
+)
+
 
 def deployment_name_for(slug: str) -> str:
     return f"{DEPLOYMENT_PREFIX}{slug}"
@@ -274,13 +292,18 @@ class HttpEndpointProber:
                 response.read(256)
                 return ProbeResult(ok=True, status=response.status, detail="ok")
         except urllib.error.HTTPError as error:
-            # A 4xx that is not 429 (e.g. 400/401) means the endpoint is
-            # reachable and answering; only 429 + 5xx count as unhealthy.
-            healthy = error.code not in DEFAULT_UNHEALTHY_STATUSES
             try:
                 body = error.read().decode("utf-8", "replace")[:4000]
             except Exception:
                 body = ""
+            # A 4xx that is not 429 (e.g. 401) means the endpoint is reachable
+            # and answering, so only 429 + 5xx are unhealthy by status alone.
+            # The exception is a router reporting that the model group has no
+            # backend: that arrives as a 400 but means the model cannot serve a
+            # single request, which is strictly worse than a 5xx blip.
+            healthy = error.code not in DEFAULT_UNHEALTHY_STATUSES and not any(
+                marker in body.lower() for marker in _NO_BACKEND_BODY_MARKERS
+            )
             error_text = self._redact(
                 f"POST {url} -> HTTP {error.code}\n{body}".rstrip(), token
             )

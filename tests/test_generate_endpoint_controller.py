@@ -742,6 +742,43 @@ def test_prober_http_4xx_is_healthy_and_carries_no_error_text(monkeypatch):
     assert result.error_text == ""
 
 
+def test_prober_treats_router_no_backend_400_as_unhealthy(monkeypatch):
+    """A 400 saying the model group has no backend must NOT read as healthy.
+
+    The endpoints sit behind a LiteLLM router, which answers 400 -- not 5xx --
+    once a model group loses every healthy deployment. On 2026-08-14 that let a
+    dashboard reset clear the breaker onto a model with no backend at all: every
+    request 400d in ~1.2s, so 96 workers drained the queue at full speed with a
+    100% failure rate and nothing stopped them -- 1,616 failures and zero
+    successes in ten minutes. The status alone cannot tell that apart from a
+    genuine client error, so the body has to be read.
+    """
+
+    import urllib.error
+
+    monkeypatch.setattr(urllib.error, "HTTPError", _FakeHTTPError)
+
+    body = (
+        '{"error":{"message":"litellm.BadRequestError: You passed in '
+        "model=GLM-52_pre-train_256K. There are no healthy deployments for this "
+        'model. Received Model Group=GLM-52_pre-train_256K","code":"400"}}'
+    )
+
+    class _Opener:
+        def open(self, request, timeout):
+            raise _FakeHTTPError(400, body)
+
+    result = _prober_with_opener(_Opener()).probe(
+        "http://host:8088", "GLM-52_pre-train_256K", "SECRET-BEARER-TOKEN"
+    )
+
+    assert result.ok is False, "a model group with no backend is not healthy"
+    assert result.status == 400
+    # The operator needs the router's own words to see why it stayed latched.
+    assert "no healthy deployments" in result.error_text
+    assert "SECRET-BEARER-TOKEN" not in result.error_text
+
+
 def test_prober_unreachable_captures_reason_and_url():
     import urllib.error
 
