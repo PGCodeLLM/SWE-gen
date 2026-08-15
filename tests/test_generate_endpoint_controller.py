@@ -696,6 +696,32 @@ def test_prober_does_not_clobber_preset_no_proxy(monkeypatch):
     assert os.environ["NO_PROXY"] == "preset.example,10.*"
 
 
+def test_prober_timeout_defaults_to_the_shared_env_var(monkeypatch):
+    """Every prober reads one env var, so no caller can drift from the rest.
+
+    The dashboard's Reset button built `HttpEndpointProber()` with no argument
+    and silently got the 20s literal, while the controller's reconcile loop read
+    SWEGEN_ENDPOINT_PROBE_TIMEOUT_SECONDS. Raising the controller to 300s for a
+    gateway answering in 45-70s therefore fixed the loop but not Reset: the
+    button kept timing out against an endpoint the controller considered
+    healthy, so a latched breaker could never be cleared.
+    """
+
+    from swegen.pipeline.generate_endpoint_controller import (
+        DEFAULT_PROBE_TIMEOUT_SECONDS,
+        ENDPOINT_PROBE_TIMEOUT_ENV,
+        HttpEndpointProber,
+    )
+
+    monkeypatch.setenv(ENDPOINT_PROBE_TIMEOUT_ENV, "300")
+    assert HttpEndpointProber()._timeout == 300.0
+    # An explicit argument still wins, so callers can override per-probe.
+    assert HttpEndpointProber(timeout_seconds=45)._timeout == 45
+    # Unset falls back to the documented default rather than crashing.
+    monkeypatch.delenv(ENDPOINT_PROBE_TIMEOUT_ENV, raising=False)
+    assert HttpEndpointProber()._timeout == DEFAULT_PROBE_TIMEOUT_SECONDS
+
+
 def test_prober_http_5xx_captures_status_body_and_url_in_error_text(monkeypatch):
     import urllib.error
 

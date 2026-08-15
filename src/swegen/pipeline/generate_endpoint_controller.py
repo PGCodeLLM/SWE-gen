@@ -60,6 +60,14 @@ ENDPOINT_SPEC_DIGEST_ANNOTATION = "swegen.pgcode/endpoint-spec-digest"
 # HTTP statuses from an endpoint that count as "endpoint unhealthy".
 DEFAULT_UNHEALTHY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
 
+# How long an endpoint may take to answer the health probe. Every prober reads
+# this, so the controller's reconcile loop and the dashboard's Reset button
+# cannot drift apart. Raise it for a gateway that is slow but working: probing
+# faster than the endpoint can answer marks a healthy model unhealthy and
+# latches its breaker while real requests are still succeeding.
+ENDPOINT_PROBE_TIMEOUT_ENV = "SWEGEN_ENDPOINT_PROBE_TIMEOUT_SECONDS"
+DEFAULT_PROBE_TIMEOUT_SECONDS = 20.0
+
 # Router bodies that mean "this model has no backend", regardless of status code.
 #
 # The endpoints sit behind a LiteLLM router, which answers HTTP 400 -- not 5xx --
@@ -248,7 +256,17 @@ class EndpointProber(Protocol):
 class HttpEndpointProber:
     """Probe a model endpoint's Anthropic messages API for real HTTP health."""
 
-    def __init__(self, *, timeout_seconds: float = 20.0) -> None:
+    def __init__(self, *, timeout_seconds: float | None = None) -> None:
+        # Default from the same env var the controller reads, so the dashboard's
+        # Reset button and the controller's reconcile loop agree on how long an
+        # endpoint may take to answer. They disagreed before: the controller was
+        # raised to 300s for a gateway that answers in 45-70s, while the
+        # dashboard kept the 20s literal, so Reset timed out against an endpoint
+        # the controller considered healthy and the breaker could never clear.
+        if timeout_seconds is None:
+            timeout_seconds = float(
+                os.environ.get(ENDPOINT_PROBE_TIMEOUT_ENV, DEFAULT_PROBE_TIMEOUT_SECONDS)
+            )
         self._timeout = timeout_seconds
         # Registered endpoints are a MIX of hosts: internal ones (e.g. 7.244.x on
         # the cluster network) are reachable ONLY directly and 504 through the
@@ -944,7 +962,9 @@ def _config_from_environment() -> dict[str, object]:
     return {
         "namespace": os.environ.get("SWEGEN_ENDPOINT_NAMESPACE", "swegen-pipeline"),
         "poll_seconds": float(os.environ.get("SWEGEN_ENDPOINT_POLL_SECONDS", "20")),
-        "probe_timeout": float(os.environ.get("SWEGEN_ENDPOINT_PROBE_TIMEOUT_SECONDS", "20")),
+        "probe_timeout": float(
+            os.environ.get(ENDPOINT_PROBE_TIMEOUT_ENV, DEFAULT_PROBE_TIMEOUT_SECONDS)
+        ),
         "trip_threshold": int(os.environ.get("SWEGEN_ENDPOINT_TRIP_THRESHOLD", "3")),
         "manifest": os.environ.get(
             "SWEGEN_ENDPOINT_TEMPLATE_PATH", "/etc/swegen/swegen-pipeline.yaml"
