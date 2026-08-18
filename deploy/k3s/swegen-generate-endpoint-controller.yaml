@@ -95,15 +95,21 @@ spec:
             - name: SWEGEN_ENDPOINT_NAMESPACE
               value: swegen-pipeline
             - name: SWEGEN_ENDPOINT_POLL_SECONDS
-              value: "20"
+              value: "30"
+            # The gateway at 7.244.3.251 answers glm-5.2-moedsa in 45-70s -- slow,
+            # but working. A 20s probe marks it unhealthy while real task success
+            # is near 100%, latches the breaker, and leaves Generate at zero with
+            # a full queue; see the "one timeout, not two" fix. 300s is the value
+            # that has been running in the cluster since.
             - name: SWEGEN_ENDPOINT_PROBE_TIMEOUT_SECONDS
-              value: "20"
+              value: "300"
             # Consecutive unhealthy probes (504/429/5xx/unreachable) before the
             # per-endpoint breaker latches and its Deployment is scaled to zero.
-            # 15 probes x 20s poll ~= 5 minutes of sustained failure, so a brief
-            # endpoint blip no longer trips the breaker -- only a real outage does.
+            # A fast-failing gateway (the 502/504 mode) answers well inside the
+            # timeout, so the loop runs at the 30s poll and 10 probes ~= 5 minutes
+            # of sustained failure before tripping -- a brief blip does not.
             - name: SWEGEN_ENDPOINT_TRIP_THRESHOLD
-              value: "15"
+              value: "10"
           resources:
             requests:
               cpu: 20m

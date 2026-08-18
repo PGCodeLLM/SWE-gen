@@ -128,7 +128,7 @@ import yaml
 source, destination = map(Path, sys.argv[1:])
 document = yaml.safe_load(source.read_text(encoding="utf-8"))
 entries = document.get("model_list") if isinstance(document, dict) else None
-model = os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-thinking-npu").strip()
+model = os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-moedsa-512k-thinking").strip()
 if not model:
     raise SystemExit("SWEGEN_REPAIR_MODEL_NAME must not be blank")
 matches = [

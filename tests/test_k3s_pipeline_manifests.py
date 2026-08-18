@@ -309,7 +309,7 @@ def test_secret_and_image_helpers_exist_without_cache_cleaner() -> None:
     assert '--from-file=config.json="${merged_docker_config}"' in secret_helper
     assert "swegen-repair-model-credentials" in secret_helper
     assert (
-        'os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-thinking-npu")'
+        'os.environ.get("SWEGEN_REPAIR_MODEL_NAME", "glm-5.2-moedsa-512k-thinking")'
         in secret_helper
     )
     assert 'entry.get("model_name") == model' in secret_helper
