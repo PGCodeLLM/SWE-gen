@@ -94,7 +94,7 @@ swegen analyze tasks/<task_id> -k 5 -n 3  # run 5 trials, 3 concurrent
 Key options:
 - `-k, --n-trials`: Number of trials to run (default: 3)
 - `-n, --n-concurrent`: Number of concurrent trials (default: 3)
-- `--analysis-model`: Model for Claude Code classification (default: claude-sonnet-4-5)
+- `--analysis-model`: Model for Claude Code classification (default: claude-sonnet-5)
 - `--skip-baseline`: Skip baseline validation (nop/oracle)
 - `--skip-classify`: Skip AI-powered trial classification
 

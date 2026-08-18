@@ -46,7 +46,7 @@ def classify_trial(
     trial_dir: str | Path,
     task_dir: str | Path,
     *,
-    model: str = "claude-sonnet-4-5",
+    model: str = "claude-sonnet-5",
     verbose: bool = False,
     timeout: int = 300,
 ) -> TrialClassification:
@@ -68,7 +68,7 @@ def classify_trial(
     Args:
         trial_dir: Path to trial directory (contains result.json, agent/, verifier/)
         task_dir: Path to task directory (contains instruction.md, solution/, tests/)
-        model: Model name for Claude Code (default: claude-sonnet-4-5)
+        model: Model name for Claude Code (default: claude-sonnet-5)
         verbose: If True, stream Claude Code output to console
         timeout: Maximum time for classification in seconds (default: 300 = 5 min)
         
@@ -93,14 +93,14 @@ class TrialClassifier:
     
     def __init__(
         self,
-        model: str = "claude-sonnet-4-5",
+        model: str = "claude-sonnet-5",
         verbose: bool = False,
         timeout: int = 300,  # 5 minutes per classification
     ):
         """Initialize the classifier.
         
         Args:
-            model: Model name for Claude Code (default: claude-sonnet-4-5)
+            model: Model name for Claude Code (default: claude-sonnet-5)
             verbose: If True, stream Claude Code output to console
             timeout: Maximum time per classification in seconds (default: 300 = 5 min)
         """
