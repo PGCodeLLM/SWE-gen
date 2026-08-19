@@ -226,9 +226,16 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 2
           resources:
+            # Measured across a live 1400-pod generate fleet: CPU p50 111m, p90
+            # 242m, mean 146m -- the 500m request reserved 700 of the cluster's
+            # 768 cores for work that used 204, leaving nothing schedulable for
+            # the other stages. Memory ran the other way: p50 325Mi against a
+            # 200Mi request, so every generate pod sat above its request and was
+            # a preferred eviction target under pressure. Limits are unchanged,
+            # so a heavy task can still burst.
             requests:
-              cpu: 500m
-              memory: 200Mi
+              cpu: 150m
+              memory: 450Mi
             limits:
               cpu: "16"
               memory: 32Gi
