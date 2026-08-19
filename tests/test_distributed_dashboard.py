@@ -621,13 +621,75 @@ def test_resolve_worker_model_handles_63_char_truncated_dynamic_pod_names() -> N
     from swegen.dashboard.distributed_status import resolve_worker_model
 
     deployment_to_model = {
+        # The static pool. Its name is a PREFIX of every dynamic pool's name,
+        # which is what made the old bare startswith() match unsound.
+        "swegen-generate": "glm-5.2-pretrain-256k-v1",
         "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23": "deepseek-v4-flash",
         "swegen-generate-dyn-glm-5-2-moedsa-7-244-3-251": "glm-5.2-moedsa",
+        # 60 chars: long enough that k8s CANNOT fit <name>-<rshash>-<podhash>
+        # into 63, so its pods lose the distinguishing "-251" tail entirely.
+        "swegen-generate-dyn-glm-5-2-moedsa-512k-thinking-7-244-3-251": (
+            "glm-5.2-moedsa-512k-thinking"
+        ),
     }
+    # REGRESSION GUARD. A 60-char deployment's pod name is clipped to 58 chars
+    # before the 5-char pod hash, destroying the "-251" tail, so the pod does NOT
+    # start with its own deployment name. The only surviving prefix was the
+    # unrelated 15-char "swegen-generate", so 130 live pods were charted under
+    # the static pool's model -- a model that had not run at generate for days.
+    # This fixture must keep a >=55-char deployment name or it stops exercising
+    # the property at all.
+    assert len("swegen-generate-dyn-glm-5-2-moedsa-512k-thinking-7-244-3-251") >= 55
+    for clipped in (
+        "swegen-generate-dyn-glm-5-2-moedsa-512k-thinking-7-244-3-2282x4",
+        "swegen-generate-dyn-glm-5-2-moedsa-512k-thinking-7-244-3-24shvd",
+    ):
+        assert len(clipped) == 63
+        # It really has lost its own deployment name as a prefix...
+        assert not clipped.startswith(
+            "swegen-generate-dyn-glm-5-2-moedsa-512k-thinking-7-244-3-251-"
+        )
+        # ...and it really does still share the static pool's prefix, so a bare
+        # startswith() would mis-resolve it.
+        assert clipped.startswith("swegen-generate-")
+        assert (
+            resolve_worker_model(clipped, deployment_to_model)
+            == "glm-5.2-moedsa-512k-thinking"
+        )
+    # The 55-char sibling pool DOES fit its full name and must keep resolving
+    # via the ordinary exact-shape match, not the truncation branch.
+    assert (
+        resolve_worker_model(
+            "swegen-generate-dyn-glm-5-2-moedsa-thinking-7-244-3-251-7c24dld",
+            {
+                **deployment_to_model,
+                "swegen-generate-dyn-glm-5-2-moedsa-thinking-7-244-3-251": (
+                    "glm-5.2-moedsa-thinking"
+                ),
+            },
+        )
+        == "glm-5.2-moedsa-thinking"
+    )
+    # The static pool's OWN pods must still resolve to the static model: the
+    # truncation tolerance must not be bought by breaking the short-name case.
+    assert (
+        resolve_worker_model("swegen-generate-9b75d9789-27tw2", deployment_to_model)
+        == "glm-5.2-pretrain-256k-v1"
+    )
+    # A 63-char pod belonging to NO known long deployment must not be captured by
+    # the short static name via the truncation branch; it falls back to its own
+    # derived identity rather than borrowing an unrelated model.
+    assert (
+        resolve_worker_model(
+            "swegen-generate-dyn-unregistered-pool-9-9-9-9-9-9-77f9c8b4d5xyz9",
+            deployment_to_model,
+        )
+        != "glm-5.2-pretrain-256k-v1"
+    )
     # Real dynamic-pool pod names hit the 63-char cap: k8s truncates the tail so
     # the "-<hash>-<rand>" suffix collapses into ONE dashless-in-the-middle blob
-    # (here "-54bfbb78785246"), which the regex strip leaves unchanged. The
-    # prefix match against the known deployment name still resolves the model.
+    # (here "-54bfbb78785246"), which the regex strip leaves unchanged. This
+    # 48-char deployment still fits its full name, so the ordinary match applies.
     truncated = "swegen-generate-dyn-deepseek-v4-flash-1-95-77-23-54bfbb78785246"
     assert len(truncated) == 63
     assert resolve_worker_model(truncated, deployment_to_model) == "deepseek-v4-flash"
@@ -1220,6 +1282,498 @@ def test_cadvisor_disk_io_parser_avoids_parent_partition_iops_double_counting() 
     }
 
 
+# --- node cAdvisor disk I/O: cadence, breaker, and stale-but-served ----------
+#
+# The node cAdvisor endpoint returns per-container cgroup metrics for every
+# container on the node. At ~500-620 pods per node it stopped completing at all
+# (0 bytes after 45.1s on ...-0006, 0 bytes after 30.2s on ...-0003), and
+# re-issuing it on every 5s snapshot refresh was by itself enough to make the
+# k3s API server fail its /livez probes. These tests pin the three properties
+# that fixed it: a slow independent cadence, a per-node breaker that stops
+# calling a node that cannot answer, and last-known-good served with an age.
+
+def _cadvisor_body(reads: int, writes: int, read_ops: int, write_ops: int, io_time: float) -> str:
+    """One node-root block device's cAdvisor counters, in kubelet's line format."""
+
+    labels = '{device="/dev/vda",id="/"}'
+    return "\n".join(
+        f"{metric}{labels} {value}"
+        for metric, value in (
+            ("container_fs_reads_bytes_total", reads),
+            ("container_fs_writes_bytes_total", writes),
+            ("container_fs_reads_total", read_ops),
+            ("container_fs_writes_total", write_ops),
+            ("container_fs_io_current", 1),
+            ("container_fs_io_time_seconds_total", io_time),
+        )
+    )
+
+
+class _KubectlFailure:
+    """A nonzero kubectl exit with the given stderr, distinct from a body string."""
+
+    def __init__(self, stderr: str) -> None:
+        self.stderr = stderr
+
+
+class _DiskIoHarness:
+    """A K3sStatusCollector wired to a fake clock and a synchronous sampler.
+
+    ``spawn`` runs the sampler inline instead of on a daemon thread, so the
+    cadence/breaker logic is exercised deterministically without sleeping.
+    """
+
+    def __init__(self, **kwargs: object) -> None:
+        from swegen.dashboard.distributed_status import K3sStatusCollector
+
+        self.clock = 1000.0
+        self.raw_calls: list[str] = []
+        self.responses: dict[str, object] = {}
+        self.collector = K3sStatusCollector(
+            runner=self._runner,
+            monotonic=lambda: self.clock,
+            spawn=lambda target: target(),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def _runner(self, command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        assert "--raw" in command, f"unexpected non-cAdvisor call: {command}"
+        node = command[-1].split("/nodes/")[1].split("/")[0]
+        self.raw_calls.append(node)
+        response = self.responses.get(node)
+        if isinstance(response, Exception):
+            raise response
+        if isinstance(response, _KubectlFailure):
+            return CompletedProcess(command, 1, stdout="", stderr=response.stderr)
+        return CompletedProcess(command, 0, stdout=str(response or ""), stderr="")
+
+    def advance(self, seconds: float) -> None:
+        self.clock += seconds
+
+    def view(self, *nodes: str) -> dict[str, dict[str, object]]:
+        node_doc = {"items": [{"metadata": {"name": name}} for name in nodes]}
+        return self.collector._disk_io_view(node_doc)
+
+
+def test_disk_io_uses_its_own_slow_cadence_and_long_timeout_not_the_refresh_cadence() -> None:
+    """cAdvisor must not be re-issued on every snapshot refresh.
+
+    Before, _collect_disk_io_metrics ran inline on the refresh path with a 5s
+    kubectl --request-timeout inside an 8s subprocess timeout. Both were far
+    below what the endpoint needs at this pod count, so every refresh started
+    calls that could only ever time out -- a hot retry loop against an API
+    server that was already the bottleneck.
+    """
+
+    from swegen.dashboard.distributed_status import (
+        DISK_IO_POLL_SECONDS_DEFAULT,
+        DISK_IO_TIMEOUT_SECONDS_DEFAULT,
+    )
+
+    harness = _DiskIoHarness()
+    harness.responses["node-a"] = _cadvisor_body(100, 200, 10, 20, 1.0)
+
+    assert harness.collector.disk_io_poll_seconds == DISK_IO_POLL_SECONDS_DEFAULT == 60.0
+    assert harness.collector.disk_io_timeout_seconds == DISK_IO_TIMEOUT_SECONDS_DEFAULT == 20.0
+
+    harness.view("node-a")
+    assert harness.raw_calls == ["node-a"]
+
+    # Ten more refreshes at the 15s snapshot cadence: no new cAdvisor call until
+    # the 60s disk-I/O cadence comes due.
+    for _ in range(3):
+        harness.advance(15.0)
+        harness.view("node-a")
+    assert harness.raw_calls == ["node-a"]
+
+    harness.advance(15.0)
+    harness.view("node-a")
+    assert harness.raw_calls == ["node-a", "node-a"]
+
+
+def test_disk_io_kubectl_call_reads_one_timeout_budget() -> None:
+    """The kubectl request deadline and the subprocess timeout come from one value.
+
+    A subprocess timeout shorter than the --request-timeout it wraps kills the
+    client before the server-side deadline can report anything useful, which is
+    exactly the "timed out after 8 seconds" the operator saw from a 5s request
+    timeout.
+    """
+
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    seen: dict[str, object] = {}
+
+    def runner(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        seen["command"] = command
+        seen["timeout"] = kwargs.get("timeout")
+        return CompletedProcess(command, 0, stdout=_cadvisor_body(1, 1, 1, 1, 0.0), stderr="")
+
+    collector = K3sStatusCollector(runner=runner, spawn=lambda target: target())
+    collector._sample_disk_io_node("node-a")
+
+    assert "--request-timeout=20s" in seen["command"]
+    assert seen["timeout"] == 22
+    assert "/api/v1/nodes/node-a/proxy/metrics/cadvisor" in seen["command"][-1]
+
+
+def test_disk_io_breaker_opens_after_three_failures_and_stops_polling_that_node() -> None:
+    """A node that cannot serve cAdvisor stops being called, rather than being retried.
+
+    Node ...-0006 returned 0 bytes after 45s, every single time. Without a
+    breaker the dashboard re-issued that call forever; the point of the breaker
+    is that a dead endpoint costs the API server nothing after N attempts.
+    """
+
+    from swegen.dashboard.distributed_status import (
+        DISK_IO_BREAKER_COOLDOWN_SECONDS_DEFAULT,
+        DISK_IO_BREAKER_FAILURES_DEFAULT,
+    )
+
+    harness = _DiskIoHarness()
+    harness.responses["node-a"] = _KubectlFailure("the server was unable to return a response")
+    assert harness.collector.disk_io_breaker_failures == DISK_IO_BREAKER_FAILURES_DEFAULT == 3
+    assert (
+        harness.collector.disk_io_breaker_cooldown_seconds
+        == DISK_IO_BREAKER_COOLDOWN_SECONDS_DEFAULT
+        == 300.0
+    )
+
+    for _ in range(3):
+        harness.view("node-a")
+        harness.advance(60.0)
+    assert harness.raw_calls == ["node-a"] * 3
+
+    view = harness.view("node-a")
+    # Three failures tripped it; the fourth due cadence made no call at all.
+    assert harness.raw_calls == ["node-a"] * 3
+    assert view["node-a"]["breaker"]["open"] is True
+    assert view["node-a"]["breaker"]["consecutive_failures"] == 3
+    assert view["node-a"]["available"] is False
+    assert "unable to return a response" in view["node-a"]["error"]
+
+
+def test_disk_io_breaker_retries_once_after_the_cooldown_and_closes_on_success() -> None:
+    harness = _DiskIoHarness()
+    harness.responses["node-a"] = _KubectlFailure("boom")
+    for _ in range(3):
+        harness.view("node-a")
+        harness.advance(60.0)
+    harness.view("node-a")
+    assert harness.raw_calls == ["node-a"] * 3
+
+    # Still inside the cooldown: due on the poll cadence, but the breaker holds.
+    harness.advance(120.0)
+    view = harness.view("node-a")
+    assert harness.raw_calls == ["node-a"] * 3
+    assert view["node-a"]["breaker"]["cooldown_remaining_seconds"] == 120.0
+
+    # Cooldown expired: exactly ONE half-open trial call.
+    harness.advance(200.0)
+    harness.view("node-a")
+    assert harness.raw_calls == ["node-a"] * 4
+    # A failed trial does not re-arm another call on the next cadence tick; the
+    # breaker charges a fresh full cooldown.
+    harness.advance(60.0)
+    harness.view("node-a")
+    assert harness.raw_calls == ["node-a"] * 4
+
+    # A successful trial closes the breaker and resets the failure count.
+    harness.responses["node-a"] = _cadvisor_body(100, 200, 10, 20, 1.0)
+    harness.advance(400.0)
+    view = harness.view("node-a")
+    assert harness.raw_calls == ["node-a"] * 5
+    assert view["node-a"]["breaker"]["open"] is False
+    assert view["node-a"]["breaker"]["consecutive_failures"] == 0
+
+
+def test_disk_io_serves_last_known_good_tagged_with_its_age_when_the_node_goes_dark() -> None:
+    """A failing node degrades to "from N ago", not to a blank row.
+
+    The operator's complaint was that stale data was presented as if it were
+    live. The payload now carries age_seconds and stale, measured server-side on
+    a monotonic clock so a browser clock skew cannot fake freshness.
+    """
+
+    import pytest
+
+    harness = _DiskIoHarness()
+    harness.responses["node-a"] = _cadvisor_body(0, 0, 0, 0, 0.0)
+    harness.view("node-a")  # baseline counters only; rates need two samples
+    harness.advance(60.0)
+    harness.responses["node-a"] = _cadvisor_body(1_000, 2_000, 100, 200, 30.0)
+    view = harness.view("node-a")
+
+    good = view["node-a"]
+    assert good["available"] is True
+    assert good["stale"] is False
+    assert good["age_seconds"] == 0.0
+    assert good["read_bytes_per_second"] == pytest.approx(1_000 / 60, rel=1e-3)
+    assert good["busy_percent"] == 50.0
+    assert good["error"] is None
+
+    # The endpoint now stops answering. The last good sample keeps being served,
+    # with a truthful age and the failure attached.
+    harness.responses["node-a"] = _KubectlFailure("the server was unable to return a response")
+    for _ in range(3):
+        harness.advance(60.0)
+        stale = harness.view("node-a")["node-a"]
+
+    assert stale["available"] is True
+    assert stale["stale"] is True
+    assert stale["read_bytes_per_second"] == good["read_bytes_per_second"]
+    assert stale["age_seconds"] == 180.0
+    assert "unable to return a response" in stale["error"]
+    assert stale["breaker"]["open"] is True
+
+
+def test_disk_io_treats_an_empty_cadvisor_body_as_a_failure_not_a_sample() -> None:
+    """0 bytes after 45s is a dead endpoint, not a node with no disks.
+
+    Counting a deviceless body as success would keep the breaker closed forever
+    against exactly the node that broke the API server.
+    """
+
+    harness = _DiskIoHarness()
+    harness.responses["node-a"] = ""
+
+    for _ in range(3):
+        harness.view("node-a")
+        harness.advance(60.0)
+    view = harness.view("node-a")
+
+    assert harness.raw_calls == ["node-a"] * 3
+    assert view["node-a"]["breaker"]["open"] is True
+    assert "no block-device metrics" in view["node-a"]["error"]
+
+
+def test_disk_io_timeout_is_reported_without_raising_into_the_snapshot() -> None:
+    harness = _DiskIoHarness()
+    harness.responses["node-a"] = TimeoutExpired(cmd="kubectl", timeout=22)
+
+    view = harness.view("node-a")
+
+    assert view["node-a"]["available"] is False
+    assert view["node-a"]["error"] == "cAdvisor metrics timed out after 20s"
+
+
+def test_a_failing_cadvisor_node_does_not_fail_the_whole_status_snapshot() -> None:
+    """One dead node's disk I/O must never take down the rest of the payload.
+
+    ``collect()`` has to keep returning nodes, stages, CPU/memory and scaling.
+    Before, the cAdvisor call ran inline inside _collect_resource_metrics' try
+    block, so a raise there flipped the entire resource panel to stale.
+    """
+
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    nodes = {
+        "items": [
+            {
+                "metadata": {"name": "node-a"},
+                "status": {
+                    "allocatable": {"cpu": "4", "memory": "8Gi"},
+                    "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}],
+                },
+            }
+        ]
+    }
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "--raw" in command:
+            raise TimeoutExpired(cmd="kubectl", timeout=22)
+        if "top" in command:
+            return CompletedProcess(
+                command, 0, stdout="node-a 1000m 25% 2Gi 25%\n", stderr=""
+            )
+        if "exec" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="no probe pod")
+        if "nodes" in command:
+            document = nodes
+        else:
+            document = {"items": []}
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    snapshot = K3sStatusCollector(runner=runner, spawn=lambda target: target()).collect()
+    metrics = snapshot["resource_metrics"]
+
+    # The panel is live, not stale: only the disk I/O column degraded.
+    assert metrics["available"] is True
+    assert metrics["stale"] is False
+    assert metrics["error"] is None
+    assert metrics["aggregate"]["cpu_used_millicores"] == 1_000
+    assert metrics["nodes"][0]["memory_percent"] == 25.0
+    assert metrics["nodes"][0]["disk_io"]["available"] is False
+    assert metrics["nodes"][0]["disk_io"]["error"] == "cAdvisor metrics timed out after 20s"
+
+
+def test_disk_io_cadence_timeout_and_breaker_are_env_overridable(monkeypatch) -> None:
+    from swegen.dashboard.distributed_status import (
+        DISK_IO_BREAKER_COOLDOWN_SECONDS_ENV,
+        DISK_IO_BREAKER_FAILURES_ENV,
+        DISK_IO_POLL_SECONDS_ENV,
+        DISK_IO_TIMEOUT_SECONDS_ENV,
+        K3sStatusCollector,
+    )
+
+    monkeypatch.setenv(DISK_IO_POLL_SECONDS_ENV, "120")
+    monkeypatch.setenv(DISK_IO_TIMEOUT_SECONDS_ENV, "45")
+    monkeypatch.setenv(DISK_IO_BREAKER_FAILURES_ENV, "5")
+    monkeypatch.setenv(DISK_IO_BREAKER_COOLDOWN_SECONDS_ENV, "900")
+    collector = K3sStatusCollector()
+
+    assert collector.disk_io_poll_seconds == 120.0
+    assert collector.disk_io_timeout_seconds == 45.0
+    assert collector.disk_io_breaker_failures == 5
+    assert collector.disk_io_breaker_cooldown_seconds == 900.0
+
+    # A typo'd or non-positive override falls back to the default rather than
+    # setting a poll interval of 0 and turning this back into a hot loop.
+    monkeypatch.setenv(DISK_IO_POLL_SECONDS_ENV, "0")
+    monkeypatch.setenv(DISK_IO_TIMEOUT_SECONDS_ENV, "not-a-number")
+    monkeypatch.setenv(DISK_IO_BREAKER_FAILURES_ENV, "-1")
+    fallback = K3sStatusCollector()
+
+    assert fallback.disk_io_poll_seconds == 60.0
+    assert fallback.disk_io_timeout_seconds == 20.0
+    assert fallback.disk_io_breaker_failures == 3
+
+
+def test_cluster_wide_pod_list_excludes_the_namespace_already_fetched() -> None:
+    """The cluster-wide pod read must not re-download the pods we already have.
+
+    Measured on this cluster, ``get pods -A --field-selector=status.phase!=Failed``
+    is 38 MB / ~4.0s for 1,693 pods -- 1,690 of which are the swegen-pipeline
+    pods collect() has ALREADY fetched for the stage panel. The dashboard was
+    making the API server page the same 38 MB out of etcd twice per refresh to
+    learn the CPU requests of three kube-system pods. Excluding our own
+    namespace takes that read to 40 KB / 0.47s, and the in-namespace share is
+    summed from the doc already in hand, so the total is unchanged.
+    """
+
+    from swegen.dashboard.distributed_status import (
+        POD_ALLOCATION_POLL_SECONDS_DEFAULT,
+        K3sStatusCollector,
+    )
+
+    clock = [1000.0]
+    all_pod_queries: list[list[str]] = []
+
+    def pod(name: str, node: str, cpu: str) -> dict[str, object]:
+        return {
+            "kind": "Pod",
+            "metadata": {"name": name, "labels": {"swegen.pgcode/stage": "generate"}},
+            "spec": {
+                "nodeName": node,
+                "containers": [{"resources": {"requests": {"cpu": cpu}}}],
+            },
+            "status": {"phase": "Running"},
+        }
+
+    namespace_pods = {"items": [pod("generate-a", "node-a", "500m")]}
+    other_pods = {"items": [pod("kube-proxy", "node-a", "250m")]}
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "--raw" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="cadvisor down")
+        if "top" in command:
+            return CompletedProcess(
+                command, 0, stdout="node-a 1000m 25% 2Gi 25%\n", stderr=""
+            )
+        if "exec" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="no probe pod")
+        if "-A" in command:
+            all_pod_queries.append(command)
+            return CompletedProcess(command, 0, stdout=json.dumps(other_pods), stderr="")
+        if "nodes" in command:
+            document = {
+                "items": [
+                    {
+                        "metadata": {"name": "node-a"},
+                        "status": {"allocatable": {"cpu": "4", "memory": "8Gi"}},
+                    }
+                ]
+            }
+        elif "deployments" in command:
+            document = {"items": []}
+        else:
+            document = namespace_pods
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    collector = K3sStatusCollector(
+        runner=runner, monotonic=lambda: clock[0], spawn=lambda target: target()
+    )
+    assert collector.pod_allocation_poll_seconds == POD_ALLOCATION_POLL_SECONDS_DEFAULT == 60.0
+
+    snapshot = collector.collect()
+
+    assert len(all_pod_queries) == 1
+    selector = next(a for a in all_pod_queries[0] if a.startswith("--field-selector="))
+    assert "status.phase!=Failed" in selector
+    assert "metadata.namespace!=swegen-pipeline" in selector
+    # The total still counts BOTH namespaces: 500m in-namespace + 250m outside.
+    metrics = snapshot["resource_metrics"]
+    assert metrics["nodes"][0]["cpu_allocated_millicores"] == 750
+    assert metrics["allocation_error"] is None
+
+    # And the cluster-wide read is additionally cached across refreshes, while
+    # the in-namespace share keeps tracking the doc fetched on each one.
+    namespace_pods["items"].append(pod("generate-b", "node-a", "500m"))
+    for _ in range(3):
+        clock[0] += 15.0
+        snapshot = collector.collect()
+    assert len(all_pod_queries) == 1
+    assert snapshot["resource_metrics"]["nodes"][0]["cpu_allocated_millicores"] == 1_250
+
+    clock[0] += 15.0
+    collector.collect()
+    assert len(all_pod_queries) == 2
+
+
+def test_pod_allocation_reports_an_error_rather_than_an_undercount() -> None:
+    """A failed cluster-wide read must not publish a total missing a namespace.
+
+    The in-namespace sum alone would look like a plausible number while silently
+    omitting every other namespace, so it is withheld and the error surfaced.
+    """
+
+    from swegen.dashboard.distributed_status import K3sStatusCollector
+
+    def runner(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if "--raw" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="cadvisor down")
+        if "top" in command:
+            return CompletedProcess(
+                command, 0, stdout="node-a 1000m 25% 2Gi 25%\n", stderr=""
+            )
+        if "exec" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="no probe pod")
+        if "-A" in command:
+            return CompletedProcess(command, 1, stdout="", stderr="etcd request timed out")
+        if "nodes" in command:
+            document = {
+                "items": [
+                    {
+                        "metadata": {"name": "node-a"},
+                        "status": {"allocatable": {"cpu": "4", "memory": "8Gi"}},
+                    }
+                ]
+            }
+        else:
+            document = {"items": []}
+        return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
+
+    metrics = K3sStatusCollector(
+        runner=runner, spawn=lambda target: target()
+    ).collect()["resource_metrics"]
+
+    assert metrics["nodes"][0]["cpu_allocated_millicores"] is None
+    assert "etcd request timed out" in metrics["allocation_error"]
+    # The rest of the panel is unaffected.
+    assert metrics["available"] is True
+    assert metrics["aggregate"]["cpu_used_millicores"] == 1_000
+
+
 def test_remote_buildkit_collector_enforces_safe_polling_and_plain_resources_path() -> None:
     from swegen.dashboard.distributed_status import RemoteBuildKitFarmCollector
 
@@ -1773,6 +2327,12 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
             document = nodes
         elif "deployments" in command:
             document = _only_kinds(workloads, {"Deployment"})
+        elif "-A" in command:
+            # The cluster-wide query now EXCLUDES the pipeline namespace, whose
+            # pods the collector already has, so a real cluster returns only the
+            # other namespaces here. Returning `workloads` again would be a fake
+            # kubectl ignoring its own selector, and would double-count.
+            document = {"items": []}
         else:
             document = _only_kinds(workloads, {"Pod"})
         return CompletedProcess(command, 0, stdout=json.dumps(document), stderr="")
@@ -1811,12 +2371,31 @@ def test_k3s_collector_reports_cluster_resources_and_retains_stale_metrics() -> 
         "ready": False,
         "restarts": 2,
     }
+    # The ceiling is the configured limit (2048), NOT the CPU sum. These pods are
+    # network-bound on the inference gateway, so whole-CPU counting under-counted
+    # what a node can run; the binding constraint is the kubelet pod cap. The
+    # CPU-derived figure (12 here, from 12_000 millicores) is still reported for
+    # context under its own key so it can never be mistaken for the limit.
+    # Read the ceiling through the same resolver the collector uses rather than
+    # the bare default: a deployment may set SWEGEN_MAX_SCALE_REPLICAS (this repo's
+    # .env does, and load_dotenv() puts it in the test process too), and this test
+    # is about where the number comes from, not what it happens to be.
+    from swegen.dashboard.distributed_status import resolve_max_scale_replicas
+
     assert first_snapshot["scaling"] == {
-        "max_replicas": 12,
-        "basis": "sum of cluster node allocatable CPU, floored to whole CPUs",
+        "max_replicas": resolve_max_scale_replicas(),
+        "basis": (
+            "configured ceiling (SWEGEN_MAX_SCALE_REPLICAS); generate/validate pods are "
+            "network-bound on the inference gateway, so the binding constraint is the "
+            "kubelet pod cap rather than cluster CPU"
+        ),
+        "cpu_derived_max_replicas": 12,
         "allocatable_millicores": 12_000,
         "stale": False,
     }
+    # Whatever the resolver returns, it must NOT be the CPU-derived figure -- that
+    # regression (a CPU sum masquerading as the ceiling) is what this guards.
+    assert first_snapshot["scaling"]["max_replicas"] != 12
 
     fail_top = True
     stale = collector.collect()["resource_metrics"]
@@ -1873,7 +2452,11 @@ def test_k3s_collector_excludes_evicted_pods_and_keeps_deployments() -> None:
     pod_queries = [c for c in commands if "pods" in c and "top" not in c]
     assert pod_queries, "collector never queried pods"
     for command in pod_queries:
-        assert "--field-selector=status.phase!=Failed" in command
+        # Every pod query excludes Failed. The cluster-wide one carries a second
+        # clause as well (it also excludes our own namespace, already fetched),
+        # so assert the constraint rather than the exact selector string.
+        selector = next(a for a in command if a.startswith("--field-selector="))
+        assert "status.phase!=Failed" in selector
     # Deployments are fetched on their own so the selector cannot drop them.
     deployment_queries = [c for c in commands if "deployments" in c]
     assert len(deployment_queries) == 1

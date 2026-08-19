@@ -58,8 +58,110 @@ REMOTE_BUILDKIT_URL_UNCONFIGURED = (
 )
 REMOTE_BUILDKIT_MIN_POLL_SECONDS = 30.0
 REMOTE_BUILDKIT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-LOCAL_DISK_IO_POLL_SECONDS = 30.0
+
+# --- Node cAdvisor disk I/O sampling -----------------------------------------
+#
+# /api/v1/nodes/<node>/proxy/metrics/cadvisor returns per-container cgroup
+# metrics for EVERY container on the node. At ~500-620 pods per node that
+# payload is enormous, and the kubelet has to walk every cgroup to build it, so
+# the cost is paid by the API server on every call. Measured on this cluster it
+# did not merely run slow: it returned 0 bytes after 45.1s on node ...-0006 and
+# 0 bytes after 30.2s on ...-0003. Re-issuing it on every 5s dashboard refresh
+# was enough to push the k3s API server into failing its own /livez probes;
+# stopping the dashboard took it from 3/3 failing to 4/4 passing in 30 seconds.
+#
+# So this collector is deliberately the most conservative caller in the module:
+# its own slow cadence, its own long timeout, its own per-node circuit breaker,
+# and it runs OFF the snapshot refresh path so a hung node cannot stall (or
+# fail) the rest of the status payload.
+DISK_IO_POLL_SECONDS_ENV = "SWEGEN_DASHBOARD_DISK_IO_POLL_SECONDS"
+DISK_IO_POLL_SECONDS_DEFAULT = 60.0
+DISK_IO_TIMEOUT_SECONDS_ENV = "SWEGEN_DASHBOARD_DISK_IO_TIMEOUT_SECONDS"
+DISK_IO_TIMEOUT_SECONDS_DEFAULT = 20.0
+# Consecutive failures for one node before that node stops being called at all.
+DISK_IO_BREAKER_FAILURES_ENV = "SWEGEN_DASHBOARD_DISK_IO_BREAKER_FAILURES"
+DISK_IO_BREAKER_FAILURES_DEFAULT = 3
+# How long an open breaker stays open before one half-open trial call.
+DISK_IO_BREAKER_COOLDOWN_SECONDS_ENV = "SWEGEN_DASHBOARD_DISK_IO_BREAKER_COOLDOWN_SECONDS"
+DISK_IO_BREAKER_COOLDOWN_SECONDS_DEFAULT = 300.0
+# Cluster-wide `get pods -A` cadence. That list is ~2,400 pods here and forces
+# the API server to page the whole set out of etcd; the CPU-request sum it feeds
+# moves slowly, so it does not need re-reading on every refresh.
+POD_ALLOCATION_POLL_SECONDS_ENV = "SWEGEN_DASHBOARD_POD_ALLOCATION_POLL_SECONDS"
+POD_ALLOCATION_POLL_SECONDS_DEFAULT = 60.0
+
 ACTIVITY_STALE_AFTER_SECONDS = 120.0
+# Operator-facing ceiling for every worker-scaling control (stage scale and
+# per-endpoint generate concurrency).
+#
+# This used to be derived as `sum(node allocatable CPU) // 1000`, which on this
+# cluster meant 4 x 192 CPU = 768. That basis was wrong for these workers: a
+# generate/validate pod is network-bound, spending nearly all its wall time
+# blocked on the inference gateway rather than burning CPU, so sizing the fleet
+# by whole CPUs under-counted how many pods a node can usefully run. The real
+# physical constraint is the kubelet pod cap (allocatable pods per node, 2048
+# here) -- see the "k3s pod cap is the binding constraint" finding.
+#
+# The CPU figure is still collected and reported (see `cpu_derived_max_replicas`
+# in the scaling payload) because it remains useful context, but it no longer
+# limits anything.
+MAX_SCALE_REPLICAS_ENV = "SWEGEN_MAX_SCALE_REPLICAS"
+MAX_SCALE_REPLICAS_DEFAULT = 2048
+
+
+def resolve_max_scale_replicas() -> int:
+    """Return the configured scaling ceiling, defaulting to 2048.
+
+    Overridable via ``SWEGEN_MAX_SCALE_REPLICAS`` to match the ``SWEGEN_*``
+    idiom used elsewhere. A blank, non-integer, or non-positive override falls
+    back to the default rather than raising: this runs inside the status
+    collector, and a typo'd env var must not take the dashboard down or, worse,
+    silently pin the ceiling to 0 and make every scale control reject input.
+    """
+
+    raw = os.environ.get(MAX_SCALE_REPLICAS_ENV, "").strip()
+    if not raw:
+        return MAX_SCALE_REPLICAS_DEFAULT
+    try:
+        configured = int(raw)
+    except ValueError:
+        return MAX_SCALE_REPLICAS_DEFAULT
+    return configured if configured > 0 else MAX_SCALE_REPLICAS_DEFAULT
+
+
+def resolve_positive_env_float(name: str, default: float) -> float:
+    """Read a positive float from ``name``, falling back to ``default``.
+
+    Same contract as :func:`resolve_max_scale_replicas`: this runs inside the
+    status collector, so a blank/typo'd/non-positive override degrades to the
+    documented default instead of raising or, worse, setting a poll interval or
+    timeout to 0 and turning the dashboard back into a hot loop against the API
+    server.
+    """
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        configured = float(raw)
+    except ValueError:
+        return default
+    return configured if configured > 0 else default
+
+
+def resolve_positive_env_int(name: str, default: int) -> int:
+    """Read a positive int from ``name``, falling back to ``default``."""
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        configured = int(raw)
+    except ValueError:
+        return default
+    return configured if configured > 0 else default
+
+
 # Cap on how many out-of-sync instance ids the SWR push-sync panel returns; the
 # summary still reports the true total so the list can be truncated safely.
 SWR_PUSH_SYNC_LIST_LIMIT = 500
@@ -233,6 +335,28 @@ def _remote_buildkit_node_disk_io(payload: dict[str, Any]) -> list[dict[str, Any
 
 _CADVISOR_METRIC = re.compile(r"^(container_fs_[a-z_]+)\{([^}]*)\}\s+([^\s]+)")
 _PROMETHEUS_LABEL = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _empty_disk_io(error: str) -> dict[str, Any]:
+    """The "no usable sample" disk-I/O shape, carrying why.
+
+    Every key the UI reads is present and null, so an unavailable node renders
+    as em-dashes with an explanation rather than tripping on a missing field.
+    """
+
+    return {
+        "available": False,
+        "stale": False,
+        "read_bytes_per_second": None,
+        "write_bytes_per_second": None,
+        "read_iops": None,
+        "write_iops": None,
+        "busy_percent": None,
+        "io_current": None,
+        "sampled_at": None,
+        "age_seconds": None,
+        "error": error,
+    }
 
 
 def parse_cadvisor_disk_io(text: str) -> dict[str, Any]:
@@ -767,6 +891,25 @@ def _empty_stage(stage: str) -> dict[str, Any]:
 # always five [a-z0-9] characters; the ReplicaSet suffix is a variable-length
 # [a-z0-9] token.
 _POD_SUFFIX_RE = re.compile(r"-[a-z0-9]+-[a-z0-9]{5}$")
+# The remainder a real pod name leaves after its owning Deployment name and the
+# joining dash: ``<replicaset_hash>-<pod_hash>`` for a Deployment-owned pod, or a
+# single dashless token for a bare pod / operator-set worker id. Crucially the
+# remainder may contain AT MOST one dash: a longer pool's name (e.g.
+# ``dyn-glm-5-2-moedsa-512k-...``) is full of dashes, so this shape is what stops
+# a short deployment name from claiming a longer deployment's pods.
+_POD_REMAINDER_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]{5})?$")
+# Kubernetes caps a pod name at 63 characters. A ReplicaSet builds a pod name as
+# ``<replicaset_name>-<5 char pod hash>``, so the generated portion it will keep
+# is clipped to 63 - 5 = 58 characters before that hash is appended.
+_MAX_POD_NAME_LEN = 63
+_MAX_GENERATED_NAME_LEN = _MAX_POD_NAME_LEN - 5
+# Longest pod-template-hash Kubernetes puts in a ReplicaSet name. Used to decide
+# whether a deployment could produce a pod name that hits the 63-char cap at all:
+# a deployment short enough that even its LONGEST possible pod name stays under
+# the cap can never own a 63-char pod, so it is excluded from the
+# truncation-tolerant branch. Taking the maximum (not the minimum) is what makes
+# that exclusion sound -- it is the conservative direction.
+_MAX_REPLICASET_HASH_LEN = 10
 # Diverging-chart direction mapping, shared by every stage. 'succeeded' stacks
 # up (good outcome); 'failed'/'error' stack down (infra/terminal failure).
 # 'rejected' (a validate/reward nop-oracle legitimate rejection) is neither a
@@ -829,27 +972,64 @@ def resolve_worker_model(
     """Resolve a worker/pod id to its model_id via the known deployment names.
 
     The reliable signal is the set of real Deployment names in
-    ``deployment_to_model``: a pod name always begins with
-    ``<deployment-name>-`` (the ReplicaSet/pod suffix follows), so we
-    prefix-match the worker_id against those names -- longest match wins, so a
-    name that is a prefix of another can't steal its pods. This is immune to the
-    63-char pod-name truncation that defeats the regex strip. Returns the model
-    for the matched deployment, else falls back to the regex-derived deployment
-    name (mapped or raw) so an unknown worker is still charted rather than
-    dropped. ``None`` only when ``worker_id`` is empty.
+    ``deployment_to_model``. A pod name is ``<deployment>-<rshash>-<podhash>``,
+    so we match the worker_id against those names -- longest match wins, so a
+    name that is a prefix of another can't steal its pods. Returns the model for
+    the matched deployment, else falls back to the regex-derived deployment name
+    (mapped or raw) so an unknown worker is still charted rather than dropped.
+    ``None`` only when ``worker_id`` is empty.
+
+    Matching is deliberately NOT a bare ``startswith(name + "-")``. That test
+    was unsound in both directions once a deployment name grew long:
+
+    * Kubernetes caps a pod name at 63 chars, so a 60-char deployment like
+      ``swegen-generate-dyn-glm-5-2-moedsa-512k-thinking-7-244-3-251`` produces
+      pods such as ``...-512k-thinking-7-244-3-2282x4`` -- the ``-251`` tail is
+      clipped away and the pod no longer starts with its own deployment name.
+    * With the real match gone, the only surviving prefix was the unrelated
+      15-char ``swegen-generate`` Deployment, so all of that pool's pods were
+      charted under the static pool's model. That is the nop/oracle mislabel:
+      130 live pods reported as a model that had not run for days.
+
+    So a match now requires either an exact-shaped remainder
+    (``<rshash>-<podhash>``) or, for a deployment whose full pod name provably
+    could not have fit in 63 chars, agreement on the 58-char generated-name
+    prefix Kubernetes actually keeps. The length gate is what keeps a short
+    deployment name from matching a longer one's truncated pods.
     """
 
     if not worker_id:
         return None
     best: str | None = None
     for name in deployment_to_model:
-        if name and (worker_id == name or worker_id.startswith(name + "-")):
+        if name and _worker_belongs_to_deployment(worker_id, name):
             if best is None or len(name) > len(best):
                 best = name
     if best is not None:
         return deployment_to_model[best]
     deployment = deployment_name_from_worker_id(worker_id)
     return deployment_to_model.get(deployment or "", deployment)
+
+
+def _worker_belongs_to_deployment(worker_id: str, deployment: str) -> bool:
+    """True when ``worker_id`` is a pod of ``deployment``, truncation included."""
+
+    if worker_id == deployment:
+        return True
+    prefix = f"{deployment}-"
+    if worker_id.startswith(prefix) and _POD_REMAINDER_RE.match(worker_id[len(prefix) :]):
+        return True
+    # Truncated pod name. Only consider it for a deployment long enough that its
+    # pod names can actually reach the cap: <deployment>-<<=10 char rshash>-<5
+    # char podhash> must be able to exceed 63. A shorter deployment's pods always
+    # fit untruncated, so it is excluded here -- that gate is what stops the
+    # 15-char "swegen-generate" from claiming the 60-char pool's clipped pods,
+    # the exact collision this function exists to prevent.
+    longest_full_name = len(prefix) + _MAX_REPLICASET_HASH_LEN + 1 + 5
+    if len(worker_id) == _MAX_POD_NAME_LEN and longest_full_name > _MAX_POD_NAME_LEN:
+        keep = min(_MAX_GENERATED_NAME_LEN, len(prefix))
+        return worker_id[:keep] == prefix[:keep]
+    return False
 
 
 def _empty_model_counts() -> dict[str, int]:
@@ -2090,14 +2270,57 @@ class K3sStatusCollector:
         *,
         namespace: str = "swegen-pipeline",
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        monotonic: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] | None = None,
+        spawn: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         self.namespace = namespace
         self.runner = runner
+        self.monotonic = monotonic
+        self.now = now or (lambda: datetime.now(UTC))
+        # cAdvisor sampling runs off the refresh thread by default. `spawn` is
+        # the seam: tests pass a synchronous runner so the sampler is
+        # deterministic, production gets a daemon thread so a node that takes
+        # 45s to return nothing cannot hold the snapshot open.
+        self.spawn = spawn or self._spawn_thread
+        self.disk_io_poll_seconds = resolve_positive_env_float(
+            DISK_IO_POLL_SECONDS_ENV, DISK_IO_POLL_SECONDS_DEFAULT
+        )
+        self.disk_io_timeout_seconds = resolve_positive_env_float(
+            DISK_IO_TIMEOUT_SECONDS_ENV, DISK_IO_TIMEOUT_SECONDS_DEFAULT
+        )
+        self.disk_io_breaker_failures = resolve_positive_env_int(
+            DISK_IO_BREAKER_FAILURES_ENV, DISK_IO_BREAKER_FAILURES_DEFAULT
+        )
+        self.disk_io_breaker_cooldown_seconds = resolve_positive_env_float(
+            DISK_IO_BREAKER_COOLDOWN_SECONDS_ENV, DISK_IO_BREAKER_COOLDOWN_SECONDS_DEFAULT
+        )
+        self.pod_allocation_poll_seconds = resolve_positive_env_float(
+            POD_ALLOCATION_POLL_SECONDS_ENV, POD_ALLOCATION_POLL_SECONDS_DEFAULT
+        )
         self._last_resource_metrics: dict[str, Any] | None = None
+        # Guards every _disk_io_* field below: the sampler mutates them from its
+        # own thread while collect() reads them from the refresh thread.
+        self._disk_io_lock = threading.Lock()
+        self._disk_io_sampling = False
         self._last_disk_io_poll_monotonic: float | None = None
         self._disk_io_counters: dict[str, dict[str, Any]] = {}
-        self._disk_io_metrics: dict[str, dict[str, Any]] = {}
+        # Last SUCCESSFUL rate sample per node, kept so an unavailable node
+        # degrades to "last known good, N seconds old" instead of blank.
+        self._disk_io_samples: dict[str, dict[str, Any]] = {}
+        self._disk_io_errors: dict[str, str | None] = {}
+        self._disk_io_breakers: dict[str, dict[str, Any]] = {}
+        self._last_allocation_poll_monotonic: float | None = None
+        # CPU requests of pods OUTSIDE self.namespace. The in-namespace share is
+        # summed from the pod doc collect() already fetched, so the cluster-wide
+        # query never re-downloads it.
+        self._other_namespace_allocation: dict[str, int] | None = None
+        self._allocation_error: str | None = None
         self._last_build_slot_metrics: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _spawn_thread(target: Callable[[], None]) -> None:
+        threading.Thread(target=target, name="dashboard-cadvisor-sample", daemon=True).start()
 
     def _get(self, args: list[str]) -> dict[str, Any]:
         completed = self.runner(
@@ -2131,19 +2354,7 @@ class K3sStatusCollector:
             ]
         )
         workload_doc = {"items": [*deployment_doc.get("items", []), *pod_doc.get("items", [])]}
-        allocation_error = None
-        try:
-            all_pod_doc = self._get(
-                [
-                    "get",
-                    "pods",
-                    "-A",
-                    f"--field-selector=status.phase!={_EVICTED_POD_PHASE}",
-                ]
-            )
-        except Exception as error:
-            all_pod_doc = None
-            allocation_error = f"{type(error).__name__}: {str(error)[:300]}"
+        allocated_by_node, allocation_error = self._collect_pod_allocation(pod_doc)
         nodes = []
         for item in node_doc.get("items", []):
             conditions = {c["type"]: c for c in item.get("status", {}).get("conditions", [])}
@@ -2320,7 +2531,7 @@ class K3sStatusCollector:
                 node["build_slot_max"] = max(node["build_slot_max"], total)
         resource_metrics = self._collect_resource_metrics(
             node_doc,
-            all_pod_doc=all_pod_doc,
+            allocated_by_node=allocated_by_node,
             allocation_error=allocation_error,
             build_slots_by_node=build_slots_by_node,
         )
@@ -2354,9 +2565,20 @@ class K3sStatusCollector:
             _cpu_millicores(str(item.get("status", {}).get("allocatable", {}).get("cpu", "0")))
             for item in node_doc.get("items", [])
         )
+        # The ceiling is an explicit configured limit, NOT the CPU sum. These
+        # pods are network/API-bound (blocked on the inference gateway), so
+        # whole-CPU counting is the wrong basis; the binding physical constraint
+        # is the kubelet pod cap. The CPU-derived number is still reported --
+        # under its own key, so nothing can mistake it for the limit.
+        cpu_derived_max_replicas = total_allocatable_millicores // 1_000
         scaling = {
-            "max_replicas": total_allocatable_millicores // 1_000,
-            "basis": "sum of cluster node allocatable CPU, floored to whole CPUs",
+            "max_replicas": resolve_max_scale_replicas(),
+            "basis": (
+                f"configured ceiling ({MAX_SCALE_REPLICAS_ENV}); generate/validate pods are "
+                "network-bound on the inference gateway, so the binding constraint is the "
+                "kubelet pod cap rather than cluster CPU"
+            ),
+            "cpu_derived_max_replicas": cpu_derived_max_replicas,
             "allocatable_millicores": total_allocatable_millicores,
             "stale": False,
         }
@@ -2373,10 +2595,16 @@ class K3sStatusCollector:
         self,
         node_doc: dict[str, Any],
         *,
-        all_pod_doc: dict[str, Any] | None,
+        allocated_by_node: dict[str, int] | None,
         allocation_error: str | None,
         build_slots_by_node: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
+        # Read the cAdvisor cache and arm the next background sample OUTSIDE the
+        # try/except below. Inside it, any raise degrades the whole resource
+        # panel to a stale snapshot; disk I/O is one optional column of that
+        # panel and must never be able to do that. _disk_io_view() cannot raise,
+        # and it never issues a kubectl call on this thread.
+        disk_io_by_node = self._disk_io_view(node_doc)
         try:
             completed = self.runner(
                 ["kubectl", "--request-timeout=3s", "top", "nodes", "--no-headers"],
@@ -2398,11 +2626,6 @@ class K3sStatusCollector:
                     _cpu_millicores(fields[1]),
                     _memory_bytes(fields[3]),
                 )
-            allocated_by_node = (
-                _allocated_cpu_by_node(all_pod_doc) if all_pod_doc is not None else None
-            )
-            disk_io_by_node = self._collect_disk_io_metrics(node_doc)
-
             per_node = []
             missing = []
             total_cpu_used = 0
@@ -2466,17 +2689,7 @@ class K3sStatusCollector:
                             else None
                         ),
                         "disk_io": disk_io_by_node.get(
-                            name,
-                            {
-                                "available": False,
-                                "read_bytes_per_second": None,
-                                "write_bytes_per_second": None,
-                                "read_iops": None,
-                                "write_iops": None,
-                                "busy_percent": None,
-                                "io_current": None,
-                                "error": "disk I/O metrics unavailable",
-                            },
+                            name, _empty_disk_io("disk I/O metrics unavailable")
                         ),
                         "build_slots": build_slots_by_node.get(
                             name,
@@ -2690,86 +2903,294 @@ print(json.dumps({'total':n,'used':used,'free':n-used,'waiters':waiters,'waiters
             return None
         return round(delta / elapsed, 3)
 
-    def _collect_disk_io_metrics(self, node_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
-        current_monotonic = time.monotonic()
-        if (
-            self._last_disk_io_poll_monotonic is not None
-            and current_monotonic - self._last_disk_io_poll_monotonic
-            < LOCAL_DISK_IO_POLL_SECONDS
-        ):
-            return self._disk_io_metrics
-        self._last_disk_io_poll_monotonic = current_monotonic
-        sampled_at = datetime.now(UTC).isoformat()
-        updated = dict(self._disk_io_metrics)
-        for item in node_doc.get("items", []):
-            node = item.get("metadata", {}).get("name")
-            if not isinstance(node, str) or not node:
-                continue
-            path = (
-                f"/api/v1/nodes/{urllib.parse.quote(node, safe='')}/proxy/metrics/cadvisor"
+    def _collect_pod_allocation(
+        self, namespace_pod_doc: dict[str, Any]
+    ) -> tuple[dict[str, int] | None, str | None]:
+        """Return per-node summed CPU requests, from two cheap reads not one huge one.
+
+        This used to be a bare cluster-wide ``kubectl get pods -A``. Measured on
+        this cluster that is a 38 MB, ~4.0s response covering 1,693 pods -- of
+        which 1,690 are the swegen-pipeline pods the caller has ALREADY fetched
+        for the stage panel. The dashboard was making the API server page the
+        same 38 MB out of etcd twice per refresh to learn the CPU requests of
+        three kube-system pods.
+
+        So the cluster-wide query is narrowed to "every namespace EXCEPT ours"
+        (40 KB, 0.47s) and its result is summed together with the namespaced doc
+        the caller already holds. Same number, ~1000x less data.
+
+        It is additionally cached for
+        ``SWEGEN_DASHBOARD_POD_ALLOCATION_POLL_SECONDS`` (default 60s): CPU
+        requests move on the timescale of a scale operation, not of a refresh. A
+        failure keeps the last good value and reports the error alongside it.
+        """
+
+        local_allocation = _allocated_cpu_by_node(namespace_pod_doc)
+        current = self.monotonic()
+        due = (
+            self._last_allocation_poll_monotonic is None
+            or current - self._last_allocation_poll_monotonic
+            >= self.pod_allocation_poll_seconds
+        )
+        if due:
+            self._last_allocation_poll_monotonic = current
+            try:
+                other_pod_doc = self._get(
+                    [
+                        "get",
+                        "pods",
+                        "-A",
+                        (
+                            f"--field-selector=status.phase!={_EVICTED_POD_PHASE},"
+                            f"metadata.namespace!={self.namespace}"
+                        ),
+                    ]
+                )
+            except Exception as error:
+                self._allocation_error = f"{type(error).__name__}: {str(error)[:300]}"
+            else:
+                self._other_namespace_allocation = _allocated_cpu_by_node(other_pod_doc)
+                self._allocation_error = None
+        if self._other_namespace_allocation is None:
+            # Never got a clean cluster-wide read: report the error rather than
+            # publishing a per-node total that silently omits other namespaces.
+            return None, self._allocation_error
+        combined = Counter(local_allocation)
+        combined.update(self._other_namespace_allocation)
+        return dict(combined), self._allocation_error
+
+    def _disk_io_breaker_state(self, node: str) -> dict[str, Any]:
+        return self._disk_io_breakers.setdefault(
+            node, {"failures": 0, "open": False, "opened_monotonic": None, "reason": None}
+        )
+
+    def _disk_io_node_allowed(self, node: str, current: float) -> bool:
+        """Whether this node's cAdvisor endpoint may be called right now.
+
+        Closed breaker: always. Open breaker: only once the cooldown has expired,
+        and then exactly once (half-open) -- ``opened_monotonic`` is advanced
+        here, so a trial that fails again does not re-arm another call until a
+        further full cooldown has passed.
+        """
+
+        state = self._disk_io_breaker_state(node)
+        if not state["open"]:
+            return True
+        opened = state["opened_monotonic"]
+        if opened is None or current - float(opened) >= self.disk_io_breaker_cooldown_seconds:
+            state["opened_monotonic"] = current
+            return True
+        return False
+
+    def _disk_io_record_failure(self, node: str, message: str) -> None:
+        state = self._disk_io_breaker_state(node)
+        state["failures"] = int(state["failures"]) + 1
+        state["reason"] = message
+        if not state["open"] and state["failures"] >= self.disk_io_breaker_failures:
+            state["open"] = True
+            state["opened_monotonic"] = self.monotonic()
+        self._disk_io_errors[node] = message
+
+    def _disk_io_record_success(self, node: str) -> None:
+        self._disk_io_breakers[node] = {
+            "failures": 0,
+            "open": False,
+            "opened_monotonic": None,
+            "reason": None,
+        }
+        self._disk_io_errors[node] = None
+
+    def _disk_io_view(self, node_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Return the per-node disk-I/O payload and arm the next sample.
+
+        This is the only method the refresh path calls. It never issues a
+        kubectl call itself and never raises: it reads the cached last-good
+        sample, tags it with its age and breaker state, and (if the slow cadence
+        is due) hands the actual sampling to ``self.spawn``.
+        """
+
+        node_names = [
+            item.get("metadata", {}).get("name")
+            for item in node_doc.get("items", [])
+        ]
+        node_names = [name for name in node_names if isinstance(name, str) and name]
+        current = self.monotonic()
+        start_sample = False
+        with self._disk_io_lock:
+            due = (
+                self._last_disk_io_poll_monotonic is None
+                or current - self._last_disk_io_poll_monotonic >= self.disk_io_poll_seconds
             )
+            if due and not self._disk_io_sampling:
+                self._disk_io_sampling = True
+                self._last_disk_io_poll_monotonic = current
+                start_sample = True
+        if start_sample:
+            # Dispatch before reading the cache, so a sampler that does finish
+            # quickly is reflected in this very payload. In production `spawn`
+            # returns immediately (daemon thread) and the read below sees the
+            # previous sample -- which is the point: the refresh never waits on
+            # cAdvisor, it only ever reads what is already there.
+            self.spawn(lambda: self._sample_disk_io(node_names))
+        with self._disk_io_lock:
+            now = self.monotonic()
+            return {name: self._disk_io_node_view(name, now) for name in node_names}
+
+    def _disk_io_node_view(self, node: str, current: float) -> dict[str, Any]:
+        """Last-known-good sample for one node, tagged with age and breaker state.
+
+        Serving stale-with-an-age is the point: a node whose cAdvisor endpoint
+        has stopped answering should read "disk IO from 4m ago" in the UI, not
+        blank out the row and not fail the snapshot.
+        """
+
+        breaker = self._disk_io_breakers.get(node, {})
+        breaker_open = bool(breaker.get("open"))
+        cooldown_remaining = None
+        if breaker_open and breaker.get("opened_monotonic") is not None:
+            cooldown_remaining = round(
+                max(
+                    0.0,
+                    self.disk_io_breaker_cooldown_seconds
+                    - (current - float(breaker["opened_monotonic"])),
+                ),
+                1,
+            )
+        breaker_view = {
+            "open": breaker_open,
+            "consecutive_failures": int(breaker.get("failures") or 0),
+            "cooldown_seconds": self.disk_io_breaker_cooldown_seconds,
+            "cooldown_remaining_seconds": cooldown_remaining,
+            "reason": breaker.get("reason"),
+        }
+        error = self._disk_io_errors.get(node)
+        sample = self._disk_io_samples.get(node)
+        if sample is None:
+            metrics = _empty_disk_io(
+                error
+                or (
+                    "awaiting first cAdvisor sample"
+                    if not breaker_open
+                    else "cAdvisor disk I/O unavailable for this node"
+                )
+            )
+            metrics["breaker"] = breaker_view
+            return metrics
+        age = round(max(0.0, current - float(sample["sampled_monotonic"])), 1)
+        # "Stale" means the reader is looking at a sample older than the cadence
+        # that was supposed to replace it -- either because the last call failed
+        # or because the breaker is open and no call was made at all.
+        stale = bool(error) or breaker_open or age > self.disk_io_poll_seconds * 2
+        metrics = {key: value for key, value in sample.items() if key != "sampled_monotonic"}
+        metrics.update(
+            stale=stale,
+            age_seconds=age,
+            error=error,
+            breaker=breaker_view,
+        )
+        return metrics
+
+    def _sample_disk_io(self, node_names: list[str]) -> None:
+        """Poll each node's cAdvisor endpoint once. Runs off the refresh thread."""
+
+        try:
+            for node in node_names:
+                with self._disk_io_lock:
+                    allowed = self._disk_io_node_allowed(node, self.monotonic())
+                if not allowed:
+                    continue
+                self._sample_disk_io_node(node)
+        finally:
+            with self._disk_io_lock:
+                self._disk_io_sampling = False
+
+    def _sample_disk_io_node(self, node: str) -> None:
+        path = f"/api/v1/nodes/{urllib.parse.quote(node, safe='')}/proxy/metrics/cadvisor"
+        timeout = self.disk_io_timeout_seconds
+        try:
             completed = self.runner(
-                ["kubectl", "--request-timeout=5s", "get", "--raw", path],
+                [
+                    "kubectl",
+                    f"--request-timeout={timeout:g}s",
+                    "get",
+                    "--raw",
+                    path,
+                ],
                 capture_output=True,
                 text=True,
-                timeout=8,
+                # One budget, not two: a subprocess timeout shorter than the
+                # kubectl --request-timeout it wraps kills the client before the
+                # server-side deadline can produce a usable error. The small
+                # margin is for process startup only.
+                timeout=timeout + 2,
                 check=False,
             )
-            if completed.returncode != 0:
-                existing = dict(updated.get(node, {}))
-                existing.update(
-                    available=bool(existing.get("available")),
-                    stale=bool(existing),
-                    error=(completed.stderr or "cAdvisor disk I/O metrics unavailable")[:300],
+        except (OSError, subprocess.SubprocessError) as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                message = f"cAdvisor metrics timed out after {timeout:g}s"
+            else:
+                message = f"{type(error).__name__}: {str(error)[:240]}"
+            with self._disk_io_lock:
+                self._disk_io_record_failure(node, message)
+            return
+        if completed.returncode != 0:
+            message = (completed.stderr or "cAdvisor disk I/O metrics unavailable")[:300]
+            with self._disk_io_lock:
+                self._disk_io_record_failure(node, message)
+            return
+        counters = parse_cadvisor_disk_io(completed.stdout)
+        if not counters["device_count"]:
+            # A 0-byte / deviceless body is what node 0006 actually returned
+            # after 45s. It is a failure, not a sample: counting it as success
+            # would keep the breaker closed forever against a dead endpoint.
+            with self._disk_io_lock:
+                self._disk_io_record_failure(
+                    node, "cAdvisor returned no block-device metrics for this node"
                 )
-                updated[node] = existing
-                continue
-            counters = parse_cadvisor_disk_io(completed.stdout)
+            return
+        sampled_monotonic = self.monotonic()
+        sampled_at = self.now().isoformat()
+        with self._disk_io_lock:
             previous = self._disk_io_counters.get(node)
-            metrics: dict[str, Any] = {
-                "available": False,
-                "stale": False,
-                "read_bytes_per_second": None,
-                "write_bytes_per_second": None,
-                "read_iops": None,
-                "write_iops": None,
-                "busy_percent": None,
-                "io_current": counters["io_current"],
-                "sampled_at": sampled_at,
-                "error": "awaiting second cAdvisor sample",
-            }
-            if previous is not None and counters["device_count"]:
-                elapsed = current_monotonic - float(previous["sampled_monotonic"])
-                metrics.update(
-                    available=True,
-                    read_bytes_per_second=self._counter_rate(
-                        counters["read_bytes"], previous["read_bytes"], elapsed
-                    ),
-                    write_bytes_per_second=self._counter_rate(
-                        counters["write_bytes"], previous["write_bytes"], elapsed
-                    ),
-                    read_iops=self._counter_rate(
-                        counters["read_ops"], previous["read_ops"], elapsed
-                    ),
-                    write_iops=self._counter_rate(
-                        counters["write_ops"], previous["write_ops"], elapsed
-                    ),
-                    error=None,
-                )
-                busy_values = []
-                previous_io_time = previous.get("io_time_by_device", {})
-                for device, io_time in counters["io_time_by_device"].items():
-                    old_io_time = previous_io_time.get(device)
-                    if old_io_time is None:
-                        continue
-                    rate = self._counter_rate(io_time, old_io_time, elapsed)
-                    if rate is not None:
-                        busy_values.append(min(100.0, rate * 100))
-                metrics["busy_percent"] = round(max(busy_values), 1) if busy_values else None
             self._disk_io_counters[node] = {
                 **counters,
-                "sampled_monotonic": current_monotonic,
+                "sampled_monotonic": sampled_monotonic,
             }
-            updated[node] = metrics
-        self._disk_io_metrics = updated
-        return updated
+            self._disk_io_record_success(node)
+            if previous is None:
+                # First sample only establishes the counter baseline; rates need
+                # two. Keep any older good sample rather than blanking the row.
+                if node not in self._disk_io_samples:
+                    self._disk_io_errors[node] = "awaiting second cAdvisor sample"
+                return
+            elapsed = sampled_monotonic - float(previous["sampled_monotonic"])
+            busy_values = []
+            previous_io_time = previous.get("io_time_by_device", {})
+            for device, io_time in counters["io_time_by_device"].items():
+                old_io_time = previous_io_time.get(device)
+                if old_io_time is None:
+                    continue
+                rate = self._counter_rate(io_time, old_io_time, elapsed)
+                if rate is not None:
+                    busy_values.append(min(100.0, rate * 100))
+            self._disk_io_samples[node] = {
+                "available": True,
+                "stale": False,
+                "read_bytes_per_second": self._counter_rate(
+                    counters["read_bytes"], previous["read_bytes"], elapsed
+                ),
+                "write_bytes_per_second": self._counter_rate(
+                    counters["write_bytes"], previous["write_bytes"], elapsed
+                ),
+                "read_iops": self._counter_rate(
+                    counters["read_ops"], previous["read_ops"], elapsed
+                ),
+                "write_iops": self._counter_rate(
+                    counters["write_ops"], previous["write_ops"], elapsed
+                ),
+                "busy_percent": round(max(busy_values), 1) if busy_values else None,
+                "io_current": counters["io_current"],
+                "sampled_at": sampled_at,
+                "sample_window_seconds": round(elapsed, 1),
+                "sampled_monotonic": sampled_monotonic,
+            }

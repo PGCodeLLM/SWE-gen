@@ -457,8 +457,12 @@ def test_local_and_remote_node_disk_io_views_are_compact_and_graceful() -> None:
     from swegen.dashboard.server import HTML
 
     assert "Disk I/O read / write · IOPS · busy" in HTML
-    assert "formatDiskIo(node.disk_io)" in HTML
-    assert "30-second cAdvisor rate sample" in HTML
+    # The node cell goes through diskIoLabel(), which wraps formatDiskIo() with
+    # the sample's age and its per-node breaker state. The bare formatter would
+    # render a frozen sample exactly like a live one.
+    assert "diskIoLabel(node.disk_io)" in HTML
+    assert "formatDiskIo(io)" in HTML
+    assert "Live cAdvisor rate sample over" in HTML
     assert 'id="buildkit-farm-disk-io"' in HTML
     assert "resources.node_disk_io||[]" in HTML
     assert "Remote per-node disk I/O telemetry is not exposed" in HTML
@@ -761,6 +765,7 @@ def evaluate_rescale_visible(
     buckets: list[dict[str, int]],
     scroll_left: int,
     client_width: int,
+    chart_offset_left: int = 0,
 ) -> dict[str, object]:
     """Drive rescaleVisible over stub bucket cells with explicit geometry.
 
@@ -768,6 +773,13 @@ def evaluate_rescale_visible(
     cell's offset box at ``left``/``width`` so the visible-window computation can
     be exercised without a real layout engine. Returns the resulting bar heights
     and the y-axis tick labels.
+
+    ``chart_offset_left`` models the chart's own position within its
+    offsetParent. Real ``offsetLeft`` values are measured from the nearest
+    POSITIONED ancestor, so when the chart sits partway across the page every
+    cell's offsetLeft carries that page offset while ``scrollLeft`` does not.
+    Passing a non-zero value here (with cell ``left`` values shifted to match)
+    reproduces that mixed-coordinate case.
     """
 
     from swegen.dashboard.server import HTML
@@ -776,27 +788,42 @@ def evaluate_rescale_visible(
         "function rescaleVisible"
         + HTML.split("function rescaleVisible", 1)[1].split("function scheduleRescaleVisible", 1)[0]
     )
+    # rescaleVisible delegates every height write to applyBucketHeights; pull that
+    # shared writer in too so the harness exercises the real mapping.
+    apply_heights = "function applyBucketHeights" + HTML.split(
+        "function applyBucketHeights", 1
+    )[1].split("\n", 1)[0]
     compact = re.search(r"const compactChartCount=.*?;", HTML)
     assert compact is not None
     program = (
         compact.group(0)
         + "function setText(node,value){node.textContent=value==null?'—':String(value)}\n"
+        # Minimal classList stub so the 'clipped' marking is observable.
+        + """
+function stubBar(){const set=new Set();return {style:{},classList:{
+  toggle:(name,on)=>{if(on)set.add(name);else set.delete(name)},
+  has:name=>set.has(name)}}}
+"""
+        + apply_heights
+        + "\n"
         + rescale
         + f"""
 const data={json.dumps(buckets)};
 const cellData=data.map(b=>({{
   cell:{{offsetLeft:b.left,offsetWidth:b.width}},
   up:b.up,down:b.down,
-  upBar:{{style:{{}}}},downBar:{{style:{{}}}},
+  upBar:stubBar(),downBar:stubBar(),
   upSegs:[{{seg:{{style:{{}}}},value:b.up}}],
   downSegs:[{{seg:{{style:{{}}}},value:b.down}}],
 }}));
 const yTicks=[{{textContent:''}},{{textContent:''}},{{textContent:''}}];
-const chart={{_buckets:cellData,_yAxis:{{children:yTicks}},scrollLeft:{scroll_left},clientWidth:{client_width}}};
+const chart={{_buckets:cellData,_yAxis:{{children:yTicks}},scrollLeft:{scroll_left},clientWidth:{client_width},offsetLeft:{chart_offset_left}}};
 rescaleVisible(chart);
 process.stdout.write(JSON.stringify({{
   upHeights:cellData.map(c=>c.upBar.style.height),
   downHeights:cellData.map(c=>c.downBar.style.height),
+  upClipped:cellData.map(c=>c.upBar.classList.has('clipped')),
+  downClipped:cellData.map(c=>c.downBar.classList.has('clipped')),
   ticks:yTicks.map(t=>t.textContent),
 }}));
 """
@@ -825,17 +852,25 @@ def test_rescale_visible_scales_to_only_the_visible_bucket_subset() -> None:
     assert result["ticks"] == ["20", "0", "-8"]
     assert result["upHeights"][1] == "100%"
     assert result["upHeights"][0] == "50%"
-    # The off-screen spike is NOT drawn against the whole-window max: at
-    # visibleUpMax 20 it clamps to 100%, proving it never set the scale (else the
-    # visible bars would be a few percent tall).
-    assert result["upHeights"][3] == "100%"
+    # The off-screen spike never set the scale (else the visible bars would be a
+    # few percent tall). It is also NOT written at all while off-screen: applying
+    # the visible denominator to it would clamp 500 to 100% and render it
+    # identically to the on-screen 20 — the clipping bug. It keeps whatever the
+    # last in-scope pass gave it and is recomputed when it scrolls in.
+    assert result["upHeights"][3] is None
+    assert result["upClipped"][3] is False
 
     # Scroll so only the spike is visible: now each half's scale jumps to it
     # (up=500, down=300) independently.
     scrolled = evaluate_rescale_visible(buckets, scroll_left=895, client_width=30)
     assert scrolled["ticks"] == ["500", "0", "-300"]
-    # The small early buckets now render as a tiny fraction of the spike's max.
-    assert scrolled["upHeights"][0] == "2%"
+    # The spike is now in scope and renders at full height against its own max --
+    # crucially at its TRUE height, not clamped, and therefore not marked clipped.
+    assert scrolled["upHeights"][3] == "100%"
+    assert scrolled["upClipped"][3] is False
+    # The small early buckets are now off-screen and are left untouched rather
+    # than being rewritten against a denominator they are not being measured by.
+    assert scrolled["upHeights"][0] is None
 
     # The wiring: rescaleVisible runs on scroll (throttled) and on resize.
     assert "scheduleRescaleVisible(chart)" in HTML
@@ -847,6 +882,132 @@ def test_rescale_visible_scales_to_only_the_visible_bucket_subset() -> None:
     assert "chart._buckets=cellData" in HTML
     assert "cellData.push(record)" in HTML
     assert "const record={cell,up,down,upBar:null,downBar:null,upSegs:[],downSegs:[]" in HTML
+
+
+def test_tall_buckets_are_never_silently_clipped_to_the_visible_window_max() -> None:
+    # REGRESSION: the operator saw generate bars "clip above ~213". 213 was not a
+    # constant anywhere -- it was simply the tallest bucket in their viewport.
+    # rescaleVisible computed the denominator from the VISIBLE cells but wrote
+    # heights to EVERY cell, so all 9 buckets taller than 213 were clamped by
+    # Math.min(100,...) and rendered flat-topped and indistinguishable, while the
+    # y-axis claimed the top was 213. These are the real leading values from
+    # /api/pipeline/status for the generate stage.
+    up_series = [111, 168, 0, 0, 12, 213, 95, 157, 135, 195, 143, 0, 0, 0, 0, 0]
+    tall = [251, 306, 347, 380, 456, 513, 572, 529, 450]
+    values = up_series + tall
+    buckets = [
+        {"up": v, "down": 0, "left": i * 10, "width": 10} for i, v in enumerate(values)
+    ]
+    # Viewport shows only the first 8 buckets, whose max is exactly 213.
+    result = evaluate_rescale_visible(buckets, scroll_left=0, client_width=80)
+
+    assert result["ticks"][0] == "213"
+    # In-scope bars scale honestly against the axis they are drawn next to.
+    assert result["upHeights"][5] == "100%"  # 213 == the max, full height
+    assert result["upHeights"][1] == f"{168 / 213 * 100}%"
+    # No in-scope bar is clipped, because the denominator IS the in-scope max.
+    assert not any(result["upClipped"][:8])
+    # The 572 bucket (and every other tall one) is off-screen and therefore not
+    # written against a 213 denominator. Under the old code each of these read
+    # "100%" -- identical to the 213 bar, a 2.7x misrepresentation.
+    for index in range(len(up_series), len(values)):
+        assert result["upHeights"][index] is None, index
+        assert result["upClipped"][index] is False, index
+
+    # Scrolling to the tall region rescales the axis to the real peak, and those
+    # bars then render at their true relative heights instead of a flat cap.
+    scrolled = evaluate_rescale_visible(buckets, scroll_left=160, client_width=90)
+    assert scrolled["ticks"][0] == "572"
+    peak = values.index(572)
+    assert scrolled["upHeights"][peak] == "100%"
+    assert scrolled["upClipped"][peak] is False
+    # 251 against a 572 max is ~44% -- visibly shorter than the peak, where the
+    # buggy version drew both at 100%.
+    assert scrolled["upHeights"][values.index(251)] == f"{251 / 572 * 100}%"
+
+
+def test_visible_window_is_measured_in_the_charts_own_coordinate_frame() -> None:
+    # REGRESSION: a cell's offsetLeft is measured from its nearest POSITIONED
+    # ancestor. Nothing between .bucket and <body> was positioned, so offsetLeft
+    # was a PAGE coordinate carrying the stage card's ~600px page offset, while
+    # chart.scrollLeft is a CONTENT coordinate starting at 0. Comparing the two
+    # shifted the "visible" window by that offset: on first paint (scrolled to
+    # the newest data) the scope resolved to the OLDEST buckets, so the chart
+    # scaled to their max and a 213 bucket rendered exactly as tall as a 572 one.
+    from swegen.dashboard.server import HTML
+
+    values = [111, 168, 12, 213, 95, 157, 251, 306, 456, 572]
+    card_x, width, gap = 620, 12, 2
+    # Cell offsets include the card's page offset, exactly as the browser reports.
+    buckets = [
+        {"up": v, "down": 0, "left": card_x + i * (width + gap), "width": width}
+        for i, v in enumerate(values)
+    ]
+    client_width = 60  # shows ~4 buckets
+    content_width = len(values) * (width + gap)
+    scrolled_to_newest = max(0, content_width - client_width)
+
+    result = evaluate_rescale_visible(
+        buckets,
+        scroll_left=scrolled_to_newest,
+        client_width=client_width,
+        chart_offset_left=card_x,
+    )
+
+    # The axis must report the peak of the NEWEST buckets (the scrolled-to
+    # region), not the max of the stale leading ones.
+    assert result["ticks"][0] == "572"
+    peak = values.index(572)
+    assert result["upHeights"][peak] == "100%"
+    # And the mid-sized bar must be visibly shorter than the peak -- the exact
+    # thing the operator reported as "200 looks as tall as 500".
+    mid = values.index(251)
+    assert result["upHeights"][mid] == f"{251 / 572 * 100}%"
+    assert result["upHeights"][mid] != "100%"
+    # The stale 213 bucket is off-screen and must not have set the scale.
+    assert result["upHeights"][values.index(213)] is None
+
+    # The chart establishes its own positioning context so offsetLeft and
+    # scrollLeft share a frame by construction, and the subtraction keeps it
+    # correct even if that CSS is removed.
+    assert ".chart{position:relative;" in HTML
+    assert "const originLeft=chart.offsetLeft||0" in HTML
+    assert "const left=(c.cell.offsetLeft||0)-originLeft" in HTML
+
+
+def test_clipped_bars_are_marked_so_truncation_is_never_silent() -> None:
+    # The non-negotiable invariant: if a bar IS clamped, it must say so. We force
+    # the condition by making a zero-width (always-"visible") cell set carry a
+    # value above the denominator the axis reports.
+    from swegen.dashboard.server import HTML
+
+    # Both bars exceed the max of the *other* visible cell only if the scope is
+    # wrong; with correct scoping the scope max covers every drawn bar, so the
+    # marker stays off. This asserts the healthy case first.
+    buckets = [
+        {"up": 10, "down": 5, "left": 0, "width": 10},
+        {"up": 500, "down": 300, "left": 10, "width": 10},
+    ]
+    healthy = evaluate_rescale_visible(buckets, scroll_left=0, client_width=20)
+    assert healthy["ticks"] == ["500", "0", "-300"]
+    assert healthy["upHeights"][1] == "100%"
+    assert not any(healthy["upClipped"])
+    assert not any(healthy["downClipped"])
+
+    # The shared writer clamps AND marks: applyBucketHeights is the single place
+    # a value becomes a height, used by both first paint and every rescale, so
+    # the two can never disagree about the mapping.
+    assert "function applyBucketHeights(c,upMax,downMax)" in HTML
+    assert "classList.toggle('clipped',upPercent>100.0001)" in HTML
+    assert "classList.toggle('clipped',downPercent>100.0001)" in HTML
+    # Initial render routes through the same writer rather than hand-rolling the
+    # height maths a second time.
+    assert "applyBucketHeights(record,upMax,downMax)" in HTML
+    # Heights are applied to the SCOPE, not to every cell -- this is the fix.
+    assert "scope.forEach(c=>{applyBucketHeights(c,visibleUpMax,visibleDownMax)})" in HTML
+    assert "cells.forEach(c=>{c.upBar.style.height=" not in HTML
+    # And the marker has a visible affordance rather than being CSS-less state.
+    assert ".bar.clipped::after" in HTML
 
 
 def test_rescale_visible_scales_the_up_and_down_halves_independently() -> None:
@@ -1362,6 +1523,79 @@ def test_poll_loop_is_self_scheduling_and_never_overlaps() -> None:
     assert "refreshes ${POLL_INTERVAL_MS/1000}s after each response" in HTML
 
 
+def test_poll_cadence_defaults_to_15s_and_is_injected_from_the_server(monkeypatch) -> None:
+    """Browser and server share one cadence, defaulting to 15s, not 5s.
+
+    A 5s dashboard poll was on its own enough to take the k3s API server from
+    passing 4/4 /livez probes to failing 3/3 against ~2,400 pods; it recovered
+    within 30s of the dashboard being stopped. The browser value is templated
+    from the server's own refresh interval so the two cannot drift, and a
+    browser polling faster than the snapshot behind it changes is pure waste.
+    """
+
+    from swegen.dashboard.server import (
+        DASHBOARD_REFRESH_SECONDS_DEFAULT,
+        DASHBOARD_REFRESH_SECONDS_ENV,
+        HTML,
+        SnapshotCache,
+    )
+
+    assert DASHBOARD_REFRESH_SECONDS_DEFAULT == 15.0
+    # The literal is templated, never hardcoded in the page source.
+    assert "const POLL_INTERVAL_MS=__POLL_INTERVAL_MS__;" in HTML
+    assert "const POLL_INTERVAL_MS=5000" not in HTML
+
+    monkeypatch.delenv(DASHBOARD_REFRESH_SECONDS_ENV, raising=False)
+    assert SnapshotCache().refresh_seconds == 15.0
+
+    monkeypatch.setenv(DASHBOARD_REFRESH_SECONDS_ENV, "30")
+    assert SnapshotCache().refresh_seconds == 30.0
+
+    # A typo'd or non-positive override falls back rather than busy-looping.
+    monkeypatch.setenv(DASHBOARD_REFRESH_SECONDS_ENV, "0")
+    assert SnapshotCache().refresh_seconds == 15.0
+    monkeypatch.setenv(DASHBOARD_REFRESH_SECONDS_ENV, "soon")
+    assert SnapshotCache().refresh_seconds == 15.0
+
+    # An explicit argument still wins, so tests and callers can pin it.
+    assert SnapshotCache(refresh_seconds=2.0).refresh_seconds == 2.0
+
+
+def test_index_page_renders_the_polling_interval_from_the_cache_cadence() -> None:
+    """The served page carries a real number, never the unsubstituted token."""
+
+    from swegen.dashboard.server import HTML, SnapshotCache
+
+    cache = SnapshotCache(refresh_seconds=15.0)
+    body = HTML.replace("__CSRF_TOKEN__", "tok").replace(
+        "__POLL_INTERVAL_MS__", str(int(max(1.0, cache.refresh_seconds) * 1000))
+    )
+
+    assert "const POLL_INTERVAL_MS=15000;" in body
+    assert "__POLL_INTERVAL_MS__" not in body
+
+
+def test_node_disk_io_cell_reports_breaker_state_and_sample_age() -> None:
+    """A frozen cAdvisor sample must read as frozen, not as live numbers.
+
+    The node cAdvisor endpoint stopped completing at ~600 pods/node, so the
+    dashboard kept rendering whatever it last had. The cell now says either
+    "disk I/O unavailable — polling suspended after N consecutive failures" or
+    "... · from 4 minutes ago".
+    """
+
+    from swegen.dashboard.server import HTML
+
+    assert "function diskIoLabel(io)" in HTML
+    assert "polling suspended after ${breaker.consecutive_failures} consecutive failures" in HTML
+    assert "disk I/O unavailable" in HTML
+    assert "from ${ageLabel(io.age_seconds)}" in HTML
+    # The age comes from the payload's server-measured seconds, not from parsing
+    # a timestamp against a browser clock that may disagree.
+    assert "const ageLabel=s=>" in HTML
+    assert "diskCell.title=diskView.detail" in HTML
+
+
 def render_stage_hourly_yield(rows: object, stage: str = "generate") -> dict[str, object]:
     from swegen.dashboard.server import HTML
 
@@ -1592,8 +1826,13 @@ def test_stage_charts_grow_without_centering_margins() -> None:
     assert ".stage-card:not(.stage-card-horizontal) .stage-chart-row{flex:1" in HTML
     assert ".stage-card:not(.stage-card-horizontal) .stage-chart-row .stage-chart-wrap{flex:1}" in HTML
     assert ".chart-frame{min-width:0;min-height:112px;flex:1" in HTML
-    assert ".chart{min-height:112px;min-width:0" in HTML
-    assert "upBar.style.height=`${Math.min(100,up/upMax*100)}%`" in HTML
+    # position:relative makes the chart the offsetParent of its buckets so the
+    # visible-window maths shares a coordinate frame with scrollLeft; the sizing
+    # properties this test cares about are unchanged alongside it.
+    assert ".chart{position:relative;min-height:112px;min-width:0" in HTML
+    # Bar heights now go through the shared applyBucketHeights writer rather than
+    # being inlined at the render site (same value->height mapping, one place).
+    assert "c.upBar.style.height=`${Math.min(100,upPercent)}%`" in HTML
     assert "justify-content:center;padding:11px" not in HTML
 
 
@@ -1643,6 +1882,79 @@ def test_scaler_accepts_the_dynamic_cluster_cpu_ceiling() -> None:
     assert K3sScaler.plan("reward", 768, max_replicas=768) == [("swegen-reward", 768)]
     with pytest.raises(ValueError, match="between 0 and 768"):
         K3sScaler.plan("reward", 769, max_replicas=768)
+
+
+def test_scaling_controls_accept_2048_and_still_reject_just_above_it() -> None:
+    # The raised ceiling must hold on BOTH write paths: stage scaling and
+    # per-endpoint generate concurrency (single and bulk).
+    from swegen.dashboard.distributed_status import MAX_SCALE_REPLICAS_DEFAULT
+    from swegen.dashboard.server import K3sScaler, _validate_concurrency
+
+    cap = MAX_SCALE_REPLICAS_DEFAULT
+    assert cap == 2048
+
+    assert K3sScaler.plan("generate", cap, max_replicas=cap) == [("swegen-generate", cap)]
+    with pytest.raises(ValueError, match="between 0 and 2048"):
+        K3sScaler.plan("generate", cap + 1, max_replicas=cap)
+
+    assert _validate_concurrency(cap, max_replicas=cap) == cap
+    with pytest.raises(ValueError, match="between 0 and 2048"):
+        _validate_concurrency(cap + 1, max_replicas=cap)
+
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+    assert registry.scale(slug="m1-alpha", concurrency=cap, max_replicas=cap) == {
+        "ok": True,
+        "slug": "m1-alpha",
+        "concurrency": cap,
+    }
+    assert registry.scale_many(
+        items=[{"slug": "m1-alpha", "concurrency": cap}], max_replicas=cap
+    )["applied"] == [{"slug": "m1-alpha", "concurrency": cap}]
+    with pytest.raises(ValueError, match="between 0 and 2048"):
+        registry.scale_many(
+            items=[{"slug": "m1-alpha", "concurrency": cap + 1}], max_replicas=cap
+        )
+
+
+def test_raising_the_ceiling_did_not_loosen_the_type_or_sign_checks() -> None:
+    # We raised a ceiling, not the validation. Bools, non-ints, floats and
+    # negatives are still rejected at the new cap.
+    from swegen.dashboard.server import SCALE_MIN, K3sScaler, _validate_concurrency
+
+    assert SCALE_MIN == 0
+    for bad in (True, False, "2048", 1.5, None, [1]):
+        with pytest.raises(ValueError, match="must be an integer"):
+            _validate_concurrency(bad, max_replicas=2048)
+        with pytest.raises(ValueError, match="must be an integer"):
+            K3sScaler.plan("generate", bad, max_replicas=2048)
+    with pytest.raises(ValueError, match="between 0 and 2048"):
+        _validate_concurrency(-1, max_replicas=2048)
+    # Zero remains valid: scaling a pool down to nothing is a legitimate action.
+    assert _validate_concurrency(0, max_replicas=2048) == 0
+
+
+def test_max_scale_replicas_is_env_overridable_and_ignores_bad_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swegen.dashboard.distributed_status import (
+        MAX_SCALE_REPLICAS_DEFAULT,
+        MAX_SCALE_REPLICAS_ENV,
+        resolve_max_scale_replicas,
+    )
+
+    monkeypatch.delenv(MAX_SCALE_REPLICAS_ENV, raising=False)
+    assert resolve_max_scale_replicas() == MAX_SCALE_REPLICAS_DEFAULT == 2048
+
+    monkeypatch.setenv(MAX_SCALE_REPLICAS_ENV, "4096")
+    assert resolve_max_scale_replicas() == 4096
+
+    # A typo'd override must not take the dashboard down, and must never pin the
+    # ceiling to 0 (which would make every scale control reject all input).
+    for bad in ("", "   ", "abc", "12.5", "0", "-5"):
+        monkeypatch.setenv(MAX_SCALE_REPLICAS_ENV, bad)
+        assert resolve_max_scale_replicas() == MAX_SCALE_REPLICAS_DEFAULT
 
 
 def test_scaler_uses_allowlisted_kubectl_argument_arrays() -> None:
@@ -1987,6 +2299,181 @@ def test_scale_endpoint_missing_slug_raises_not_found() -> None:
         registry.scale(slug="Bad Slug!", concurrency=1, max_replicas=100)
 
 
+def test_scale_many_applies_every_row_and_writes_one_event_each() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    conn.rows["m2-beta"] = "model-two"
+    conn.rows["m3-gamma"] = "model-three"
+    registry = _registry_with(conn)
+
+    result = registry.scale_many(
+        items=[
+            {"slug": "m1-alpha", "concurrency": 130},
+            {"slug": "m2-beta", "concurrency": 0},
+            {"slug": "m3-gamma", "concurrency": 7},
+        ],
+        max_replicas=200,
+    )
+
+    assert result["ok"] is True
+    assert result["failed"] == []
+    assert result["applied"] == [
+        {"slug": "m1-alpha", "concurrency": 130},
+        {"slug": "m2-beta", "concurrency": 0},
+        {"slug": "m3-gamma", "concurrency": 7},
+    ]
+    # One 'scaled' audit event per applied row, carrying the new value.
+    scaled = [params for params in conn.events if params[2] == "scaled"]
+    assert len(scaled) == 3
+    assert "concurrency set to 130" in scaled[0][3]
+    assert "concurrency set to 0" in scaled[1][3]
+
+
+def test_scale_many_reports_partial_failure_without_hiding_applied_rows() -> None:
+    # The operator must never believe they set 3 rows when only 2 took. A slug
+    # deleted between page load and Apply fails; the others still apply, and the
+    # response names BOTH sets with ok=False.
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    conn.rows["m3-gamma"] = "model-three"
+    registry = _registry_with(conn)
+
+    result = registry.scale_many(
+        items=[
+            {"slug": "m1-alpha", "concurrency": 5},
+            {"slug": "m2-vanished", "concurrency": 9},
+            {"slug": "m3-gamma", "concurrency": 11},
+        ],
+        max_replicas=200,
+    )
+
+    assert result["ok"] is False
+    assert result["applied"] == [
+        {"slug": "m1-alpha", "concurrency": 5},
+        {"slug": "m3-gamma", "concurrency": 11},
+    ]
+    assert result["failed"] == [{"slug": "m2-vanished", "error": "endpoint not found"}]
+    # The surviving rows really were written, and the missing row logged no event.
+    assert [params[0] for params in conn.events if params[2] == "scaled"] == [
+        "m1-alpha",
+        "m3-gamma",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("items", "match"),
+    [
+        ([{"slug": "m1-alpha", "concurrency": 201}], "between 0"),
+        ([{"slug": "m1-alpha", "concurrency": -1}], "between 0"),
+        ([{"slug": "m1-alpha", "concurrency": True}], "must be an integer"),
+        ([{"slug": "m1-alpha", "concurrency": "8"}], "must be an integer"),
+        ([{"slug": "m1-alpha", "concurrency": 1.5}], "must be an integer"),
+        ([{"slug": "m1-alpha"}], "must be an integer"),
+        ([{"slug": "Bad Slug!", "concurrency": 1}], "not found"),
+        (["not-an-object"], "each item"),
+        ([], "non-empty"),
+        ("not-a-list", "non-empty"),
+    ],
+)
+def test_scale_many_rejects_invalid_input_before_writing_anything(
+    items: object, match: str
+) -> None:
+    from swegen.dashboard.server import EndpointNotFoundError
+
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    with pytest.raises((ValueError, EndpointNotFoundError), match=match):
+        registry.scale_many(items=items, max_replicas=200)
+    # Validation is a strict pre-pass: not a single UPDATE or event was written.
+    assert conn.events == []
+    assert not any(sql.strip().upper().startswith("UPDATE") for sql, _ in conn.calls)
+
+
+def test_scale_many_validates_the_whole_batch_before_applying_any_row() -> None:
+    # One bad value in the middle rejects the WHOLE batch: the valid rows around
+    # it must not be half-applied, or the operator sees a partially-moved fleet.
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    conn.rows["m2-beta"] = "model-two"
+    registry = _registry_with(conn)
+
+    with pytest.raises(ValueError, match="between 0"):
+        registry.scale_many(
+            items=[
+                {"slug": "m1-alpha", "concurrency": 10},
+                {"slug": "m2-beta", "concurrency": 9999},
+            ],
+            max_replicas=200,
+        )
+    assert conn.events == []
+    assert not any(sql.strip().upper().startswith("UPDATE") for sql, _ in conn.calls)
+
+
+def test_scale_many_rejects_duplicate_slugs_and_oversized_batches() -> None:
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    # Two entries for one endpoint would silently last-write-wins.
+    with pytest.raises(ValueError, match="duplicate slug"):
+        registry.scale_many(
+            items=[
+                {"slug": "m1-alpha", "concurrency": 1},
+                {"slug": "m1-alpha", "concurrency": 2},
+            ],
+            max_replicas=200,
+        )
+    with pytest.raises(ValueError, match="per apply"):
+        registry.scale_many(
+            items=[{"slug": f"m{i}-x", "concurrency": 1} for i in range(51)],
+            max_replicas=200,
+        )
+    assert conn.events == []
+
+
+def test_scale_many_enforces_the_same_bounds_as_single_row_scale() -> None:
+    # The bulk path must not widen the write bounds of a 130-pod fleet: it
+    # rejects exactly what scale() rejects and accepts exactly what it accepts.
+    conn = _FakeEndpointConn()
+    conn.rows["m1-alpha"] = "model-one"
+    registry = _registry_with(conn)
+
+    # An unavailable capacity ceiling blocks the bulk path too.
+    with pytest.raises(ValueError, match="capacity is unavailable"):
+        registry.scale_many(
+            items=[{"slug": "m1-alpha", "concurrency": 1}], max_replicas=None
+        )
+    # The boundary values are accepted on both paths.
+    for boundary in (0, 200):
+        assert registry.scale_many(
+            items=[{"slug": "m1-alpha", "concurrency": boundary}], max_replicas=200
+        )["applied"] == [{"slug": "m1-alpha", "concurrency": boundary}]
+        assert (
+            registry.scale(slug="m1-alpha", concurrency=boundary, max_replicas=200)[
+                "concurrency"
+            ]
+            == boundary
+        )
+
+
+def test_scale_many_allows_latched_breaker_rows_to_be_retargeted() -> None:
+    # concurrency is the TARGET the controller honours once Reset clears the
+    # latch, not an immediate scale. Refusing the write would strand the operator
+    # at a stale target they could only change after unlatching.
+    conn = _FakeEndpointConn()
+    conn.rows["m1-latched"] = "model-one"
+    conn.endpoints["m1-latched"] = {"breaker_open": True}
+    registry = _registry_with(conn)
+
+    result = registry.scale_many(
+        items=[{"slug": "m1-latched", "concurrency": 12}], max_replicas=200
+    )
+    assert result["ok"] is True
+    assert result["applied"] == [{"slug": "m1-latched", "concurrency": 12}]
+
+
 def test_update_endpoint_changes_api_and_validates() -> None:
     conn = _FakeEndpointConn()
     conn.rows["m1-alpha"] = "model-one"
@@ -2128,11 +2615,20 @@ def test_generate_endpoint_routes_are_allowlisted_in_do_post() -> None:
     for path in (
         "/api/generate/endpoints",
         "/api/generate/endpoints/scale",
+        "/api/generate/endpoints/scale-many",
         "/api/generate/endpoints/update",
         "/api/generate/endpoints/reset",
         "/api/generate/endpoints/delete",
     ):
         assert f'"{path}"' in source
+    # Bulk scale is dispatched to the registry's batch method with the same
+    # capacity ceiling every other write path uses.
+    assert "endpoint_registry.scale_many(" in source
+    assert "items=payload.get(\"items\")" in source
+    # Its larger body ceiling is scoped to that one route; everything else keeps
+    # the original 1 KiB limit.
+    assert "MAX_BULK_SCALE_BODY_BYTES" in source
+    assert "MAX_CONTROL_BODY_BYTES" in source
     # Endpoint errors map to the documented HTTP status codes.
     assert "EndpointConflictError" in source
     assert "EndpointNotFoundError" in source
@@ -2280,12 +2776,14 @@ def test_dashboard_html_has_generate_endpoints_panel_and_actions() -> None:
     assert "idCell.append(model,host)" not in HTML
     # Empty/unavailable rows span all six columns now.
     assert "td.colSpan=6" in HTML
-    # Per-endpoint action buttons wired to their POST routes.
-    assert "submitEndpointScale(ep.slug" in HTML
+    # Per-endpoint action buttons wired to their POST routes. Concurrency is no
+    # longer a per-row modal button: it is an inline spinner committed by the
+    # single bulk Apply (see the endpoint-concurrency tests below).
+    assert "submitEndpointScale(ep.slug" not in HTML
     assert "submitEndpointEdit(ep.slug" in HTML
     assert "submitEndpointReset(ep.slug)" in HTML
     assert "submitEndpointDelete(ep.slug" in HTML
-    assert "'/api/generate/endpoints/scale'" in HTML
+    assert "'/api/generate/endpoints/scale-many'" in HTML
     assert "'/api/generate/endpoints/update'" in HTML
     assert "'/api/generate/endpoints/reset'" in HTML
     assert "'/api/generate/endpoints/delete'" in HTML
@@ -2296,6 +2794,140 @@ def test_dashboard_html_has_generate_endpoints_panel_and_actions() -> None:
     assert "confirm(`Delete endpoint" in HTML
     # The Reset button keeps its label (it now fires a live probe under the hood).
     assert "setText(resetBtn,'Reset')" in HTML
+
+
+def test_endpoint_rows_have_inline_concurrency_spinners_and_one_bulk_apply() -> None:
+    from swegen.dashboard.server import HTML
+
+    # Each row renders a native number input (browser-supplied stepper), bounded
+    # by the same cluster ceiling the server enforces.
+    assert "function endpointConcInput(ep,maxReplicas,endpoints)" in HTML
+    assert "input.type='number'" in HTML
+    assert "input.className='endpoint-conc-input'" in HTML
+    assert "input.min='0'" in HTML
+    assert "input.max=String(maxReplicas)" in HTML
+    assert "concCell.append(endpointConcInput(ep,maxReplicas,endpoints))" in HTML
+    # Exactly ONE Apply button commits the whole table, not one per row.
+    assert 'id="endpoint-apply"' in HTML
+    assert HTML.count('id="endpoint-apply"') == 1
+    assert "Apply concurrency changes" in HTML
+    assert "submitEndpointConcurrencies(endpoints,maxReplicas)" in HTML
+    # Drafts are keyed by slug so the 5s poll cannot discard a half-typed edit,
+    # and a draft that matches the server value again stops counting as dirty.
+    assert "endpointConcDrafts:{}" in HTML
+    assert "uiState.endpointConcDrafts[ep.slug]=input.value" in HTML
+    assert "if(input.value===String(ep.concurrency??0))delete uiState.endpointConcDrafts[ep.slug]" in HTML
+    # Only dirty rows are sent.
+    assert "const items=state.dirty.map(ep=>({slug:ep.slug,concurrency:Number(uiState.endpointConcDrafts[ep.slug])}))" in HTML
+    # Drafts for endpoints that no longer exist are dropped, so a deleted row
+    # cannot leave the Apply button armed forever.
+    assert "if(!endpoints.some(ep=>ep.slug===slug))delete uiState.endpointConcDrafts[slug]" in HTML
+
+
+def test_endpoint_bulk_apply_gates_on_client_side_bounds_and_reports_partials() -> None:
+    from swegen.dashboard.server import HTML
+
+    # The button only arms for a dirty, in-range, capacity-available batch -- the
+    # same bounds the server enforces, so it never invites a doomed request.
+    assert "function endpointApplyState(endpoints,maxReplicas)" in HTML
+    assert "!/^\\d+$/.test(String(raw).trim())" in HTML
+    assert "value<0||(capacityAvailable&&value>maxReplicas)" in HTML
+    assert "enabled:Boolean(dirty.length)&&!invalid.length&&capacityAvailable&&!uiState.endpointBusy" in HTML
+    # A missing cluster ceiling blocks the apply outright rather than guessing.
+    assert "'Cluster scaling capacity is unavailable; no change was made.'" in HTML
+    # A PARTIAL apply names both the applied and the failed rows, so the operator
+    # can never read "applied 3" when only 2 landed.
+    assert "FAILED ${(body.failed||[]).length}" in HTML
+    assert "const failed=(body.failed||[]).map(row=>`${row.slug} (${row.error})`)" in HTML
+    # Only server-confirmed rows have their draft cleared; a failed row keeps its
+    # pending value so the operator's intent is not silently lost.
+    assert "(payload.applied||[]).forEach(row=>delete uiState.endpointConcDrafts[row.slug])" in HTML
+    assert "if((payload.failed||[]).length){feedback.className='bad'}" in HTML
+
+
+def evaluate_endpoint_apply_state(
+    endpoints: list[dict[str, object]],
+    drafts: dict[str, str],
+    max_replicas: object,
+    busy: bool = False,
+) -> dict[str, object]:
+    """Drive the real endpointApplyState/endpointDirtyRows JS over stub rows.
+
+    Exercises the client-side gate itself rather than asserting on its source, so
+    a change that silently stops rejecting out-of-range concurrency fails here.
+    """
+
+    from swegen.dashboard.server import HTML
+
+    def one_liner(name: str) -> str:
+        """Extract a single-line `function <name>(...){...}` definition from HTML."""
+
+        body = HTML.split(f"function {name}", 1)[1].split("\n", 1)[0]
+        return f"function {name}{body}"
+
+    program = (
+        f"const uiState={{endpointConcDrafts:{json.dumps(drafts)},endpointBusy:{str(busy).lower()}}};\n"
+        + one_liner("endpointDirtyRows")
+        + "\n"
+        + one_liner("endpointApplyState")
+        + f"""
+const endpoints={json.dumps(endpoints)};
+const state=endpointApplyState(endpoints,{json.dumps(max_replicas)});
+process.stdout.write(JSON.stringify({{
+  dirty:state.dirty.map(e=>e.slug),
+  invalid:state.invalid.map(e=>e.slug),
+  enabled:state.enabled,
+  capacityAvailable:state.capacityAvailable,
+}}));
+"""
+    )
+    completed = run(["node", "-e", program], check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
+def test_endpoint_apply_state_arms_only_for_valid_in_range_pending_edits() -> None:
+    endpoints = [
+        {"slug": "a-one", "concurrency": 130, "model_id": "m-one"},
+        {"slug": "b-two", "concurrency": 0, "model_id": "m-two"},
+        {"slug": "c-three", "concurrency": 5, "model_id": "m-three"},
+    ]
+
+    # No drafts at all: nothing pending, Apply stays disabled.
+    idle = evaluate_endpoint_apply_state(endpoints, {}, 200)
+    assert idle["dirty"] == [] and idle["enabled"] is False
+
+    # A draft equal to the stored value is NOT dirty (operator typed it back).
+    unchanged = evaluate_endpoint_apply_state(endpoints, {"a-one": "130"}, 200)
+    assert unchanged["dirty"] == [] and unchanged["enabled"] is False
+
+    # Two genuinely changed rows arm the button; only those two are collected.
+    pending = evaluate_endpoint_apply_state(
+        endpoints, {"a-one": "160", "c-three": "0"}, 200
+    )
+    assert pending["dirty"] == ["a-one", "c-three"]
+    assert pending["invalid"] == []
+    assert pending["enabled"] is True
+
+    # Out of range, negative, and non-integer values each disarm the button.
+    for bad in ("201", "-1", "1.5", "abc", ""):
+        blocked = evaluate_endpoint_apply_state(endpoints, {"a-one": bad}, 200)
+        assert blocked["invalid"] == ["a-one"], bad
+        assert blocked["enabled"] is False, bad
+
+    # The upper boundary itself is allowed (matches the server's inclusive bound).
+    assert evaluate_endpoint_apply_state(endpoints, {"a-one": "200"}, 200)["enabled"] is True
+
+    # An unavailable cluster ceiling blocks the apply entirely.
+    no_capacity = evaluate_endpoint_apply_state(endpoints, {"a-one": "5"}, None)
+    assert no_capacity["capacityAvailable"] is False
+    assert no_capacity["enabled"] is False
+
+    # A request already in flight disarms it too, so a double-click cannot
+    # double-apply a 130-pod fleet change.
+    assert (
+        evaluate_endpoint_apply_state(endpoints, {"a-one": "9"}, 200, busy=True)["enabled"]
+        is False
+    )
 
 
 def render_stage_card_dom(stage: str) -> dict[str, object]:
@@ -2481,7 +3113,7 @@ def test_reset_probe_ui_reports_both_unlatched_outcomes() -> None:
     assert "ta.readOnly=true" in HTML
     assert "navigator.clipboard.writeText" in HTML
     # The token input is never rendered back into the table.
-    assert "renderEndpoints(pg.generate_endpoints,k.generate_endpoint_pods||{})" in HTML
+    assert "renderEndpoints(pg.generate_endpoints,k.generate_endpoint_pods||{},maxReplicas)" in HTML
     assert "ep.auth_token" not in HTML
 
 
